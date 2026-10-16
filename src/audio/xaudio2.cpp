@@ -159,7 +159,9 @@ std::optional<Output> Open() {
 void Pump(Output& out, const std::function<void(float*, uint32_t)>& render) {
     out.voice->Start();
     constexpr uint32_t kFrames = kRate / 100;
-    constexpr uint32_t kSlots = 4;
+    // 100 ms queued: a 30 ms queue starves under short stalls, such as x86 emulation on ARM under Proton
+    constexpr uint32_t kQueued = 10;
+    constexpr uint32_t kSlots = 16;  // more than kQueued, so the slot being rendered is never queued
     std::vector<float> bufs(kSlots * kFrames * kChannels);
     bool stopped = false;
     for (uint32_t n = 0;;) {
@@ -175,7 +177,7 @@ void Pump(Output& out, const std::function<void(float*, uint32_t)>& render) {
         }
         XAUDIO2_VOICE_STATE st;
         out.voice->GetState(&st, XAUDIO2_VOICE_NOSAMPLESPLAYED);
-        if (st.BuffersQueued >= 3) {
+        if (st.BuffersQueued >= kQueued) {
             Sleep(2);
             continue;
         }
