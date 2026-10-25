@@ -8,6 +8,8 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <map>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -17,6 +19,8 @@
 #include "core/input.h"
 #include "game/fonts.h"
 #include "game/loading.h"
+#include "game/loading_text.h"
+#include "game/resample.h"
 #include "gpu/backend.h"
 #include "gpu/texture.h"
 #include "kernel/memory.h"
@@ -36,7 +40,8 @@ bool g_mission_load = false;  // game thread
 // starts from that picture (the display kept through the reboot). The kept display is marked so the next instance's
 // progress thread leaves the full bar alone rather than filling it again over the softer kept picture.
 constexpr uint32_t kRenderDevice = 0x5E3E2C, kDrawTile = 0x2E65A4;
-constexpr float kBarX = 335, kBarY = 135, kBarWidth = 240, kBarHeight = 4;
+using game::loading_text::kBarX, game::loading_text::kBarY, game::loading_text::kBarWidth,
+    game::loading_text::kBarHeight;
 
 void FullBar(X86Context& ctx) {
     uint32_t device = R32(kRenderDevice);
@@ -143,17 +148,30 @@ constexpr Words kWords[] = {{"int", u"PRESS ANY KEY"},
 std::u16string_view g_press_text;  // the picture ShowScreen is loading waits for a key: its words
 bool g_edges = true;               // the picture ShowScreen is loading is shown 4:3 (the ESRB notice is not)
 bool g_bar_in_picture = false;     // the picture ShowScreen is loading is the kept one: the full bar goes into it
+std::string g_picture;             // the picture ShowScreen is loading, its path in small letters
 
 // D:\Default\DataXb\Screens\<language>\<map>_loading<n>.tga
-std::u16string_view WordsFor(const std::string& path) {
+struct MissionPicture {
+    std::string language, map;
+    int variant = 0;
+};
+
+bool ParsePicture(const std::string& path, MissionPicture& out) {
     size_t file = path.find_last_of("\\/");
-    if (file == std::string::npos || !file) return {};
+    if (file == std::string::npos || !file) return false;
     size_t folder = path.find_last_of("\\/", file - 1), at = path.find("_loading", file);
-    if (folder == std::string::npos || at == std::string::npos) return {};
-    if (!Waits(path.substr(file + 1, at - file - 1))) return {};
-    std::string_view language = std::string_view(path).substr(folder + 1, file - folder - 1);
+    if (folder == std::string::npos || at == std::string::npos || at + 8 >= path.size()) return false;
+    out.language = path.substr(folder + 1, file - folder - 1);
+    out.map = path.substr(file + 1, at - file - 1);
+    out.variant = path[at + 8] - '0';
+    return out.variant >= 0 && out.variant <= 9;
+}
+
+std::u16string_view WordsFor(const std::string& path) {
+    MissionPicture m;
+    if (!ParsePicture(path, m) || !Waits(m.map)) return {};
     for (const Words& w : kWords)
-        if (w.folder == language) return w.text;
+        if (w.folder == m.language) return w.text;
     return {};
 }
 
@@ -323,15 +341,68 @@ void KeepPage() {
 
 }  // namespace
 
+// SHARP TEXT on a mission picture (loading_text.cpp): the picture made again at the render scale with its text sharp,
+// in the ClearType mode the briefing and the tip set again from the game's own words. The renderer samples it in the
+// picture texture's place while that holds what it was made from; the next ShowScreen lets it go.
+namespace {
+
+uint32_t g_sharp_picture = 0;  // the picture texture's data an override is set for, 0 none
+
+// loadingscreens.<language> by language, from the game's localization archive, read once
+const std::u16string& LoadingScreens(const std::string& language) {
+    static std::map<std::string, std::u16string> texts;
+    static bool read = false;
+    if (!std::exchange(read, true)) {
+        std::vector<uint8_t> umd;
+        if (ReadGameFile("D:\\Default\\dynamicxbox.umd", umd))
+            for (const char* l : app::kLanguages) texts[l] = game::loading_text::LoadingScreens(umd, l);
+        LOGI("loading: words for the pictures %s", texts.empty() ? "not found" : "read");
+    }
+    return texts[language];
+}
+
+void Sharpen(uint32_t frame, bool bar, bool edges) {
+    uint32_t k = game::fonts::SharpScale(), pitch = 0;
+    MissionPicture m;
+    gpu::TextureDesc d;
+    const uint8_t* texels = PictureTexels(frame, pitch);
+    if (!k || !texels || !ParsePicture(g_picture, m) || !gpu::Describe(frame + kPictureHeader, d)) return;
+    game::loading_text::Words words;
+    bool retype = app::Get().sharp_text == 2 &&
+                  game::loading_text::FindWords(LoadingScreens(m.language), m.map, m.variant, words);
+    std::string note;
+    std::vector<uint8_t> top =
+        game::loading_text::Rebuild({texels, pitch, bar, edges}, retype ? &words : nullptr, k, note);
+    LOGI("loading: %s\\%s_loading%d sharp: %s", m.language.c_str(), m.map.c_str(), m.variant, note.c_str());
+    if (top.empty()) return;
+    auto copy = std::make_shared<gpu::TextureOverride>();
+    copy->width = game::loading_text::kWidth * k;
+    copy->height = game::loading_text::kHeight * k;
+    copy->levels.push_back(std::move(top));
+    // its own levels down to an eighth, for a frame drawn smaller than the copy
+    for (uint32_t l = 1; l < 4; l++)
+        copy->levels.push_back(game::resample::HalfLevel(copy->levels.back(), copy->width >> (l - 1),
+                                                         copy->height >> (l - 1), false));
+    copy->sig = gpu::MemSig(d.data, gpu::TotalSize(d));
+    gpu::SetTextureOverride(d.data, std::move(copy));
+    g_sharp_picture = d.data;
+}
+
+}  // namespace
+
 X86_EXTERN_FUNC(__imp__sub_00051673);
 X86_FUNC(sub_00051673) {
     bool picture = R32(ctx.esp) == kPictureDecoded;
     __imp__sub_00051673(ctx, base);
-    if (picture && std::exchange(g_bar_in_picture, false)) PaintBar(ctx.ebp);
-    if (picture && g_edges && app::Widescreen()) PaintEdges(ctx.ebp);
-    if (!picture || g_press_text.empty()) return;
-    KeepPage();
-    PressText(ctx.ebp, std::exchange(g_press_text, {}));
+    if (!picture) return;
+    bool bar = std::exchange(g_bar_in_picture, false), edges = g_edges && app::Widescreen();
+    if (bar) PaintBar(ctx.ebp);
+    if (edges) PaintEdges(ctx.ebp);
+    if (!g_press_text.empty()) {
+        KeepPage();
+        PressText(ctx.ebp, std::exchange(g_press_text, {}));
+    }
+    Sharpen(ctx.ebp, bar, edges);
 }
 
 // A relaunched instance starts from the display the old one kept, a 640x480 copy that reads softer than the same
@@ -340,20 +411,30 @@ X86_FUNC(sub_00051673) {
 namespace {
 bool g_reloaded = false, g_bar_after = false;
 uint32_t g_path = 0;  // guest copy of the picture's path
+
+// a picture's path, TCHAR or char, in small letters; n its characters
+std::string LowerPath(uint32_t p, uint32_t& n, bool& wide) {
+    wide = !G<uint8_t>(p + 1);
+    n = 0;
+    while (n < 519 && (wide ? R16(p + n * 2) : G<uint8_t>(p + n))) n++;
+    std::string path;
+    for (uint32_t i = 0; i < n; i++) path += char(std::tolower(wide ? R16(p + i * 2) & 0xFF : G<uint8_t>(p + i)));
+    return path;
+}
 }  // namespace
 
 void game::loading::BeforeShowScreen(X86Context& ctx) {
-    uint32_t p = R32(ctx.esp + 4);
+    if (g_sharp_picture) gpu::ClearTextureOverride(std::exchange(g_sharp_picture, 0));
+    g_picture.clear();
+    uint32_t p = R32(ctx.esp + 4), n = 0;
+    bool wide = false;
     if (p) {
-        bool wide = !G<uint8_t>(p + 1);  // TCHAR or char
-        uint32_t n = 0;
-        while (n < 519 && (wide ? R16(p + n * 2) : G<uint8_t>(p + n))) n++;
+        std::string path = LowerPath(p, n, wide);
         uint32_t bytes = (n + 1) * (wide ? 2 : 1);
         SetShownPicture(std::string(static_cast<const char*>(HostPtr(p)), bytes));
-        std::string path;
-        for (uint32_t i = 0; i < n; i++) path += char(std::tolower(wide ? R16(p + i * 2) & 0xFF : G<uint8_t>(p + i)));
         g_press_text = g_mission_load ? WordsFor(path) : std::u16string_view{};
         g_edges = path.find("esrb") == std::string::npos;
+        g_picture = std::move(path);
         return;
     }
     const std::string& kept = KeptPicture();
@@ -364,6 +445,7 @@ void game::loading::BeforeShowScreen(X86Context& ctx) {
     W32(ctx.esp + 4, g_path);
     W32(ctx.esp + 0xC, 0);
     g_bar_after = g_bar_in_picture = KeptDisplayMarked();
+    g_picture = LowerPath(g_path, n, wide);
 }
 
 void game::loading::AfterShowScreen(X86Context& ctx) {
