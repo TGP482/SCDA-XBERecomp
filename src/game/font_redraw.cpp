@@ -1,16 +1,6 @@
 // SHARP TEXT's ClearType mode: the game's glyphs drawn again by DirectWrite from vector fonts that resemble them,
 // hinted at the size they are shown at. Grayscale antialiasing rather than ClearType's colour subpixels: the game
 // blends its text with one alpha, tints it and the frame may be scaled after, which would leave colour fringes.
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <dwrite_3.h>
-#include <wrl/client.h>
-
 #include <algorithm>
 #include <cmath>
 #include <mutex>
@@ -19,6 +9,7 @@
 
 #include "app/resources.h"
 #include "core/log.h"
+#include "game/dwrite_faces.h"
 #include "game/font_redraw.h"
 
 using Microsoft::WRL::ComPtr;
@@ -43,8 +34,6 @@ constexpr Face kFaces[] = {
 };
 
 std::mutex g_lock;  // pages are drawn on worker threads
-ComPtr<IDWriteFactory5> g_factory;
-ComPtr<IDWriteInMemoryFontFileLoader> g_loader;
 std::unordered_map<std::string, ComPtr<IDWriteFontFace>> g_faces;  // by game font, null when it failed
 
 IDWriteFontFace* FaceFor(const Face& f) {
@@ -52,37 +41,7 @@ IDWriteFontFace* FaceFor(const Face& f) {
     auto [it, fresh] = g_faces.try_emplace(std::string(f.font));
     ComPtr<IDWriteFontFace>& face = it->second;
     if (!fresh) return face.Get();
-    if (!g_factory && FAILED(DWriteCreateFactory(DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory5),
-                                                 reinterpret_cast<IUnknown**>(g_factory.GetAddressOf())))) {
-        LOGW("fonts: DirectWrite 3 is missing, no ClearType text");
-        return nullptr;
-    }
-    if (f.resource) {
-        HRSRC res = FindResourceW(nullptr, MAKEINTRESOURCEW(f.resource), RT_RCDATA);
-        HGLOBAL loaded = res ? LoadResource(nullptr, res) : nullptr;
-        const void* data = loaded ? LockResource(loaded) : nullptr;
-        if (data && !g_loader && SUCCEEDED(g_factory->CreateInMemoryFontFileLoader(&g_loader)))
-            g_factory->RegisterFontFileLoader(g_loader.Get());
-        ComPtr<IDWriteFontFile> file;
-        // no owner: the loader keeps a copy
-        if (data && g_loader &&
-            SUCCEEDED(g_loader->CreateInMemoryFontFileReference(g_factory.Get(), data, SizeofResource(nullptr, res),
-                                                                nullptr, &file)))
-            g_factory->CreateFontFace(DWRITE_FONT_FACE_TYPE_TRUETYPE, 1, file.GetAddressOf(), 0,
-                                      DWRITE_FONT_SIMULATIONS_NONE, &face);
-    } else {
-        ComPtr<IDWriteFontCollection> fonts;
-        ComPtr<IDWriteFontFamily> family;
-        ComPtr<IDWriteFont> font;
-        UINT32 index = 0;
-        BOOL exists = FALSE;
-        if (SUCCEEDED(g_factory->GetSystemFontCollection(&fonts)) &&
-            SUCCEEDED(fonts->FindFamilyName(f.family, &index, &exists)) && exists &&
-            SUCCEEDED(fonts->GetFontFamily(index, &family)) &&
-            SUCCEEDED(family->GetFirstMatchingFont(f.weight, DWRITE_FONT_STRETCH_NORMAL, DWRITE_FONT_STYLE_NORMAL,
-                                                   &font)))
-            font->CreateFontFace(&face);
-    }
+    face = f.resource ? game::dwrite::ResourceFace(f.resource) : game::dwrite::SystemFace(f.family, f.weight);
     if (!face) LOGW("fonts: no vector font for %.*s, it stays sharpened", int(f.font.size()), f.font.data());
     return face.Get();
 }
@@ -101,9 +60,9 @@ bool Analyze(IDWriteFontFace* face, UINT16 glyph, float em, const DWRITE_MATRIX&
     run.glyphIndices = &glyph;
     // natural symmetric: hinted vertically, grayscale coverage in the 1x1 texture
     ComPtr<IDWriteGlyphRunAnalysis> analysis;
-    if (FAILED(g_factory->CreateGlyphRunAnalysis(&run, &m, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC,
-                                                 DWRITE_MEASURING_MODE_NATURAL, DWRITE_GRID_FIT_MODE_ENABLED,
-                                                 DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE, 0, 0, &analysis)) ||
+    if (FAILED(game::dwrite::Factory()->CreateGlyphRunAnalysis(
+            &run, &m, DWRITE_RENDERING_MODE1_NATURAL_SYMMETRIC, DWRITE_MEASURING_MODE_NATURAL,
+            DWRITE_GRID_FIT_MODE_ENABLED, DWRITE_TEXT_ANTIALIAS_MODE_GRAYSCALE, 0, 0, &analysis)) ||
         FAILED(analysis->GetAlphaTextureBounds(DWRITE_TEXTURE_ALIASED_1x1, &ink.r)) || ink.r.right <= ink.r.left ||
         ink.r.bottom <= ink.r.top)
         return false;

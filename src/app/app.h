@@ -43,8 +43,9 @@ struct Settings {
     bool fps_counter = false;
     uint32_t fmv_scale = 0;          // full screen movies on a wider screen: 0 fill it, 1 in a 4:3 frame
     uint32_t colour_blind = 0;       // 0 off, 1 protanopia, 2 deuteranopia, 3 tritanopia
-    // the game's font pages redrawn at the render scale: 0 off, 1 sharpened (their own glyphs, edges hard),
-    // 2 ClearType (each glyph drawn by DirectWrite from a vector font matched to it)
+    // the game's font pages and the mission loading pictures redrawn at the render scale: 0 off, 1 sharpened (their
+    // own glyphs, edges hard), 2 ClearType (each glyph drawn by DirectWrite from a vector font matched to it; the
+    // pictures' briefing and tip set again from the game's words)
     uint32_t sharp_text = 0;
     bool vsync = true;
     bool hdr_output = true;          // HDR10 on a display with Windows HDR on

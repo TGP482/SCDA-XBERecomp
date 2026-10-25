@@ -20,6 +20,10 @@ constexpr uint32_t kTextureResource = 0x6C;
 // render device has made it
 uint32_t FindPageHeader(uint32_t texture, uint32_t width, uint32_t height);
 
+// how much larger SHARP TEXT makes the 2D layer's textures: the render scale rounded up, 2 to 6; 0 when the setting is
+// off or the layer is drawn at about its size
+uint32_t SharpScale();
+
 // once a frame, from the Magma frame hook (hud.cpp): finds the pages the render device has made, has their sharp
 // copies made and hands the finished ones to the renderer; follows the sharp text setting and the render scale
 void Poll();
