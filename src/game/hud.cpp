@@ -12,6 +12,7 @@
 #include <utility>
 
 #include "app/app.h"
+#include "game/fonts.h"
 #include "game/magma.h"
 #include "game/loading.h"
 #include "gpu/backend.h"
@@ -679,10 +680,11 @@ X86_FUNC(sub_002C64E0) {
     g_decided = false;
 }
 
-// Magma frame; canvas outside pages is full width in a level, 4:3 in menus
+// Magma frame; canvas outside pages is full width in a level, 4:3 in menus. The font pages' sharp copies follow
 X86_EXTERN_FUNC(__imp__sub_002303E8);
 X86_FUNC(sub_002303E8) {
     __imp__sub_002303E8(ctx, base);
+    game::fonts::Poll();
     if (app::Get().fps_counter) Draw(ctx, base, Mode::Left, [](X86Context& c, uint8_t*) { app::DrawFps(c); });
     g_offset = g_hud_seen ? kNone : kCentre;
     g_in_level = g_hud_seen;

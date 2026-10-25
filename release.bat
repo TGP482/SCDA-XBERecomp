@@ -15,6 +15,9 @@ del /q "%ZIP%" 2>nul
 rem an empty assets folder beside the executables, where the game (files or .iso) goes
 rd /s /q "%OUT%\release" 2>nul
 mkdir "%OUT%\release\assets"
+rem the licenses of the fonts built into the executables (SIL OFL)
+mkdir "%OUT%\release\fonts"
+copy /y fonts\*.txt "%OUT%\release\fonts\" >nul
 rem the game's shadercache\ is a link to the one at the top (not in git): deleting out loses no shaders
 if not exist shadercache mkdir shadercache
 dir /AL /B "%OUT%" 2>nul | findstr /X /I shadercache >nul || (
@@ -29,4 +32,4 @@ rem exe it starts
 del /q "%OUT%\compiler\*.dll" 2>nul
 for %%f in (msvcp140 vcruntime140) do copy /y "%VCRUNTIME%\%%f.dll" "%OUT%\compiler\" >nul
 rem the compiler folder without its work folder: no game code goes in the zip, the first start builds it
-7z a "%ZIP%" ".\%OUT%\SCDA.exe" ".\%OUT%\SCDA_Versus.exe" ".\%OUT%\release\assets" ".\%OUT%\compiler" "%D3DCOMPILER%" "%VCRUNTIME%\msvcp140.dll" "%VCRUNTIME%\vcruntime140.dll" "%VCRUNTIME%\vcruntime140_1.dll" -xr!work
+7z a "%ZIP%" ".\%OUT%\SCDA.exe" ".\%OUT%\SCDA_Versus.exe" ".\%OUT%\release\assets" ".\%OUT%\release\fonts" ".\%OUT%\compiler" "%D3DCOMPILER%" "%VCRUNTIME%\msvcp140.dll" "%VCRUNTIME%\vcruntime140.dll" "%VCRUNTIME%\vcruntime140_1.dll" -xr!work

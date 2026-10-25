@@ -46,6 +46,8 @@ constexpr uint32_t kFmvScales[] = {0, 1};
 const char* const kFmvScaleNames[] = {"FILL", "4:3"};
 constexpr uint32_t kColourBlindModes[] = {0, 1, 2, 3};
 const char* const kColourBlindNames[] = {"OFF", "PROTANOPIA", "DEUTERANOPIA", "TRITANOPIA"};
+constexpr uint32_t kSharpTexts[] = {0, 1, 2};
+const char* const kSharpTextNames[] = {"OFF (DEFAULT)", "SHARPENED", "CLEARTYPE"};
 constexpr uint32_t kAudioOutputs[] = {audio::kOutputAuto, audio::kOutputMono, audio::kOutputStereo,
                                       audio::kOutputSurround};
 const char* const kAudioOutputNames[] = {"AUTOMATIC", "MONO", "2.0 STEREO", "5.1 SURROUND"};
@@ -314,7 +316,8 @@ enum RowId {
     kAudioOutput, kHdrOutput, kShadowFilter, kBrightness, kContrast, kPauseOnFocusLoss, kFreeLookSensitivity, kWeaponSensitivity,
     kSniperSensitivity, kFmvScale, kColourBlind, kAimHorizontal, kAimVertical, kInvertMouseX, kInvertPadX, kInvertPadY,
     kSensitivityVertical, kPadDeadZone, kPadHorizontal, kPadVertical, kPadAimHorizontal, kPadAimVertical,
-    kVibration, kGyroAiming, kGyroSensitivity, kGyroAxis, kGyroButton, kGyroButtonMode, kGyroRecenter, kGyroCalibrate
+    kVibration, kGyroAiming, kGyroSensitivity, kGyroAxis, kGyroButton, kGyroButtonMode, kGyroRecenter, kGyroCalibrate,
+    kSharpText
 };
 
 using rows::Kind;
@@ -329,7 +332,7 @@ bool VersusHides(int id) {
     if (!kVersus) return false;
     return id == kShaderModel || id == kHdr || id == kToneMapping || id == kAmbientOcclusion ||
            id == kMsaa || id == kShadowResolution || id == kShadowDistance || id == kShadowFilter ||
-           id == kTickRate || id == kInputDelay || IsGyroRow(id);
+           id == kTickRate || id == kInputDelay || id == kSharpText || IsGyroRow(id);
 }
 
 constexpr Row kSettingsRows[] = {
@@ -347,6 +350,7 @@ constexpr Row kSettingsRows[] = {
     {Kind::Value, kFpsCounter, "FPS COUNTER"},
     {Kind::Value, kFmvScale, "FMV SCALE"},
     {Kind::Value, kColourBlind, "COLOUR BLIND MODE"},
+    {Kind::Value, kSharpText, "SHARP TEXT"},
     {Kind::Heading, -1, "GRAPHICS"},
     {Kind::Value, kShaderModel, "SHADER MODEL"},
     {Kind::Value, kHdr, "HDR RENDERING"},
@@ -545,6 +549,9 @@ bool StepDisplayRow(int id, int step, Settings& s, char (&text)[64]) {
             std::snprintf(text, sizeof(text), "%s", kColourBlindNames[mode]);
             return true;
         }
+        case kSharpText:
+            std::snprintf(text, sizeof(text), "%s", kSharpTextNames[StepTable(kSharpTexts, s.sharp_text, step)]);
+            return true;
         case kFov:
             // 45 to 140 in steps of 1
             if (step) s.fov = uint32_t(StepRange(int(s.fov), 45, 140, 1, step));

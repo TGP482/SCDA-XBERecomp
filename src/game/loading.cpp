@@ -15,6 +15,7 @@
 
 #include "app/app.h"
 #include "core/input.h"
+#include "game/fonts.h"
 #include "game/loading.h"
 #include "gpu/backend.h"
 #include "gpu/texture.h"
@@ -22,6 +23,7 @@
 #include "xdk/hle.h"
 
 using namespace kernel;
+using namespace game::fonts;  // the font's layout
 
 namespace {
 
@@ -109,14 +111,6 @@ X86_FUNC(sub_0026AB34) {
 // Title_18 is Magma's title font used for the picture's header line, from the copy of the font included with the game
 namespace {
 
-// font (loaded by sub_002D2630): +0x08 name, +0x50 glyph count, +0x54 glyphs of 24 bytes (u16 char, u8 width, height,
-// s8 x, y above the baseline, u8 advance, f32 u, v), +0x468 / +0x46C page widths / heights (u16 arrays), +0x470
-// pages, +0x478 page textures. Each page is a texture loaded from the package (sub_002B62BC) whose pixels never reach
-// the CPU side: the render device fills its D3D texture straight from the package and detaches the mip's lazy array.
-// Once uploaded, the texture's render resource (+0x6C) leads to that D3D texture, found by its size.
-constexpr uint32_t kFontName = 0x08, kGlyphCount = 0x50, kGlyphs = 0x54, kGlyphSize = 24, kPageWidths = 0x468,
-                   kPageHeights = 0x46C, kPages = 0x470, kPageTextures = 0x478;
-constexpr uint32_t kTextureResource = 0x6C;
 struct Glyph {
     char16_t c;
     int w, h, x, y, advance, u, v;  // u, v: top left texel
@@ -276,10 +270,9 @@ void PressText(uint32_t frame, std::u16string_view text) {
 
 }  // namespace
 
-// font loader's last step: the glyphs, and which texture holds the page
-X86_EXTERN_FUNC(__imp__sub_002D1BA0);
-X86_FUNC(sub_002D1BA0) {
-    uint32_t font = ctx.ecx, textures = R32(font + kPageTextures);
+// font loader's last step (fonts.cpp): the glyphs, and which texture holds the page
+void game::loading::FontLoaded(uint32_t font) {
+    uint32_t textures = R32(font + kPageTextures);
     auto* name = static_cast<const char*>(HostPtr(font + kFontName));
     if (g_glyphs.empty() && textures && G<uint8_t>(font + kPages) == 1 &&
         std::string_view(name, strnlen(name, 64)) == "Title_18") {
@@ -295,40 +288,15 @@ X86_FUNC(sub_002D1BA0) {
         LOGI("loading: Title_18 glyphs kept (%zu), page %dx%d in texture %08X", g_glyphs.size(), g_texels_width,
              g_texels_height, g_page_texture);
     }
-    __imp__sub_002D1BA0(ctx, base);
 }
 
 namespace {
-
-// the page's D3D texture header: the render resource or something it points at, two levels deep
-uint32_t FindPageHeader() {
-    auto header = [](uint32_t p) {
-        gpu::TextureDesc d;
-        return p && mem::IsCommitted(p) && mem::IsCommitted(p + 19) && gpu::Describe(p, d) && !d.cube &&
-               d.width == uint32_t(g_texels_width) && d.height == uint32_t(g_texels_height) &&
-               mem::IsCommitted(d.data);
-    };
-    std::vector<uint32_t> near{R32(g_page_texture + kTextureResource)};
-    for (size_t level = 0; level < 2; level++) {
-        std::vector<uint32_t> next;
-        for (uint32_t p : near) {
-            if (!p || !mem::IsCommitted(p) || !mem::IsCommitted(p + 0x3F)) continue;
-            for (uint32_t o = 0; o < 0x40; o += 4) {
-                if (header(p + o)) return p + o;
-                if (header(R32(p + o))) return R32(p + o);
-                next.push_back(R32(p + o));
-            }
-        }
-        near = std::move(next);
-    }
-    return 0;
-}
 
 // the page's coverage from its D3D texture, once the render device has made it
 void KeepPage() {
     static bool tried = false;
     if (!g_texels.empty() || !g_page_texture || std::exchange(tried, true)) return;
-    uint32_t header = FindPageHeader();
+    uint32_t header = FindPageHeader(g_page_texture, uint32_t(g_texels_width), uint32_t(g_texels_height));
     gpu::TextureDesc d;
     if (!header || !gpu::Describe(header, d)) {
         LOGI("loading: Title_18 page texture not found (resource %08X)", R32(g_page_texture + kTextureResource));
@@ -336,40 +304,17 @@ void KeepPage() {
     }
     const gpu::FormatInfo& f = gpu::Format(d.format);
     uint32_t size = gpu::LevelSize(d, 0);
-    if (d.format == 0x0B || !mem::IsCommitted(d.data + size - 1)) {  // P8 would want its palette
+    std::vector<uint8_t> out;
+    // P8 would want its palette
+    if (d.format == 0x0B || !mem::IsCommitted(d.data + size - 1) ||
+        !gpu::DecodeLevelBgra(d, static_cast<const uint8_t*>(HostPtr(d.data)), nullptr, out)) {
         LOGI("loading: Title_18 page texture %08X, %s, not read", header, f.name);
         return;
     }
-    std::vector<uint8_t> out;
-    uint32_t pitch = 0;
-    gpu::DecodeLevel(d, 0, 0, static_cast<const uint8_t*>(HostPtr(d.data)), nullptr, out, pitch);
     int w = g_texels_width, h = g_texels_height;
     std::vector<uint8_t> texels(size_t(w) * h);
     bool luminance = d.format == 0x00 || d.format == 0x13;  // L8: the coverage is the colour
-    for (int y = 0; y < h; y++)
-        for (int x = 0; x < w; x++) {
-            uint8_t& t = texels[size_t(y) * w + x];
-            if (f.host == gpu::Host::BGRA8) {
-                t = out[size_t(y) * pitch + x * 4 + (luminance ? 0 : 3)];
-                continue;
-            }
-            const uint8_t* block = &out[size_t(y / 4) * pitch + (x / 4) * 16];
-            int i = (y % 4) * 4 + x % 4;
-            if (f.host == gpu::Host::BC2) {
-                t = uint8_t((block[i / 2] >> (i % 2 * 4) & 15) * 17);
-            } else if (f.host == gpu::Host::BC3) {
-                int a0 = block[0], a1 = block[1];
-                uint64_t bits = 0;
-                for (int k = 0; k < 6; k++) bits |= uint64_t(block[2 + k]) << (8 * k);
-                int code = int(bits >> (3 * i) & 7);
-                if (code < 2) t = uint8_t(code ? a1 : a0);
-                else if (a0 > a1) t = uint8_t(((8 - code) * a0 + (code - 1) * a1) / 7);
-                else t = uint8_t(code == 6 ? 0 : code == 7 ? 255 : ((6 - code) * a0 + (code - 1) * a1) / 5);
-            } else {
-                LOGI("loading: Title_18 page texture %08X, %s, not read", header, f.name);
-                return;
-            }
-        }
+    for (size_t i = 0; i < texels.size(); i++) texels[i] = out[i * 4 + (luminance ? 0 : 3)];
     g_texels = std::move(texels);
     size_t inked = std::count_if(g_texels.begin(), g_texels.end(), [](uint8_t t) { return t != 0; });
     LOGI("loading: Title_18 page read from texture %08X (%s), %zu of %zu texels inked", header, f.name, inked,
