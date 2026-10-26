@@ -49,6 +49,15 @@ add_custom_target(compiler_files ALL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FREESTANDING_HEADERS} ${COMPILER_DIR}/include/freestanding
     VERBATIM)
 
+# the movies' subtitles beside the executables (src/game/subtitles.cpp): fan transcripts made with tools/subtitles
+file(GLOB SUBTITLE_FILES CONFIGURE_DEPENDS subtitles/*.srt)
+if(SUBTITLE_FILES)
+    add_custom_target(subtitle_files ALL
+        COMMAND ${CMAKE_COMMAND} -E make_directory ${CMAKE_BINARY_DIR}/subtitles
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SUBTITLE_FILES} ${CMAKE_BINARY_DIR}/subtitles
+        VERBATIM)
+endif()
+
 # x86 to C++ recompiler
 file(GLOB RECOMP_SOURCES CONFIGURE_DEPENDS tools/recomp/*.cpp)
 add_executable(xbe_recomp ${RECOMP_SOURCES})
@@ -116,6 +125,9 @@ function(scda_image target xbe config partitions game_dir)
     add_executable(${target} WIN32 ${HOST_SOURCES} ${GAME_SOURCES} ${IMGUI_SOURCES} ${XBE_HASH}
         ${CMAKE_CURRENT_SOURCE_DIR}/src/app/version.rc)
     add_dependencies(${target} recompile_${target} build_info compiler_files)
+    if(TARGET subtitle_files)
+        add_dependencies(${target} subtitle_files)
+    endif()
     # the import library of what the executable exports to its DLL goes to the compiler folder
     set_target_properties(${target} PROPERTIES ENABLE_EXPORTS ON ARCHIVE_OUTPUT_DIRECTORY ${COMPILER_DIR})
     target_include_directories(${target} PRIVATE src ${GEN})

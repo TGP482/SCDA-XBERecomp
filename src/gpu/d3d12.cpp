@@ -943,6 +943,7 @@ private:
     void DrawHdrFrame(Target* t, ID3D12Resource* r, bool pillarbox, D3D12_CPU_DESCRIPTOR_HANDLE bb);
     void BlitFrame(const Target& t, ID3D12Resource* r, bool pillarbox, DXGI_FORMAT rtv = kBgra);
     void RenderUi();
+    void UploadUiImages();
     void ReleaseOldTextures();
     void ResetFrame();
     void CountFps();
@@ -1028,7 +1029,10 @@ private:
     ComPtr<ID3D12DescriptorHeap> smp_heap_;
     ComPtr<ID3D12DescriptorHeap> rtv_heap_;
     ComPtr<ID3D12DescriptorHeap> dsv_heap_;
-    ComPtr<ID3D12DescriptorHeap> ui_heap_;
+    ComPtr<ID3D12DescriptorHeap> ui_heap_;  // ImGui's font, then two views a UI image, used in turn
+    ComPtr<ID3D12Resource> ui_images_[kUiImages];
+    uint32_t ui_views_ = 0;  // bit i: image i's view is in its second slot
+    uint32_t ui_inc_ = 0;
     uint32_t srv_inc_ = 0;
     uint32_t smp_inc_ = 0;
     uint32_t rtv_inc_ = 0;
@@ -1260,7 +1264,7 @@ void D3D12Backend::CreateHeaps() {
     rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames + kPostRtvs, false, rtv_heap_);
     post_rtv_ = kRtvCount + kFrames;
     dsv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDsvCount, false, dsv_heap_);
-    CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true, ui_heap_);
+    ui_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1 + 2 * kUiImages, true, ui_heap_);
     for (uint32_t i = kRtvCount; i-- > 0;) free_rtv_.push_back(i);
     for (uint32_t i = kDsvCount; i-- > 0;) free_dsv_.push_back(i);
 }
@@ -4000,8 +4004,42 @@ void D3D12Backend::BlitFrame(const Target& t, ID3D12Resource* r, bool pillarbox,
     if (r) Blit(r, t.fmt, uv, {.gamma = gamma_, .rtv = rtv, .colour = mode ? colour.data() : nullptr});
 }
 
+struct UiImagePixels {
+    std::vector<uint8_t> bgra;
+    uint32_t w = 0, h = 0;
+    bool set = false;
+};
+std::mutex g_ui_images_lock;
+UiImagePixels g_ui_pending[kUiImages];
+std::atomic<uint64_t> g_ui_ids[kUiImages];
+
+// a UI image set since the last frame becomes a texture; its view goes in the slot the frames in flight are not using
+void D3D12Backend::UploadUiImages() {
+    for (int i = 0; i < kUiImages; i++) {
+        UiImagePixels p;
+        {
+            std::lock_guard lock(g_ui_images_lock);
+            if (!g_ui_pending[i].set) continue;
+            p = std::move(g_ui_pending[i]);
+            g_ui_pending[i] = {};
+        }
+        if (ui_images_[i]) CurrentFrame().garbage.push_back(ui_images_[i]);
+        ui_images_[i] = CreatePixelTexture(p.bgra, p.w * 4, p.w, p.h);
+        ui_views_ ^= 1u << i;
+        uint32_t view = 1 + 2 * uint32_t(i) + (ui_views_ >> i & 1);
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = 1;
+        dev_->CreateShaderResourceView(ui_images_[i].Get(), &sv, Cpu(ui_heap_.Get(), view, ui_inc_));
+        g_ui_ids[i] = Gpu(ui_heap_.Get(), view, ui_inc_).ptr;
+    }
+}
+
 void D3D12Backend::RenderUi() {
     std::lock_guard lock(app::UiLock());
+    UploadUiImages();
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
@@ -4433,5 +4471,13 @@ void D3D12Backend::SetGamma(const uint8_t*) {}
 }  // namespace
 
 std::unique_ptr<Backend> CreateBackend() { return std::make_unique<D3D12Backend>(); }
+
+void SetUiImage(int slot, std::vector<uint8_t> bgra, uint32_t w, uint32_t h) {
+    if (slot < 0 || slot >= kUiImages || !w || !h || bgra.size() < size_t(w) * h * 4) return;
+    std::lock_guard lock(g_ui_images_lock);
+    g_ui_pending[slot] = {std::move(bgra), w, h, true};
+}
+
+uint64_t UiImage(int slot) { return slot >= 0 && slot < kUiImages ? g_ui_ids[slot].load() : 0; }
 
 }  // namespace gpu

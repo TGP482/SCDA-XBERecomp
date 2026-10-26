@@ -317,7 +317,7 @@ enum RowId {
     kSniperSensitivity, kFmvScale, kColourBlind, kAimHorizontal, kAimVertical, kInvertMouseX, kInvertPadX, kInvertPadY,
     kSensitivityVertical, kPadDeadZone, kPadHorizontal, kPadVertical, kPadAimHorizontal, kPadAimVertical,
     kVibration, kGyroAiming, kGyroSensitivity, kGyroAxis, kGyroButton, kGyroButtonMode, kGyroRecenter, kGyroCalibrate,
-    kSharpText
+    kSharpText, kSubtitles
 };
 
 using rows::Kind;
@@ -332,7 +332,7 @@ bool VersusHides(int id) {
     if (!kVersus) return false;
     return id == kShaderModel || id == kHdr || id == kToneMapping || id == kAmbientOcclusion ||
            id == kMsaa || id == kShadowResolution || id == kShadowDistance || id == kShadowFilter ||
-           id == kTickRate || id == kInputDelay || id == kSharpText || IsGyroRow(id);
+           id == kTickRate || id == kInputDelay || id == kSharpText || id == kSubtitles || IsGyroRow(id);
 }
 
 constexpr Row kSettingsRows[] = {
@@ -366,6 +366,7 @@ constexpr Row kSettingsRows[] = {
     {Kind::Value, kSkipIntros, "SKIP INTROS"},
     {Kind::Value, kPauseOnFocusLoss, "PAUSE ON FOCUS LOSS"},
     {Kind::Value, kLanguage, "LANGUAGE"},
+    {Kind::Value, kSubtitles, "SUBTITLES"},
     {Kind::Value, kAudioOutput, "AUDIO OUTPUT"},
     {Kind::Value, kTickRate, "COOP TICK RATE"},
     {Kind::Value, kInputDelay, "COOP MIN INPUT DELAY"},
@@ -447,6 +448,7 @@ bool* ToggleFlag(Settings& s, int id) {
         case kToneMapping: return &s.tone_mapping;
         case kSmaa: return &s.smaa;
         case kSkipIntros: return &s.skip_intros;
+        case kSubtitles: return &s.subtitles;
         case kPauseOnFocusLoss: return &s.pause_on_focus_loss;
         case kPushToTalk: return &s.push_to_talk;
         case kInvertMouse: return &s.invert_mouse;
@@ -1191,6 +1193,7 @@ void DrawUi() {
     io.KeyRepeatRate = 0.1f;  // held arrows step ten times a second, ImGui's twenty is too fast for settings
     // scale the font with the output height
     io.FontGlobalScale = std::max(1.0f, io.DisplaySize.y / 720.0f);
+    if (g_draw_overlay) g_draw_overlay();
     if (ConsoleOpen()) DrawConsole();
     if (MenuOpen()) {
         PollCapture();

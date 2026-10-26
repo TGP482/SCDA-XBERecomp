@@ -82,6 +82,7 @@ struct Settings {
     float aim_horizontal_sensitivity = 1.0f;
     float aim_vertical_sensitivity = 1.0f;
     bool skip_intros = false;        // logos video and rating screen at boot
+    bool subtitles = true;           // the movies' speech in English, from subtitles/<movie>.srt
     bool pause_on_focus_loss = true;  // the game and its sound stop while the window is in the background
     std::string language = "auto";   // "auto" (the Windows display language) or one of kLanguages
     uint32_t audio_output = 0;       // audio::kOutputAuto, kOutputStereo, kOutputSurround or kOutputMono
@@ -132,6 +133,7 @@ inline float Narrow() { return 4.0f / 3.0f / Aspect(); }
 inline bool Widescreen() { return Aspect() > 1.34f; }
 
 std::filesystem::path ExeDir();
+std::filesystem::path AssetsDir();  // assets beside the exe or in a folder above it, empty without one
 // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc
 // image, which it mounts as D:; false after telling the player what is missing
 struct GameFiles {
@@ -164,6 +166,8 @@ uint32_t SettingsRevision();  // counts saved setting changes, from F10 or the i
 bool Capturing();  // a key binding waits for a key
 void ToggleMenu();
 void DrawUi();
+// drawn by DrawUi under the console and the panel, every frame shown: the movies' subtitles (game/subtitles.cpp)
+inline void (*g_draw_overlay)() = nullptr;
 
 // the window's display has Windows HDR on, from the renderer
 inline std::atomic<bool> g_hdr_display{false};

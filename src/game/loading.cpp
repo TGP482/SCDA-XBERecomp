@@ -21,6 +21,7 @@
 #include "game/loading.h"
 #include "game/loading_text.h"
 #include "game/resample.h"
+#include "game/subtitles.h"
 #include "gpu/backend.h"
 #include "gpu/texture.h"
 #include "kernel/memory.h"
@@ -456,10 +457,11 @@ void game::loading::AfterShowScreen(X86Context& ctx) {
     FullBar(ctx);
 }
 
-// the progress thread's bar (sub_00039566, the call returning at 0x39837), ret 0x30
+// the progress thread's bar (sub_00039566, the call returning at 0x39837), ret 0x30; the front end player's movie
+// picture (sub_00038F96, returning at 0x3923E), its subtitles drawn over it
 X86_EXTERN_FUNC(__imp__sub_002E65A4);
 X86_FUNC(sub_002E65A4) {
-    bool bar = R32(ctx.esp) == 0x39837;
+    bool bar = R32(ctx.esp) == 0x39837, movie = R32(ctx.esp) == 0x3923E;
     if (bar && KeptDisplayMarked()) {
         ctx.esp += 4 + 0x30;
         return;
@@ -467,6 +469,7 @@ X86_FUNC(sub_002E65A4) {
     gpu::g_in_splash += bar;  // the bar stays with the picture under it
     __imp__sub_002E65A4(ctx, base);
     gpu::g_in_splash -= bar;
+    if (movie) game::subtitles::AfterMoviePicture(ctx, base);
 }
 
 // The controller layout screen (loading screen vtable +0x34 sub_00038C3F, thiscall) shows controllerN.tga and polls

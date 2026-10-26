@@ -60,6 +60,7 @@ constexpr Entry kEntries[] = {
     {"SKIP INTROS", {u"Passer les intros", u"Intros überspringen", u"Salta introduzione", u"Saltar introducción"}},
     {"PAUSE ON FOCUS LOSS", {u"Pause en arrière-plan", u"Pause im Hintergrund", u"Pausa in background", u"Pausa en segundo plano"}},
     {"LANGUAGE", {u"Langue", u"Sprache", u"Lingua", u"Idioma"}},
+    {"SUBTITLES", {u"Sous-titres", u"Untertitel", u"Sottotitoli", u"Subtítulos"}},
     {"AUDIO OUTPUT", {u"Sortie audio", u"Audioausgabe", u"Uscita audio", u"Salida de audio"}},
     {"COOP TICK RATE", {u"Fréquence de mise à jour co-op", u"Koop-Tickrate", u"Frequenza di aggiornamento cooperativa", u"Tasa de actualización coop."}},
     {"COOP MIN INPUT DELAY", {u"Délai d'entrée min. co-op", u"Min. Koop-Eingabeverzögerung", u"Ritardo input min. cooperativa", u"Retardo de entrada mín. coop."}},
