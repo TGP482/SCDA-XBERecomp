@@ -54,7 +54,7 @@ const char* const kAudioOutputNames[] = {"AUTOMATIC", "MONO", "2.0 STEREO", "5.1
 constexpr uint32_t kShadowSizes[] = {0, 512, 1024, 2048, 4096, 8192};
 constexpr uint32_t kShadowDistances[] = {1, 2, 4, 8};
 constexpr uint32_t kFpsCaps[] = {30, 60, 75, 90, 120, 144, 165, 240, 360, kFpsCapRefresh, 0};
-constexpr uint32_t kVersusFpsCaps[] = {30, 60, 75, 90, 120, 144, 165, kVersusMaxFps, kFpsCapRefresh};
+constexpr uint32_t kVersusFpsCaps[] = {30, 60, 75, 90, 120, 144, 165, kVersusMaxFps, kFpsCapRefresh, 0};
 // co-op steps last whole ms, so each rate is the top of its step: 1000/rate rounds down to the same period
 constexpr uint32_t kTickRates[] = {0, 30, 50, 60, 100, 111, 125, 142};
 constexpr uint32_t kDelayFloors[] = {0, 10, 20, 30, 40, 50};
@@ -327,12 +327,11 @@ constexpr bool kVersus = std::string_view(IMAGE_XBE) == "sc4_adv.xbe";
 
 bool IsGyroRow(int id) { return id >= kGyroAiming && id <= kGyroCalibrate; }
 
-// versus has none of the renderer features of story, nor gyro aiming
+// versus has no SM3 renderer or shadow options of story, nor co-op rows and gyro aiming
 bool VersusHides(int id) {
     if (!kVersus) return false;
-    return id == kShaderModel || id == kHdr || id == kToneMapping || id == kAmbientOcclusion ||
-           id == kMsaa || id == kShadowResolution || id == kShadowDistance || id == kShadowFilter ||
-           id == kTickRate || id == kInputDelay || IsGyroRow(id);
+    return id == kShaderModel || id == kHdr || id == kToneMapping || id == kShadowResolution ||
+           id == kShadowDistance || id == kShadowFilter || id == kTickRate || id == kInputDelay || IsGyroRow(id);
 }
 
 constexpr Row kSettingsRows[] = {
@@ -571,8 +570,8 @@ bool StepDisplayRow(int id, int step, Settings& s, char (&text)[64]) {
         case kMaxFps: {
             uint32_t cap;
             if (kVersus) {
-                // scda.toml is shared with story: its UNLIMITED or a cap over versus's top shows as that top
-                uint32_t v = s.fps_cap && s.fps_cap <= kVersusMaxFps ? s.fps_cap : kVersusMaxFps;
+                // scda.toml is shared with story: a cap over versus's top shows as that top
+                uint32_t v = s.fps_cap <= kVersusMaxFps ? s.fps_cap : kVersusMaxFps;
                 cap = kVersusFpsCaps[StepTable(kVersusFpsCaps, v, step)];
                 if (step) s.fps_cap = v;
             } else {

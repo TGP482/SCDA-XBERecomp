@@ -17,7 +17,7 @@ namespace app {
 
 inline constexpr int kVersion = 3;  // release number, the GitHub release tag is V<number>
 inline constexpr uint32_t kFpsCapRefresh = 1;  // fps_cap: the monitor's refresh rate
-// versus tops out here whatever fps_cap says, as SCCT PC versus, so a player's net traffic stays bounded
+// versus caps top out here, as SCCT PC versus, so a player's net traffic stays bounded; UNLIMITED lifts it
 inline constexpr uint32_t kVersusMaxFps = 240;
 
 enum class DisplayMode : uint32_t { Fullscreen, Windowed, Borderless };

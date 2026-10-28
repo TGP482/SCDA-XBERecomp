@@ -274,7 +274,7 @@ void Pace() {
     static clock::time_point next = clock::now();
     uint32_t cap = Get().fps_cap;
     if (cap == kFpsCapRefresh) cap = RefreshRate();
-    if (std::string_view(IMAGE_XBE) == "sc4_adv.xbe" && (!cap || cap > kVersusMaxFps)) cap = kVersusMaxFps;
+    if (std::string_view(IMAGE_XBE) == "sc4_adv.xbe" && cap > kVersusMaxFps) cap = kVersusMaxFps;
     auto now = clock::now();
     if (!cap) {
         next = now;
