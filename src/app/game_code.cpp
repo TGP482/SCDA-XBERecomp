@@ -52,7 +52,7 @@ constexpr wchar_t kClangFlags[] =
     L"-target x86_64-pc-windows-msvc -fms-compatibility-version=19.40 -std=c++20 -O2 -march=x86-64-v2 "
     L"-fno-strict-aliasing -DNDEBUG -DX86_GAME_CODE -nostdinc -nostdinc++ -w";
 constexpr wchar_t kLinkFlags[] = L"/dll /noentry /nodefaultlib /machine:x64 /opt:noicf";
-constexpr wchar_t kTitle[] = L"Tom Clancy's Splinter Cell: Double Agent";
+constexpr wchar_t kTitle[] = L"Tom Clancy's Splinter Cell: Double Agent - XBE Recomp";
 constexpr uint64_t kJobMemory = 512ull << 20;  // a compiler's peak on the biggest file is about half of this
 constexpr uint64_t kDiskNeeded = 1ull << 30;    // both images' sources, objects and DLLs, with room to spare
 
