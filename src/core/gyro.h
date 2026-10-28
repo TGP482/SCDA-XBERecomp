@@ -35,7 +35,7 @@ struct Turn {
 // game thread, each look update; a turn gathered while the look did not run is dropped
 Turn Take(const Settings& s);
 
-// the drift measured over the next seconds, the controller set down still
+// the drift taken from the next window the controller lies still through; the gyro turns nothing till then
 void StartCalibration();
 bool Calibrating();
 
