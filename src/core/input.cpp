@@ -1129,8 +1129,8 @@ bool TakeMouse(float& dx, float& dy) {
     float horizontal = kVersus ? 1.0f : s.mouse_sensitivity;
     float vertical = kVersus ? 1.0f : s.mouse_vertical_sensitivity;
     bool aim = g_aiming && !kVersus;
-    dx = float(s.invert_mouse_x ? -x : x) * horizontal * (aim ? s.aim_horizontal_sensitivity : 1.0f);
-    dy = float(s.invert_mouse ? -y : y) * vertical * (aim ? s.aim_vertical_sensitivity : 1.0f);
+    dx = float(s.invert_mouse_x ? -x : x) * (aim ? s.aim_horizontal_sensitivity : horizontal);
+    dy = float(s.invert_mouse ? -y : y) * (aim ? s.aim_vertical_sensitivity : vertical);
     return true;
 }
 
@@ -1271,12 +1271,8 @@ bool Aiming() {
 
 LookScale PadLookScale(bool aiming) {
     const app::Settings& s = app::Get();
-    LookScale scale{s.pad_horizontal_sensitivity, s.pad_vertical_sensitivity};
-    if (aiming) {
-        scale.x *= s.pad_aim_horizontal_sensitivity;
-        scale.y *= s.pad_aim_vertical_sensitivity;
-    }
-    return scale;
+    if (aiming) return {s.pad_aim_horizontal_sensitivity, s.pad_aim_vertical_sensitivity};
+    return {s.pad_horizontal_sensitivity, s.pad_vertical_sensitivity};
 }
 
 float GameDeadZone() {

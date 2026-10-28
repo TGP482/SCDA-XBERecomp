@@ -77,7 +77,7 @@ struct Settings {
     float free_look_sensitivity = 1.0f;
     float weapon_sensitivity = 1.0f;
     float sniper_sensitivity = 1.0f;
-    // aiming a weapon or through a scope, times the sensitivity above
+    // aiming a weapon or through a scope, in place of the sensitivity above
     float aim_horizontal_sensitivity = 1.0f;
     float aim_vertical_sensitivity = 1.0f;
     bool skip_intros = false;        // logos video and rating screen at boot

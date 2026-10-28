@@ -90,8 +90,6 @@ constexpr Entry kEntries[] = {
     {"SPANISH", {u"Espagnol", u"Spanisch", u"Spagnolo", u"Español"}},
 
     // MOUSE AND KEYBOARD and CONTROLLER rows
-    {"MOUSE HORIZONTAL SENSITIVITY", {u"Sensibilité horizontale de la souris", u"Horizontale Mausempfindlichkeit", u"Sensibilità orizzontale del mouse", u"Sensibilidad horizontal del ratón"}},
-    {"MOUSE VERTICAL SENSITIVITY", {u"Sensibilité verticale de la souris", u"Vertikale Mausempfindlichkeit", u"Sensibilità verticale del mouse", u"Sensibilidad vertical del ratón"}},
     {"INVERT X AXIS", {u"Inverser l'axe X", u"X-Achse umkehren", u"Inverti asse X", u"Invertir eje X"}},
     {"INVERT Y AXIS", {u"Inverser l'axe Y", u"Y-Achse umkehren", u"Inverti asse Y", u"Invertir eje Y"}},
     {"FREE LOOK SENSITIVITY", {u"Sensibilité vue libre", u"Empfindlichkeit freie Sicht", u"Sensibilità visuale libera", u"Sensibilidad vista libre"}},

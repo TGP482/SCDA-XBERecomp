@@ -388,8 +388,8 @@ const std::vector<Row>& InputRows() {
                                    {Kind::Value, kWeaponSensitivity, "WEAPON SENSITIVITY"},
                                    {Kind::Value, kSniperSensitivity, "SNIPER SENSITIVITY"}});
         else
-            out.insert(out.end(), {{Kind::Value, kSensitivity, "MOUSE HORIZONTAL SENSITIVITY"},
-                                   {Kind::Value, kSensitivityVertical, "MOUSE VERTICAL SENSITIVITY"}});
+            out.insert(out.end(), {{Kind::Value, kSensitivity, "HORIZONTAL SENSITIVITY"},
+                                   {Kind::Value, kSensitivityVertical, "VERTICAL SENSITIVITY"}});
         out.insert(out.end(), {{Kind::Value, kAimHorizontal, "AIM HORIZONTAL SENSITIVITY"},
                                {Kind::Value, kAimVertical, "AIM VERTICAL SENSITIVITY"},
                                {Kind::Value, kInvertMouseX, "INVERT X AXIS"},
@@ -643,7 +643,6 @@ float& Sensitivity(Settings& s, int id) {
         case kPadVertical: return s.pad_vertical_sensitivity;
         case kPadAimHorizontal: return s.pad_aim_horizontal_sensitivity;
         case kPadAimVertical: return s.pad_aim_vertical_sensitivity;
-        case kGyroSensitivity: return s.gyro.sensitivity;
         default: return s.mouse_sensitivity;
     }
 }
@@ -693,9 +692,19 @@ void StepGeneralRow(int id, int step, Settings& s, char (&text)[64]) {
         case kPadHorizontal:
         case kPadVertical:
         case kPadAimHorizontal:
-        case kPadAimVertical:
-        case kGyroSensitivity: {
+        case kPadAimVertical: {
             float& v = Sensitivity(s, id);
+            // 0.1 to 20.0 in steps of 0.1, shown as five times the stored value so the game's own reads 5.0
+            int shown = std::clamp(int(std::lround(v * 50.0f)), 1, 200);
+            if (step) {
+                shown = StepRange(shown, 1, 200, 1, step);
+                v = float(shown) / 50.0f;
+            }
+            std::snprintf(text, sizeof(text), "%.1f", float(shown) / 10.0f);
+            break;
+        }
+        case kGyroSensitivity: {
+            float& v = s.gyro.sensitivity;
             // 0.1 to 5.0 in steps of 0.1
             if (step) v = float(StepRange(int(std::lround(v * 10.0f)), 1, 50, 1, step)) / 10.0f;
             std::snprintf(text, sizeof(text), "%.1f", v);
