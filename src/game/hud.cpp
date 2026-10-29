@@ -26,6 +26,7 @@ bool ComboElement(X86Context& ctx, uint8_t* base, uint32_t instance);  // prompt
 bool HintElement(X86Context& ctx, uint8_t* base, uint32_t instance);   // prompts.cpp
 bool WordingElement(X86Context& ctx, uint8_t* base, uint32_t instance);  // prompts.cpp
 bool OptionsElement(X86Context& ctx, uint8_t* base, uint32_t instance);  // options_menu.cpp
+bool ControlsElement(X86Context& ctx, uint8_t* base, uint32_t page, uint32_t instance);  // ps2_controls.cpp
 }
 
 namespace {
@@ -639,6 +640,7 @@ void DrawLeft(X86Context& ctx, uint8_t* base, void (*draw)(X86Context&, uint8_t*
 X86_EXTERN_FUNC(__imp__sub_002C64E0);
 X86_FUNC(sub_002C64E0) {
     uint32_t instance = ctx.ecx;
+    if (game::ControlsElement(ctx, base, g_drawing, instance)) return;
     if (game::OptionsElement(ctx, base, instance)) return;
     if (game::WordingElement(ctx, base, instance)) return;
     if (game::HintElement(ctx, base, instance)) return;

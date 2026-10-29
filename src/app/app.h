@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <string>
@@ -17,6 +18,7 @@ namespace app {
 
 inline constexpr int kVersion = 3;  // release number, the GitHub release tag is V<number>
 inline constexpr uint32_t kFpsCapRefresh = 1;  // fps_cap: the monitor's refresh rate
+inline constexpr uint32_t kPromptsPs2 = 1;     // button_prompts: PlayStation 2
 // versus caps top out here, as SCCT PC versus, so a player's net traffic stays bounded; UNLIMITED lifts it
 inline constexpr uint32_t kVersusMaxFps = 240;
 
@@ -72,6 +74,9 @@ struct Settings {
     float pad_aim_horizontal_sensitivity = 1.0f;
     float pad_aim_vertical_sensitivity = 1.0f;
     uint32_t vibration_strength = 100;  // percent of the game's rumble, 0 to 200
+    // the pad's look: 0 Xbox, 1 PlayStation 2 (ps2\ beside the exe: its icons and controller screens, its wording and
+    // the PS2 game's button layout)
+    uint32_t button_prompts = 0;
     gyro::Settings gyro;               // story only: the controller's gyro turns the view, beside the right stick
     // versus only, in place of mouse_sensitivity: third person, weapon raised, sniper scope
     float free_look_sensitivity = 1.0f;
@@ -155,6 +160,13 @@ bool HandingOver();
 void FinishHandover();  // any thread but the window thread's: opens the game window, lets the old instance go
 // the game menus' cursor (HCURSOR): cursor.png or cursor.dds beside the exe sized to the frame, else the system arrow
 void* MenuCursor();
+// PlayStation 2 button prompts (ps2_screens.cpp): the host file standing in for that file of the game disc
+// ("\DEFAULT\DATAXB\SCREENS\INT\CONTROLLER2.TGA", upper case), a controller screen drawn for the DualShock 2 from
+// the Xbox one read gives; empty for any other file, with Xbox prompts, or when it cannot be drawn
+std::string Ps2Screen(const std::string& disc_path, const std::function<bool(std::vector<uint8_t>&)>& read);
+// a picture of the PlayStation 2 art beside the exe ("icons\controls.png"), box filtered to w x h, RGBA with straight
+// alpha, rows top down: false when it cannot be read
+bool Ps2Art(const std::string& file, int w, int h, std::vector<uint8_t>& rgba);
 
 // options menu, drawn by the renderer each frame with the lock held
 std::recursive_mutex& UiLock();

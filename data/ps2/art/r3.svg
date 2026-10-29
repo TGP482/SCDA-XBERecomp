@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="100%" height="100%">
+  <defs>
+    <radialGradient id="cap" cx="50%" cy="45%" r="60%">
+      <stop offset="0" stop-color="#2a2c30"/>
+      <stop offset="0.6" stop-color="#3d4045"/>
+      <stop offset="1" stop-color="#5d6168"/>
+    </radialGradient>
+    <linearGradient id="rim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#c3c6cb"/>
+      <stop offset="1" stop-color="#3d4045"/>
+    </linearGradient>
+  </defs>
+  <!-- the analog stick pressed down: arrows in from every side -->
+  <circle cx="16" cy="15.5" r="10.2" fill="#0b0b0c"/>
+  <circle cx="16" cy="15.5" r="9.4" fill="url(#cap)" stroke="url(#rim)" stroke-width="0.9"/>
+  <circle cx="16" cy="15.5" r="7.2" fill="none" stroke="#1a1b1e" stroke-width="1.6" stroke-dasharray="0.9 0.9"/>
+  <text x="16" y="18.9" font-family="Arial, sans-serif" font-weight="bold" font-size="8.6" text-anchor="middle"
+        fill="#d8dbdf">R3</text>
+  <path d="M16 4.6 L19.4 0.9 L12.6 0.9 Z M16 26.4 L19.4 30.1 L12.6 30.1 Z M4.9 15.5 L1.2 12.1 L1.2 18.9 Z
+           M27.1 15.5 L30.8 12.1 L30.8 18.9 Z" fill="#e2e5e8" stroke="#000" stroke-opacity="0.7" stroke-width="0.8"
+        stroke-linejoin="round"/>
+</svg>
