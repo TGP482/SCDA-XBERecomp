@@ -27,3 +27,6 @@ scda.toml
 
 # Local temporary folder
 .local
+
+# Python bytecode from tools/
+__pycache__/

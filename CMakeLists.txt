@@ -49,6 +49,17 @@ add_custom_target(compiler_files ALL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FREESTANDING_HEADERS} ${COMPILER_DIR}/include/freestanding
     VERBATIM)
 
+# The PlayStation 2 button prompts beside the executables: their icons, the DualShock 2 picture and the controller
+# screens' recipe (data/ps2 without its SVG sources, which tools/ps2_art renders)
+set(PS2_DIR ${CMAKE_BINARY_DIR}/ps2)
+file(GLOB PS2_ICONS CONFIGURE_DEPENDS data/ps2/icons/*.png)
+add_custom_target(ps2_files ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${PS2_DIR}/icons
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${PS2_ICONS} ${PS2_DIR}/icons
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${CMAKE_CURRENT_SOURCE_DIR}/data/ps2/dualshock2.png
+            ${CMAKE_CURRENT_SOURCE_DIR}/data/ps2/screens.toml ${PS2_DIR}
+    VERBATIM)
+
 # x86 to C++ recompiler
 file(GLOB RECOMP_SOURCES CONFIGURE_DEPENDS tools/recomp/*.cpp)
 add_executable(xbe_recomp ${RECOMP_SOURCES})

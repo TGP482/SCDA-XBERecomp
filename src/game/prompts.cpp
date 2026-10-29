@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "app/app.h"
 #include "core/input.h"
 #include "game/magma.h"
 #include "xdk/hle.h"
@@ -23,6 +24,7 @@ uint32_t StackOwner(uint32_t page);  // options_menu.cpp
 uint32_t DrawingPage();  // hud.cpp
 uint32_t KeyboardPlayer();  // mouse.cpp
 std::u16string KeyWording(std::u16string text);  // text.cpp
+std::u16string PadWording(std::u16string text);  // text.cpp
 }
 
 X86_EXTERN_FUNC(__imp__sub_002C64E0);  // Magma element draw (thiscall instance), hooked in hud.cpp
@@ -445,6 +447,11 @@ struct Seen {
 Seen g_seen[std::size(kHints)];  // game thread
 uint32_t g_tick = 3;  // past a hint never seen
 bool g_hinting = false;
+// PlayStation 2 prompts on the pad: the START and SELECT pills fill their icon's width, where the Xbox buttons left 5
+// of 32 texels each side, so a hint's or the event bar's text moves this much further from one, as far as the Xbox
+// layout had it
+constexpr int kPillGap = 4;
+std::unordered_map<uint32_t, uint32_t> g_pills;  // a hint's or the event bar's icon by id: the tick it last drew a pill
 
 // keyboard legends while the keyboard is in use; in split screen only in the keyboard's player's menus and HUD
 bool Keyboard(uint32_t page) {
@@ -600,16 +607,17 @@ bool ComboElement(X86Context& ctx, uint8_t* base, uint32_t instance) {
 }
 
 // hud.cpp, any element about to draw. On the keyboard a text naming the pad's buttons draws with the bound keys
-// in their place, given to the draw the way a list gives a row its text, so what is kept follows the device: true
-// when drawn here.
+// in their place, with PlayStation 2 prompts on the pad with the DualShock 2's buttons, given to the draw the way a
+// list gives a row its text, so what is kept follows the device: true when drawn here.
 bool WordingElement(X86Context& ctx, uint8_t* base, uint32_t instance) {
     static bool drawing = false;
     static uint32_t buffer = 0;
     uint32_t widget = R32(instance + kInstanceWidget);
     uint32_t screen = R32(kScreen);
-    if (drawing || !widget || !screen || R32(widget) != kTextWidget || !(G<uint8_t>(instance + kVisible) & 1) ||
-        !Keyboard(game::DrawingPage()))
+    if (drawing || !widget || !screen || R32(widget) != kTextWidget || !(G<uint8_t>(instance + kVisible) & 1))
         return false;
+    bool keyboard = Keyboard(game::DrawingPage());
+    if (!keyboard && app::Get().button_prompts != app::kPromptsPs2) return false;
     uint32_t given = R32(screen + kGivenText);
     if (!given && R32(widget + kTextString + kStringLength) > kMaxReadChars) return false;
     std::u16string text = given ? std::u16string() : ReadText(widget);
@@ -617,7 +625,7 @@ bool WordingElement(X86Context& ctx, uint8_t* base, uint32_t instance) {
         if (i == kMaxWording) return false;
         text += char16_t(R16(given + i * 2));
     }
-    std::u16string keys = KeyWording(text);
+    std::u16string keys = keyboard ? KeyWording(text) : PadWording(text);
     if (keys == text || keys.size() > kMaxWording) return false;
     if (!buffer) buffer = mem::AllocSystem((kMaxWording + 1) * 2);
     if (!buffer) return false;
@@ -629,6 +637,26 @@ bool WordingElement(X86Context& ctx, uint8_t* base, uint32_t instance) {
     sub_002C64E0(ctx, base);
     drawing = false;
     W32(screen + kGivenText, given);
+    return true;
+}
+
+// ps2_controls.cpp: an element drawn with the text of a text element (its own or another's) and more after it, given
+// to the draw the way a list gives a row its text: false when it cannot be
+bool DrawWithText(X86Context& ctx, uint8_t* base, uint32_t instance, uint32_t text, std::u16string_view more) {
+    static uint32_t buffer = 0;
+    uint32_t screen = R32(kScreen);
+    if (!screen || R32(text) != kTextWidget || R32(screen + kGivenText)) return false;
+    std::u16string line = ReadText(text);
+    if (!line.empty()) line += more;
+    if (line.empty() || line.size() > kMaxWording) return false;
+    if (!buffer) buffer = mem::AllocSystem((kMaxWording + 1) * 2);
+    if (!buffer) return false;
+    for (size_t i = 0; i <= line.size(); i++)
+        W16(buffer + uint32_t(i) * 2, i < line.size() ? uint16_t(line[i]) : 0);
+    W32(screen + kGivenText, buffer);
+    ctx.ecx = instance;
+    sub_002C64E0(ctx, base);
+    W32(screen + kGivenText, 0);
     return true;
 }
 
@@ -659,14 +687,62 @@ static bool DrawHintText(X86Context& ctx, uint8_t* base, uint32_t instance, uint
     return true;
 }
 
+// the icon a hint's or the event bar's text is beside, and the text's side of it: 1 after, -1 before; 0 for any other
+static uint32_t BesideIcon(uint32_t text, int& side) {
+    for (const Hint& h : kHints)
+        if (text == h.text || (h.after && text == h.after)) {
+            side = text == h.text ? -1 : 1;
+            return h.image;
+        }
+    for (const Prompt& p : kEventPrompts)
+        if (text == p.text) {
+            side = p.before ? 1 : -1;
+            return p.image;
+        }
+    return 0;
+}
+
+static bool BesideText(uint32_t image) {
+    return std::any_of(std::begin(kHints), std::end(kHints), [&](const Hint& h) { return h.image == image; }) ||
+           std::any_of(std::begin(kEventPrompts), std::end(kEventPrompts),
+                       [&](const Prompt& p) { return p.image == image; });
+}
+
+// with PlayStation 2 prompts on the pad, the text beside a START or SELECT pill draws kPillGap further from it: true
+// when drawn here
+static bool PillElement(X86Context& ctx, uint8_t* base, uint32_t instance, uint32_t id, uint32_t widget) {
+    if (BesideText(id)) {
+        uint32_t material = R32(widget + kImageMaterial);
+        uint32_t name = material ? R32(material + kMaterialId) : 0;
+        bool pill = std::any_of(std::begin(kIcons), std::end(kIcons),
+                                [&](const Icon& i) { return i.id == name && (i.code == Start || i.code == Back); });
+        g_pills[id] = pill ? g_tick : 0;
+        return false;
+    }
+    int side = 0;
+    uint32_t image = BesideIcon(id, side);
+    auto pill = image ? g_pills.find(image) : g_pills.end();
+    if (pill == g_pills.end() || g_tick - pill->second > 2 || R32(widget) != kTextWidget) return false;
+    uint32_t sides = R32(widget + kRect);
+    W16(widget + kRect, uint16_t(int16_t(R16(widget + kRect)) + side * kPillGap));
+    W16(widget + kRectRight, uint16_t(int16_t(R16(widget + kRectRight)) + side * kPillGap));
+    g_hinting = true;
+    ctx.ecx = instance;
+    sub_002C64E0(ctx, base);
+    g_hinting = false;
+    W32(widget + kRect, sides);
+    return true;
+}
+
 // hud.cpp, any element about to draw. On the keyboard a hint's icon goes and its key joins the caption, which
-// ends where the icon did; with text after the icon the two close up around the key, centred as before: true when
-// handled here.
+// ends where the icon did; with text after the icon the two close up around the key, centred as before. With
+// PlayStation 2 prompts on the pad the text keeps clear of a START or SELECT pill: true when handled here.
 bool HintElement(X86Context& ctx, uint8_t* base, uint32_t instance) {
     uint32_t id = R32(instance + kInstanceId);
     uint32_t widget = R32(instance + kInstanceWidget);
-    if (g_hinting || !widget || !(G<uint8_t>(instance + kVisible) & 1) || !Keyboard(game::DrawingPage()))
-        return false;
+    if (g_hinting || !widget || !(G<uint8_t>(instance + kVisible) & 1)) return false;
+    if (!Keyboard(game::DrawingPage()))
+        return app::Get().button_prompts == app::kPromptsPs2 && PillElement(ctx, base, instance, id, widget);
     for (size_t i = 0; i < std::size(kHints); i++) {
         const Hint& h = kHints[i];
         Seen& s = g_seen[i];

@@ -8,7 +8,8 @@
 
 // Texture packs and texture dumps. A console texture is named by a hash of its level 0 bytes, size and format; an
 // image in textures\replacement\ beside the exe with that hash in its name is drawn in its place at any resolution,
-// and textures\dumps\ gets each texture once as a PNG or DDS file to edit or upscale.
+// and textures\dumps\ gets each texture once as a PNG or DDS file to edit or upscale. With PlayStation 2 button
+// prompts the game's button icons are drawn as ps2\icons\ has them (ps2_icons.h), after the player's own pack.
 namespace gpu::texturedumper {
 
 // rows tightly packed, block rows for the BC formats
@@ -28,11 +29,12 @@ struct Image {
 enum class Lookup { None, Loading, Ready };
 
 // latches the texture settings, the render thread's, and lists the pack again once its files changed.
-// true then: every pack image loads anew, GPU copies made before are stale
+// true then (or when the PlayStation 2 icons came or went): every pack image loads anew, GPU copies made before are
+// stale
 bool Update();
 // changes with any texture setting: every texture's key and pack image are looked up again
 uint32_t Generation();
-// replacement on and the pack holds images
+// replacement on and the pack holds images, or PlayStation 2 prompts' icons stand in
 bool Replacing();
 
 // the name of a texture's bytes, a P8 texture's with its 256 colours; 0 when neither the pack nor dumping applies

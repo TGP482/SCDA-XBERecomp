@@ -6,6 +6,7 @@
 #include <fstream>
 #include <map>
 
+#include "app/app.h"
 #include "kernel/disc.h"
 #include "kernel/kernel.h"
 #include "kernel/exports.h"
@@ -222,9 +223,10 @@ struct Target {
     std::string host;                    // empty on the disc image or unmapped
     bool disc = false;                   // on the mounted disc image
     const Disc::Entry* entry = nullptr;  // there: the file or folder, null when missing
+    std::string disc_path;               // on D:, its path there in upper case, the disc image or the folder
 };
 
-Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
+Target ResolveDevice(const std::string& xbox_path, uint32_t root_handle) {
     std::string p = Normalize(xbox_path);
     if (root_handle) {
         if (auto f = FileFromHandle(root_handle)) p = Normalize(f->xbox + "\\" + p);
@@ -261,9 +263,38 @@ Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
     // no Xbox name holds ':', and fs::path would take "D:" as a host drive
     for (auto& part : parts)
         if (part.find(':') != std::string::npos) return {};
-    if (best->first == kCdRom)
-        if (const Disc* disc = MountedDisc()) return {{}, true, disc->Find(parts)};
-    return {MatchCase(best->second, parts).string()};
+    Target t;
+    if (best->first == kCdRom) t.disc_path = Upper(rest);
+    if (const Disc* disc = MountedDisc(); disc && best->first == kCdRom) {
+        t.disc = true;
+        t.entry = disc->Find(parts);
+    } else {
+        t.host = MatchCase(best->second, parts).string();
+    }
+    return t;
+}
+
+bool ReadTarget(const Target& t, std::vector<uint8_t>& out) {
+    if (t.disc) {
+        if (!t.entry || t.entry->dir) return false;
+        out.resize(t.entry->size);
+        return MountedDisc()->Read(*t.entry, 0, out.data(), t.entry->size) == t.entry->size;
+    }
+    std::ifstream f(t.host, std::ios::binary);
+    if (!f) return false;
+    out.assign(std::istreambuf_iterator<char>(f), {});
+    return true;
+}
+
+// with PlayStation 2 button prompts their controller screens stand in for the Xbox ones, drawn from them
+Target Resolve(const std::string& xbox_path, uint32_t root_handle) {
+    Target t = ResolveDevice(xbox_path, root_handle);
+    if (t.disc_path.empty() || (t.disc && (!t.entry || t.entry->dir))) return t;
+    std::string screen = app::Ps2Screen(t.disc_path, [&t](std::vector<uint8_t>& out) { return ReadTarget(t, out); });
+    if (screen.empty()) return t;
+    Target drawn;
+    drawn.host = screen;
+    return drawn;
 }
 
 // the disc image is read only: nothing on it is created, replaced or written
@@ -296,18 +327,7 @@ uint32_t OpenOnDisc(const Disc::Entry* e, const std::string& name, uint32_t hand
 
 std::string ResolvePath(const std::string& xbox_path, uint32_t root_handle) { return Resolve(xbox_path, root_handle).host; }
 
-bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out) {
-    Target t = Resolve(xbox_path, 0);
-    if (t.disc) {
-        if (!t.entry || t.entry->dir) return false;
-        out.resize(t.entry->size);
-        return MountedDisc()->Read(*t.entry, 0, out.data(), t.entry->size) == t.entry->size;
-    }
-    std::ifstream f(t.host, std::ios::binary);
-    if (!f) return false;
-    out.assign(std::istreambuf_iterator<char>(f), {});
-    return true;
-}
+bool ReadGameFile(const std::string& xbox_path, std::vector<uint8_t>& out) { return ReadTarget(Resolve(xbox_path, 0), out); }
 
 // exports
 

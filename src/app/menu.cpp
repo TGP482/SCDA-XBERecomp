@@ -317,7 +317,7 @@ enum RowId {
     kSniperSensitivity, kFmvScale, kColourBlind, kAimHorizontal, kAimVertical, kInvertMouseX, kInvertPadX, kInvertPadY,
     kSensitivityVertical, kPadDeadZone, kPadHorizontal, kPadVertical, kPadAimHorizontal, kPadAimVertical,
     kVibration, kGyroAiming, kGyroSensitivity, kGyroAxis, kGyroButton, kGyroButtonMode, kGyroRecenter, kGyroCalibrate,
-    kTextureReplacement, kTextureDumping, kDumpFormat
+    kTextureReplacement, kTextureDumping, kDumpFormat, kButtonPrompts
 };
 
 using rows::Kind;
@@ -405,6 +405,7 @@ const std::vector<Row>& InputRows() {
 const std::vector<Row>& PadRows() {
     static const std::vector<Row> list = [] {
         std::vector<Row> out = {{Kind::Heading, -1, "GENERAL"},
+                                {Kind::Value, kButtonPrompts, "BUTTON PROMPTS"},
                                 {Kind::Value, kPadHorizontal, "HORIZONTAL SENSITIVITY"},
                                 {Kind::Value, kPadVertical, "VERTICAL SENSITIVITY"},
                                 {Kind::Value, kPadAimHorizontal, "AIM HORIZONTAL SENSITIVITY"},
@@ -726,6 +727,14 @@ void StepGeneralRow(int id, int step, Settings& s, char (&text)[64]) {
             if (step && &s == &Get()) gyro::StartCalibration();
             std::snprintf(text, sizeof(text), "%s", gyro::Calibrating() ? "KEEP STILL" : "START");
             break;
+        case kButtonPrompts:
+            // the PlayStation 2 layout comes with its prompts: the buttons go back to that style's defaults
+            if (step) {
+                s.button_prompts = uint32_t(StepIndex(int(s.button_prompts), step, 2));
+                if (&s == &Get()) input::ResetPadBindings();
+            }
+            std::snprintf(text, sizeof(text), "%s", s.button_prompts == kPromptsPs2 ? "PLAYSTATION 2" : "XBOX (DEFAULT)");
+            break;
         case kVibration:
             // 0% to 200% in steps of 10
             if (step) s.vibration_strength = uint32_t(StepRange(int(s.vibration_strength), 0, 200, 10, step));
@@ -811,6 +820,7 @@ void RestoreDefaults(int page) {
     Get().invert_pad_y = keep.invert_pad_y;
     Get().pad_dead_zone = keep.pad_dead_zone;
     Get().vibration_strength = keep.vibration_strength;
+    Get().button_prompts = keep.button_prompts;
     Get().gyro = keep.gyro;
     Get().pad_horizontal_sensitivity = keep.pad_horizontal_sensitivity;
     Get().pad_vertical_sensitivity = keep.pad_vertical_sensitivity;

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="100%" height="100%">
+  <defs>
+    <linearGradient id="off" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#4b4f55"/>
+      <stop offset="1" stop-color="#1c1d20"/>
+    </linearGradient>
+    <linearGradient id="on" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f4f5f6"/>
+      <stop offset="1" stop-color="#a9adb2"/>
+    </linearGradient>
+    <!-- the DualShock 2's D-pad: four separate buttons pointing in, an arrow on each -->
+    <g id="button">
+      <path d="M12 1.2 H20 Q21 1.2 21 2.2 V10.6 L16 14.6 L11 10.6 V2.2 Q11 1.2 12 1.2 Z" stroke="#0b0b0c"
+            stroke-width="1.2" stroke-linejoin="round"/>
+    </g>
+    <path id="mark" d="M16 3.6 L18.6 7.4 L13.4 7.4 Z"/>
+  </defs>
+  <g transform="rotate(90 16 16)"><use href="#button" fill="url(#off)"/><use href="#mark" fill="#7a7e84"/></g>
+  <g transform="rotate(180 16 16)"><use href="#button" fill="url(#off)"/><use href="#mark" fill="#7a7e84"/></g>
+  <g transform="rotate(270 16 16)"><use href="#button" fill="url(#off)"/><use href="#mark" fill="#7a7e84"/></g>
+  <g transform="rotate(0 16 16)"><use href="#button" fill="url(#on)"/><use href="#mark" fill="#1c1d20"/></g>
+</svg>
