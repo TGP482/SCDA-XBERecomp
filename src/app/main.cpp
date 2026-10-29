@@ -133,11 +133,12 @@ void ApplyNow() {
     g_display_applied++;
 }
 
-// a key went down: the settings panel and hide HUD binds
+// a key went down: the settings panel, hide HUD and texture replacement binds
 bool HostKey(WPARAM wp, LPARAM lp) {
     if (lp & (1 << 30) || ConsoleOpen()) return false;  // bit 30: a repeat of a held key
     if (input::HostKey(input::KeyEvent::SettingsPanel, int(wp))) ToggleMenu();
     else if (!MenuOpen() && input::HostKey(input::KeyEvent::HideHud, int(wp))) g_hide_hud = !g_hide_hud;
+    else if (!MenuOpen() && input::HostKey(input::KeyEvent::ToggleTextures, int(wp))) ToggleTextureReplacement();
     else return false;
     return true;
 }
@@ -272,11 +273,8 @@ void Pace() {
     using clock = std::chrono::steady_clock;
     static clock::time_point next = clock::now();
     uint32_t cap = Get().fps_cap;
-    // a few under the refresh rate, so a variable refresh display stays in its range and vsync never waits a whole
-    // refresh
-    constexpr uint32_t kRefreshMargin = 3;
-    if (cap == kFpsCapRefresh) cap = RefreshRate() > kRefreshMargin ? RefreshRate() - kRefreshMargin : 0;
-    if (std::string_view(IMAGE_XBE) == "sc4_adv.xbe" && (!cap || cap > kVersusMaxFps)) cap = kVersusMaxFps;
+    if (cap == kFpsCapRefresh) cap = RefreshRate();
+    if (std::string_view(IMAGE_XBE) == "sc4_adv.xbe" && cap > kVersusMaxFps) cap = kVersusMaxFps;
     auto now = clock::now();
     if (!cap) {
         next = now;

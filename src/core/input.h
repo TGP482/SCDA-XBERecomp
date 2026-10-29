@@ -83,7 +83,7 @@ uint32_t StickKeys();
 // keys the game side acts on itself, once per press in play
 enum class KeyEvent {
     None, Whistle, SidekickCommand, QuickSave, QuickLoad, Reload, PushToTalk, HideHud, SettingsPanel, DropBody, ZoomIn,
-    ZoomOut
+    ZoomOut, ToggleTextures
 };
 // A synced co-op session. Its lockstep carries the pad, not what the game side calls on its own, so there the
 // sidekick key holds the black button (co-op action) and whistle is off.

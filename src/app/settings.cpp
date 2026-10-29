@@ -117,6 +117,9 @@ void Load() {
     if (auto on = t["ambient_occlusion"].value<bool>()) s.ambient_occlusion = *on;
     s.ambient_occlusion = std::min(t["ambient_occlusion"].value_or(s.ambient_occlusion), 2u);
     s.async_shaders = t["async_shaders"].value_or(s.async_shaders);
+    s.custom_textures = t["custom_textures"].value_or(s.custom_textures);
+    s.dump_textures = t["dump_textures"].value_or(s.dump_textures);
+    s.texture_dump_format = std::min(t["texture_dump_format"].value_or(s.texture_dump_format), 1u);
     s.mouse_sensitivity = float(t["mouse_sensitivity"].value_or(double(s.mouse_sensitivity)));
     // absent in files from before the split: the one sensitivity they had
     s.mouse_vertical_sensitivity = float(t["mouse_vertical_sensitivity"].value_or(double(s.mouse_sensitivity)));
@@ -199,6 +202,9 @@ toml::table Table() {
                   {"tone_mapping", s.tone_mapping},
                   {"ambient_occlusion", int64_t(s.ambient_occlusion)},
                   {"async_shaders", s.async_shaders},
+                  {"custom_textures", s.custom_textures},
+                  {"dump_textures", s.dump_textures},
+                  {"texture_dump_format", int64_t(s.texture_dump_format)},
                   {"mouse_sensitivity", double(s.mouse_sensitivity)},
                   {"mouse_vertical_sensitivity", double(s.mouse_vertical_sensitivity)},
                   {"invert_mouse", s.invert_mouse},

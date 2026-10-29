@@ -119,6 +119,11 @@ The latest version of [SCDA-XBERecomp](https://github.com/TGP482/SCDA-XBERecomp/
 - **HDR Rendering** - Enables Shader Model 3 HDR rendering.
 - **Tone Mapping** - Enables Shader Model 3 tone mapping.
 
+### Textures
+- **Texture Replacement** - Replaces the game's textures with the `.dds` or `.png` images in the `textures\replacement` folder beside the exe.
+- **Texture Dumping** - Saves every texture the game uses into the `textures\dumps` folder beside the exe as you play.
+- **Dump Format** - Choose between PNG or DDS, which keeps the original compression and mipmaps.
+
 ### Input
 - **Mouse and Keyboard** - Full keyboard and mouse support with raw input, adjustable horizontal and vertical sensitivity, inverted look and rebindable controls.
 - **Controller** - Controller with SDL3 support, buttons can be rebound from the Controller page. Defaults match the Xbox layout.

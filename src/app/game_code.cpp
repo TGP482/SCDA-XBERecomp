@@ -52,7 +52,7 @@ constexpr wchar_t kClangFlags[] =
     L"-target x86_64-pc-windows-msvc -fms-compatibility-version=19.40 -std=c++20 -O2 -march=x86-64-v2 "
     L"-fno-strict-aliasing -DNDEBUG -DX86_GAME_CODE -nostdinc -nostdinc++ -w";
 constexpr wchar_t kLinkFlags[] = L"/dll /noentry /nodefaultlib /machine:x64 /opt:noicf";
-constexpr wchar_t kTitle[] = L"Tom Clancy's Splinter Cell: Double Agent";
+constexpr wchar_t kTitle[] = L"Tom Clancy's Splinter Cell: Double Agent - XBE Recomp";
 constexpr uint64_t kJobMemory = 512ull << 20;  // a compiler's peak on the biggest file is about half of this
 constexpr uint64_t kDiskNeeded = 1ull << 30;    // both images' sources, objects and DLLs, with room to spare
 
@@ -485,21 +485,44 @@ Layout Arrange(const RECT& client, int unit) {
     return l;
 }
 
-// the ready page's buttons, with the controller button that presses each
+// how lit each ready page control is, 0 to 1, fading with the cursor over it
+struct Glow {
+    float start = 0;
+    float exit = 0;
+    float toggle = 0;
+};
+Glow g_glow;
+bool g_pad = false;  // a controller is connected, so the labels name its buttons
+constexpr float kFadeMs = 120.0f;
+
+COLORREF Mix(COLORREF from, COLORREF to, float t) {
+    auto channel = [t](int a, int b) { return BYTE(a + (b - a) * t + 0.5f); };
+    return RGB(channel(GetRValue(from), GetRValue(to)), channel(GetGValue(from), GetGValue(to)),
+               channel(GetBValue(from), GetBValue(to)));
+}
+
+// the controller button that presses a control, shown only with a controller connected
+std::wstring Label(const std::wstring& text, const wchar_t* button) {
+    return g_pad ? text + L" (" + button + L")" : text;
+}
+
+void PaintButton(HDC dc, const RECT& box, const std::wstring& text, float glow) {
+    FillBox(dc, box, Mix(kBarEmpty, kBarFull, glow));
+    DrawLine(dc, box, text, Mix(kText, kBackground, glow), DT_CENTER);
+}
+
 void PaintChoices(HDC dc, const Layout& l, int unit) {
-    FillBox(dc, l.start, kBarFull);
-    DrawLine(dc, l.start, L"Start (A)", kBackground, DT_CENTER);
-    FillBox(dc, l.exit, kBarEmpty);
-    DrawLine(dc, l.exit, L"Exit (B)", kText, DT_CENTER);
+    PaintButton(dc, l.start, Label(L"Start", L"A"), g_glow.start);
+    PaintButton(dc, l.exit, Label(L"Exit", L"B"), g_glow.exit);
     int middle = (l.delete_toggle.top + l.delete_toggle.bottom) / 2;
     RECT box{l.delete_toggle.left, middle - unit / 2, l.delete_toggle.left + unit, middle + unit / 2};
-    FillBox(dc, box, kBarEmpty);
-    if (g_delete_compiler) InflateRect(&box, -unit / 4, -unit / 4);
-    if (g_delete_compiler) FillBox(dc, box, kBarFull);
+    FillBox(dc, box, Mix(kBarEmpty, kBarFull, g_glow.toggle));
+    InflateRect(&box, -unit / 4, -unit / 4);
+    if (g_delete_compiler) FillBox(dc, box, Mix(kBarFull, kBackground, g_glow.toggle));
     RECT label = l.delete_toggle;
     label.left += unit * 3 / 2;
     std::wstring megabytes = std::to_wstring(g_compiler_bytes >> 20);
-    DrawLine(dc, label, L"Delete the compiler files, " + megabytes + L" MB (X)", kText, DT_LEFT);
+    DrawLine(dc, label, Label(L"Delete the compiler files, " + megabytes + L" MB", L"X"), kText, DT_LEFT);
 }
 
 void Paint(HDC dc, const RECT& client, int unit) {
@@ -579,6 +602,30 @@ void OnClick(HWND hwnd, LPARAM lp) {
     else if (PtInRect(&l.delete_toggle, at)) g_delete_compiler = !g_delete_compiler;
 }
 
+float Approach(float glow, bool lit, float step) {
+    return lit ? std::min(glow + step, 1.0f) : std::max(glow - step, 0.0f);
+}
+
+// read with each repaint: the cursor, so leaving the window or another window over it unlights too, and controllers
+void UpdateReadyPage(HWND hwnd) {
+    static int64_t last = NowMs();
+    int64_t now = NowMs();
+    float step = float(now - last) / kFadeMs;
+    last = now;
+    g_pad = false;
+    for (int slot = 0; slot < 4 && !g_pad; slot++) g_pad = input::PadConnected(slot);
+    POINT at;
+    GetCursorPos(&at);
+    bool over = WindowFromPoint(at) == hwnd;
+    ScreenToClient(hwnd, &at);
+    RECT client;
+    GetClientRect(hwnd, &client);
+    Layout l = Arrange(client, Unit(hwnd));
+    g_glow.start = Approach(g_glow.start, over && PtInRect(&l.start, at), step);
+    g_glow.exit = Approach(g_glow.exit, over && PtInRect(&l.exit, at), step);
+    g_glow.toggle = Approach(g_glow.toggle, over && PtInRect(&l.delete_toggle, at), step);
+}
+
 // a controller's A starts, B leaves and X ticks the delete box, once ready; on the press, not the hold
 void PollController(HWND hwnd) {
     static uint16_t held = 0;
@@ -600,6 +647,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_ERASEBKGND:
             return 1;
         case WM_TIMER:
+            if (ready) UpdateReadyPage(hwnd);
             InvalidateRect(hwnd, nullptr, FALSE);
             PollController(hwnd);
             return 0;
@@ -654,7 +702,7 @@ HWND OpenWindow() {
     NONCLIENTMETRICSW metrics{sizeof(metrics)};
     SystemParametersInfoForDpi(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0, dpi);
     SetWindowLongPtrW(hwnd, GWLP_USERDATA, LONG_PTR(CreateFontIndirectW(&metrics.lfMessageFont)));
-    SetTimer(hwnd, 1, 50, nullptr);  // the controller is read with each repaint
+    SetTimer(hwnd, 1, 16, nullptr);  // the controller and cursor are read with each repaint
     ShowWindow(hwnd, SW_SHOW);
     return hwnd;
 }

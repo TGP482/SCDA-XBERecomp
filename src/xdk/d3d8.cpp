@@ -183,6 +183,13 @@ void Occlusion(const float* m, bool gtao) {
     g_backend->Occlusion(g_state, p);
 }
 
+void LatchDistanceFog(float start, float end) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (end <= start) return;
+    float slope = 1 / (end - start);
+    g_fog = {slope, -start * slope, 1.0f};
+}
+
 void FilterShadows(const float* m) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
     if (!g_backend || m[11] != 1.0f || m[15] != 0.0f) return;

@@ -24,6 +24,7 @@ constexpr Entry kEntries[] = {
     {"GENERAL", {u"Général", u"Allgemein", u"Generale", u"General"}},
     {"DISPLAY", {u"Affichage", u"Anzeige", u"Video", u"Pantalla"}},
     {"GRAPHICS", {u"Graphismes", u"Grafik", u"Grafica", u"Gráficos"}},
+    {"TEXTURES", {u"Textures", u"Texturen", u"Texture", u"Texturas"}},
     {"RESTORE DEFAULTS", {u"Rétablir les valeurs par défaut", u"Standard wiederherstellen", u"Ripristina predefiniti", u"Restaurar predeterminados"}},
     {"PRESS A KEY", {u"Appuyez sur une touche", u"Taste drücken", u"Premi un tasto", u"Pulsa una tecla"}},
     {"PRESS A BUTTON", {u"Appuyez sur un bouton", u"Taste drücken", u"Premi un pulsante", u"Pulsa un botón"}},
@@ -57,6 +58,9 @@ constexpr Entry kEntries[] = {
     {"SHADOW RESOLUTION", {u"Résolution des ombres", u"Schattenauflösung", u"Risoluzione delle ombre", u"Resolución de sombras"}},
     {"SHADOW DISTANCE", {u"Distance des ombres", u"Schattendistanz", u"Distanza delle ombre", u"Distancia de sombras"}},
     {"SHADOW FILTER", {u"Filtre des ombres", u"Schattenfilter", u"Filtro delle ombre", u"Filtro de sombras"}},
+    {"TEXTURE REPLACEMENT", {u"Remplacement des textures", u"Texturersetzung", u"Sostituzione delle texture", u"Reemplazo de texturas"}},
+    {"TEXTURE DUMPING", {u"Extraction des textures", u"Texturextraktion", u"Estrazione delle texture", u"Extracción de texturas"}},
+    {"DUMP FORMAT", {u"Format d'extraction", u"Extraktionsformat", u"Formato di estrazione", u"Formato de extracción"}},
     {"SKIP INTROS", {u"Passer les intros", u"Intros überspringen", u"Salta introduzione", u"Saltar introducción"}},
     {"PAUSE ON FOCUS LOSS", {u"Pause en arrière-plan", u"Pause im Hintergrund", u"Pausa in background", u"Pausa en segundo plano"}},
     {"LANGUAGE", {u"Langue", u"Sprache", u"Lingua", u"Idioma"}},
@@ -89,8 +93,6 @@ constexpr Entry kEntries[] = {
     {"SPANISH", {u"Espagnol", u"Spanisch", u"Spagnolo", u"Español"}},
 
     // MOUSE AND KEYBOARD and CONTROLLER rows
-    {"MOUSE HORIZONTAL SENSITIVITY", {u"Sensibilité horizontale de la souris", u"Horizontale Mausempfindlichkeit", u"Sensibilità orizzontale del mouse", u"Sensibilidad horizontal del ratón"}},
-    {"MOUSE VERTICAL SENSITIVITY", {u"Sensibilité verticale de la souris", u"Vertikale Mausempfindlichkeit", u"Sensibilità verticale del mouse", u"Sensibilidad vertical del ratón"}},
     {"INVERT X AXIS", {u"Inverser l'axe X", u"X-Achse umkehren", u"Inverti asse X", u"Invertir eje X"}},
     {"INVERT Y AXIS", {u"Inverser l'axe Y", u"Y-Achse umkehren", u"Inverti asse Y", u"Invertir eje Y"}},
     {"FREE LOOK SENSITIVITY", {u"Sensibilité vue libre", u"Empfindlichkeit freie Sicht", u"Sensibilità visuale libera", u"Sensibilidad vista libre"}},
@@ -132,6 +134,7 @@ constexpr Entry kEntries[] = {
     {"QUICK LOAD", {u"Chargement rapide", u"Schnellladen", u"Caricamento veloce", u"Carga rápida"}},
     {"CONSOLE", {u"Console", u"Konsole", u"Console", u"Consola"}},
     {"TOGGLE HUD", {u"Afficher / masquer l'interface", u"HUD ein / aus", u"Mostra / nascondi HUD", u"Mostrar / ocultar HUD"}},
+    {"TOGGLE TEXTURE REPLACEMENT", {u"Activer / désactiver le remplacement des textures", u"Texturersetzung ein / aus", u"Attiva / disattiva sostituzione delle texture", u"Activar / desactivar reemplazo de texturas"}},
     {"SETTINGS PANEL", {u"Panneau des paramètres", u"Einstellungsmenü", u"Pannello impostazioni", u"Panel de configuración"}},
 
     // Versus keys
@@ -265,7 +268,8 @@ std::u16string app::Translate(std::string_view text, std::string (*rest)(std::st
 std::string app::TitleCase(std::string_view text) {
     constexpr std::string_view kSmall[] = {"AND", "OR", "OF", "TO", "A"};
     constexpr std::string_view kKeep[] = {"FPS", "FMV", "EEV", "EMF", "LMB", "RMB", "MMB", "IP", "OPSAT", "ESC", "HDR",
-                                          "MSAA", "SMAA", "SSAO", "GTAO", "HUD", "LB", "RB", "LT", "RT", "LS", "RS"};
+                                          "MSAA", "SMAA", "SSAO", "GTAO", "HUD", "LB", "RB", "LT", "RT", "LS", "RS",
+                                          "PNG", "DDS"};
     std::string out;
     size_t i = 0;
     while (i < text.size()) {

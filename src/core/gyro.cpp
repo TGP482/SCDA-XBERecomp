@@ -28,7 +28,6 @@ constexpr float kRestSeconds = 2.0f;
 constexpr float kRestGyroSpread = 1.0f;  // degrees a second
 constexpr float kRestAccelSpread = 0.1f;  // metres a second squared
 constexpr float kMaxDrift = 1.5f;  // degrees a second
-constexpr float kCalibrationSeconds = 3.0f;
 // turns slower than this are smoothed over kSmoothSeconds, twice as fast pass as they are
 constexpr float kSmoothSpeed = 5.0f;  // degrees a second
 constexpr float kSmoothSeconds = 0.1f;
@@ -104,8 +103,8 @@ struct Motion {
     Vec3 drift;  // degrees a second the gyro reads at rest
     Vec3 smoothed;  // the slow share of the turn, degrees a second
     RestWindow rest;
-    bool calibrating = false;
-    Average calibration;
+    bool calibrating = false;  // the next still window sets the drift, however large
+    bool calibrated = false;  // by hand: rest windows stop, a slow steady turn would pass for drift
     // degrees turned since the last take: about the controller's up, its front, the world's up; pitch down positive
     float yaw = 0;
     float roll = 0;
@@ -149,20 +148,15 @@ void UpdateDrift(Motion& m, const Vec3& gyro, float dt) {
     if (w.mean.seconds < kRestSeconds) return;
     Vec3 mean = w.mean.Mean();
     bool still = w.gyro.Widest() < kRestGyroSpread && w.accel.Widest() < kRestAccelSpread;
-    if (still && Largest(mean) < kMaxDrift) m.drift = mean;
+    if (still && m.calibrating) {
+        m.drift = mean;
+        m.calibrating = false;
+        m.calibrated = true;
+        LOGR("gyro: drift %.3f %.3f %.3f", m.drift.x, m.drift.y, m.drift.z);
+    } else if (still && !m.calibrated && Largest(mean) < kMaxDrift) {
+        m.drift = mean;
+    }
     w = {};
-}
-
-// true while a calibration takes the readings; at its end its mean is the drift
-bool UpdateCalibration(Motion& m, const Vec3& gyro, float dt) {
-    if (!m.calibrating) return false;
-    m.calibration.Push(gyro, dt);
-    if (m.calibration.seconds < kCalibrationSeconds) return true;
-    m.drift = m.calibration.Mean();
-    m.calibrating = false;
-    m.rest = {};
-    LOGR("gyro: drift %.3f %.3f %.3f", m.drift.x, m.drift.y, m.drift.z);
-    return true;
 }
 
 // the slow share of a turn is smoothed, the fast share passes as it is: sensor noise goes, quick aim keeps no lag
@@ -176,8 +170,8 @@ Vec3 ApplySmoothing(Motion& m, const Vec3& turn, float dt) {
 void ReadGyro(Motion& m, const Vec3& radians, uint64_t ns) {
     float dt = Gap(m.gyro_ns, ns);
     Vec3 gyro = Scale(radians, kDegreesPerRadian);
-    if (UpdateCalibration(m, gyro, dt)) return;
     UpdateDrift(m, gyro, dt);
+    if (m.calibrating) return;
     Vec3 turn = ApplySmoothing(m, Sub(gyro, m.drift), dt);
     m.yaw += turn.y * dt;
     m.roll += turn.z * dt;  // the left side down turns left
@@ -280,6 +274,7 @@ Turn Take(const Settings& s) {
     std::lock_guard lock(g_lock);
     Motion& m = g_motion;
     Turn turn;
+    if (stale) m.pressed = 0;  // presses while the look did not run
     bool on = UpdateSwitch(s, m);
     if (on && !stale) {
         turn.yaw = AxisTurn(m, s.axis) * s.sensitivity;
@@ -298,7 +293,7 @@ void StartCalibration() {
     std::lock_guard lock(g_lock);
     if (!g_motion.pad) return;  // no gyro read yet
     g_motion.calibrating = true;
-    g_motion.calibration = {};
+    g_motion.rest = {};
 }
 
 bool Calibrating() {

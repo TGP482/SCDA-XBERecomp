@@ -65,6 +65,7 @@ bool g_capture = false;  // a HUD instance is being drawn: its quads wait for it
 bool g_replay = false;
 bool g_pages = false;    // a page was drawn this frame
 bool g_projected = false;  // Enhanced Reality icons are being drawn
+bool g_icon = false;       // one of them is being captured
 bool g_picture = false;    // the loading page is being drawn: as the game draws it, shown 4:3
 Mode g_mode = Mode::Centre;
 std::vector<Quad> g_quads;
@@ -252,10 +253,63 @@ X86_FUNC(sub_0025A3F0) {
     }
 }
 
-// Magma instance draw (thiscall, +8 id). On a HUD page each instance is drawn into a list, then placed by the
-// half of the screen it covers and replayed; children come back through here inside their parent's list.
+// Magma instance draw (thiscall, +8 id)
 X86_EXTERN_FUNC(__imp__sub_002620A0);
+
+namespace {
+
+// draws captured quads again, each placed by its mode
+void Replay(X86Context& ctx, const std::vector<Quad>& quads) {
+    uint32_t esp = ctx.esp;
+    uint32_t corners = (esp - 0x40) & ~0xFu;
+    ctx.esp = corners;
+    g_replay = true;
+    for (const auto& q : quads) {
+        g_mode = q.mode;
+        std::memcpy(&G<float>(corners), q.corners, sizeof q.corners);
+        ctx.ecx = q.util;
+        const uint32_t* a = q.args;
+        CallGuest(ctx, kAddQuad, {corners, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11]});
+    }
+    g_replay = false;
+    ctx.esp = esp;
+}
+
+// An Enhanced Reality icon sits at its projected point already, but at the canvas's stretched width: it is captured
+// and narrowed to its 4:3 shape about its own centre
+void DrawIcon(X86Context& ctx, uint8_t* base) {
+    bool capture = std::exchange(g_capture, true);
+    std::vector<Quad> outer = std::exchange(g_quads, {});
+    std::vector<uint32_t> path = std::exchange(g_path, {});
+    g_icon = true;
+    __imp__sub_002620A0(ctx, base);
+    g_icon = false;
+    std::vector<Quad> quads = std::exchange(g_quads, std::move(outer));
+    g_path = std::move(path);
+    g_capture = capture;
+    if (quads.empty()) return;
+    float lo = quads[0].corners[0];
+    float hi = lo;
+    for (const auto& q : quads) {
+        for (int i = 0; i < 12; i += 3) {
+            lo = std::min(lo, q.corners[i]);
+            hi = std::max(hi, q.corners[i]);
+        }
+    }
+    float mid = (lo + hi) / 2;
+    float k = app::Narrow();
+    for (auto& q : quads) {
+        for (int i = 0; i < 12; i += 3) q.corners[i] = mid + (q.corners[i] - mid) * k;
+    }
+    Replay(ctx, quads);
+}
+
+}  // namespace
+
+// On a HUD page each instance is drawn into a list, then placed by the half of the screen it covers and replayed;
+// children come back through here inside their parent's list.
 X86_FUNC(sub_002620A0) {
+    if (g_projected && !g_icon && app::Widescreen()) return DrawIcon(ctx, base);
     if (!g_hud || !app::Widescreen()) return __imp__sub_002620A0(ctx, base);
     uint32_t id = R32(ctx.ecx + kInstanceId);
     if (g_capture) {
@@ -284,19 +338,7 @@ X86_FUNC(sub_002620A0) {
     for (auto& q : quads) group.push_back(&q);
     Assign(group, 0, id, w);
     LOG_FIRST(100, "versus widescreen: instance %08X x %.0f..%.0f mode %d", id, lo, hi, int(mode));
-    uint32_t esp = ctx.esp;
-    uint32_t corners = (esp - 0x40) & ~0xFu;
-    ctx.esp = corners;
-    g_replay = true;
-    for (auto& q : quads) {
-        g_mode = q.mode;
-        std::memcpy(&G<float>(corners), q.corners, sizeof q.corners);
-        ctx.ecx = q.util;
-        const uint32_t* a = q.args;
-        CallGuest(ctx, kAddQuad, {corners, a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11]});
-    }
-    g_replay = false;
-    ctx.esp = esp;
+    Replay(ctx, quads);
 }
 
 // HUD Enhanced Reality (thiscall): objective icons at world positions projected through the widened 3D view, each
@@ -325,7 +367,8 @@ X86_FUNC(sub_00252B80) {
 X86_EXTERN_FUNC(__imp__sub_001231E0);
 X86_FUNC(sub_001231E0) {
     float w = Width();
-    if (!app::Widescreen() || w <= 0.0f || g_projected || g_picture) return __imp__sub_001231E0(ctx, base);
+    bool projected = g_projected && !g_icon;
+    if (!app::Widescreen() || w <= 0.0f || projected || g_picture) return __imp__sub_001231E0(ctx, base);
     uint32_t corners = R32(ctx.esp + 4);
     float c[12];
     std::memcpy(c, &G<float>(corners), sizeof c);

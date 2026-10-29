@@ -230,6 +230,7 @@ constexpr Target kStoryActions[] = {
     {{"quick_load", "QUICK LOAD", "F8"}, -1, true, KeyEvent::QuickLoad},
     {{"console", "CONSOLE", "Backtick"}, kHostKey},
     {{"hide_hud", "TOGGLE HUD", ""}, kHostKey, false, KeyEvent::HideHud},
+    {{"toggle_textures", "TOGGLE TEXTURE REPLACEMENT", ""}, kHostKey, false, KeyEvent::ToggleTextures},
     {{"settings_panel", "SETTINGS PANEL", "F10"}, kHostKey, false, KeyEvent::SettingsPanel},
 };
 // Versus (sc4_adv.xbe) binds the pad differently. Its own ids keep rebinds in one game.
@@ -257,6 +258,7 @@ constexpr Target kVersusActions[] = {
     {{"pause", "PAUSE", "Escape"}, 12},
     // no console: versus has no commands
     {{"push_to_talk", "PUSH TO TALK", "T"}, kHostKey, false, KeyEvent::PushToTalk},
+    {{"toggle_textures", "TOGGLE TEXTURE REPLACEMENT", ""}, kHostKey, false, KeyEvent::ToggleTextures},
     {{"settings_panel", "SETTINGS PANEL", "F10"}, kHostKey, false, KeyEvent::SettingsPanel},
 };
 constexpr bool kVersus = std::string_view(IMAGE_XBE) == "sc4_adv.xbe";
@@ -1127,8 +1129,8 @@ bool TakeMouse(float& dx, float& dy) {
     float horizontal = kVersus ? 1.0f : s.mouse_sensitivity;
     float vertical = kVersus ? 1.0f : s.mouse_vertical_sensitivity;
     bool aim = g_aiming && !kVersus;
-    dx = float(s.invert_mouse_x ? -x : x) * horizontal * (aim ? s.aim_horizontal_sensitivity : 1.0f);
-    dy = float(s.invert_mouse ? -y : y) * vertical * (aim ? s.aim_vertical_sensitivity : 1.0f);
+    dx = float(s.invert_mouse_x ? -x : x) * (aim ? s.aim_horizontal_sensitivity : horizontal);
+    dy = float(s.invert_mouse ? -y : y) * (aim ? s.aim_vertical_sensitivity : vertical);
     return true;
 }
 
@@ -1269,12 +1271,8 @@ bool Aiming() {
 
 LookScale PadLookScale(bool aiming) {
     const app::Settings& s = app::Get();
-    LookScale scale{s.pad_horizontal_sensitivity, s.pad_vertical_sensitivity};
-    if (aiming) {
-        scale.x *= s.pad_aim_horizontal_sensitivity;
-        scale.y *= s.pad_aim_vertical_sensitivity;
-    }
-    return scale;
+    if (aiming) return {s.pad_aim_horizontal_sensitivity, s.pad_aim_vertical_sensitivity};
+    return {s.pad_horizontal_sensitivity, s.pad_vertical_sensitivity};
 }
 
 float GameDeadZone() {
@@ -1347,7 +1345,8 @@ bool AnswerKey(int vk) {
     bool media_or_reserved = (vk >= VK_BROWSER_BACK && vk <= VK_LAUNCH_APP2) || (vk >= 0x3A && vk <= 0x40) ||
                              (vk >= 0x88 && vk <= 0x9F) || (vk >= 0xC1 && vk <= 0xDA);
     if (media_or_reserved) return false;
-    if (ConsoleKey(vk) || Bound(KeyEvent::HideHud, vk) || Bound(KeyEvent::SettingsPanel, vk)) return false;
+    bool toggle = Bound(KeyEvent::HideHud, vk) || Bound(KeyEvent::ToggleTextures, vk);
+    if (ConsoleKey(vk) || toggle || Bound(KeyEvent::SettingsPanel, vk)) return false;
     // vk is the layout's own key here, not a bind position
     return GetAsyncKeyState(vk) < 0;
 }

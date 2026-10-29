@@ -15,9 +15,9 @@ struct X86Context;
 // the host side: window, settings, options menu
 namespace app {
 
-inline constexpr int kVersion = 2;  // release number, the GitHub release tag is V<number>
-inline constexpr uint32_t kFpsCapRefresh = 1;  // fps_cap: just under the monitor's refresh rate
-// versus tops out here whatever fps_cap says, as SCCT PC versus, so a player's net traffic stays bounded
+inline constexpr int kVersion = 3;  // release number, the GitHub release tag is V<number>
+inline constexpr uint32_t kFpsCapRefresh = 1;  // fps_cap: the monitor's refresh rate
+// versus caps top out here, as SCCT PC versus, so a player's net traffic stays bounded; UNLIMITED lifts it
 inline constexpr uint32_t kVersusMaxFps = 240;
 
 enum class DisplayMode : uint32_t { Fullscreen, Windowed, Borderless };
@@ -36,7 +36,7 @@ struct Settings {
     DisplayMode display_mode = DisplayMode::Borderless;
     uint32_t width = 0, height = 0;  // 0 is the desktop mode
     uint32_t render_percent = 100;   // of the output height
-    uint32_t fps_cap = 60;           // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
+    uint32_t fps_cap = kFpsCapRefresh;  // 0 unlimited, kFpsCapRefresh the monitor's refresh rate
     uint32_t fov = 75;               // horizontal degrees on a 4:3 frame, 75 is the game's
     uint32_t brightness = 50;        // 0 to 100 as SCCT PC's sliders, 50 each leaves the picture alone
     uint32_t contrast = 50;
@@ -60,6 +60,9 @@ struct Settings {
     bool tone_mapping = false;
     uint32_t ambient_occlusion = 0;  // screen space, from the scene's depth: 0 off, 1 SSAO, 2 GTAO
     bool async_shaders = true;       // a draw whose pipeline needs compiling is skipped until the build threads have it; scda.toml only
+    bool custom_textures = true;     // images in textures\replacement\ beside the exe replace the game's
+    bool dump_textures = false;      // each texture once into textures\dumps\ beside the exe
+    uint32_t texture_dump_format = 0;  // 0 PNG, 1 DDS
     float mouse_sensitivity = 1.0f;  // horizontal
     float mouse_vertical_sensitivity = 1.0f;
     bool invert_mouse = false;  // the Y axis
@@ -78,7 +81,7 @@ struct Settings {
     float free_look_sensitivity = 1.0f;
     float weapon_sensitivity = 1.0f;
     float sniper_sensitivity = 1.0f;
-    // aiming a weapon or through a scope, times the sensitivity above
+    // aiming a weapon or through a scope, in place of the sensitivity above
     float aim_horizontal_sensitivity = 1.0f;
     float aim_vertical_sensitivity = 1.0f;
     bool skip_intros = false;        // logos video and rating screen at boot
@@ -165,6 +168,7 @@ bool MenuOpen();
 uint32_t SettingsRevision();  // counts saved setting changes, from F10 or the in-game pages
 bool Capturing();  // a key binding waits for a key
 void ToggleMenu();
+void ToggleTextureReplacement();  // the bind's: flips and saves the setting
 void DrawUi();
 // drawn by DrawUi under the console and the panel, every frame shown: the movies' subtitles (game/subtitles.cpp)
 inline void (*g_draw_overlay)() = nullptr;

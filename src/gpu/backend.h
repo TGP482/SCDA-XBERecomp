@@ -87,6 +87,9 @@ uint64_t UiImage(int slot);
 // F3: save the next frame, every draw and target, under captures
 inline std::atomic<bool> g_capture{false};
 
+// night vision is on: tone mapping takes the level's night vision preset
+inline std::atomic<bool> g_night_vision{false};
+
 // the game's shadow map, the colour surface bound beside it and the swizzled chain aliased over the map's memory
 // that blurs shadow edges on screen, by surface data as the headers hold it; blur_hi is 0 until the game made them
 struct ShadowTargets {
