@@ -43,6 +43,10 @@ struct Settings {
     bool fps_counter = false;
     uint32_t fmv_scale = 0;          // full screen movies on a wider screen: 0 fill it, 1 in a 4:3 frame
     uint32_t colour_blind = 0;       // 0 off, 1 protanopia, 2 deuteranopia, 3 tritanopia
+    // the game's font pages and the mission loading pictures redrawn at the render scale: 0 off, 1 sharpened (their
+    // own glyphs, edges hard), 2 ClearType (each glyph drawn by DirectWrite from a vector font matched to it; the
+    // pictures' briefing and tip set again from the game's words)
+    uint32_t sharp_text = 0;
     bool vsync = true;
     bool hdr_output = true;          // HDR10 on a display with Windows HDR on
     uint32_t aniso = 0;              // 0 as the game asks
@@ -81,6 +85,7 @@ struct Settings {
     float aim_horizontal_sensitivity = 1.0f;
     float aim_vertical_sensitivity = 1.0f;
     bool skip_intros = false;        // logos video and rating screen at boot
+    bool subtitles = true;           // the movies' speech in English, from subtitles/<movie>.srt
     bool pause_on_focus_loss = true;  // the game and its sound stop while the window is in the background
     std::string language = "auto";   // "auto" (the Windows display language) or one of kLanguages
     uint32_t audio_output = 0;       // audio::kOutputAuto, kOutputStereo, kOutputSurround or kOutputMono
@@ -131,6 +136,7 @@ inline float Narrow() { return 4.0f / 3.0f / Aspect(); }
 inline bool Widescreen() { return Aspect() > 1.34f; }
 
 std::filesystem::path ExeDir();
+std::filesystem::path AssetsDir();  // assets beside the exe or in a folder above it, empty without one
 // the game in assets (game_files.cpp): its folder and this executable's xbe, from the extracted files or a disc
 // image, which it mounts as D:; false after telling the player what is missing
 struct GameFiles {
@@ -164,6 +170,8 @@ bool Capturing();  // a key binding waits for a key
 void ToggleMenu();
 void ToggleTextureReplacement();  // the bind's: flips and saves the setting
 void DrawUi();
+// drawn by DrawUi under the console and the panel, every frame shown: the movies' subtitles (game/subtitles.cpp)
+inline void (*g_draw_overlay)() = nullptr;
 
 // the window's display has Windows HDR on, from the renderer
 inline std::atomic<bool> g_hdr_display{false};

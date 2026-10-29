@@ -12,8 +12,10 @@
 #include <utility>
 
 #include "app/app.h"
+#include "game/fonts.h"
 #include "game/magma.h"
 #include "game/loading.h"
+#include "game/subtitles.h"
 #include "gpu/backend.h"
 #include "xdk/d3d8.h"
 #include "xdk/hle.h"
@@ -597,6 +599,13 @@ X86_FUNC(sub_002E3011) {
             x1 = x1 * k + kCentre * (1 - k) * w;
         }
     }
+    // where a movie's picture lands, for its subtitles
+    if (ri && game::loading::g_movie) {
+        float w = float(int(R32(ri + 0x4B84))), h = float(int(R32(ri + 0x4B88)));
+        if (w > 0 && h > 0)
+            game::subtitles::MoviePicture(GF(ctx.esp + 8) / w, GF(ctx.esp + 0xC) / h, GF(ctx.esp + 0x10) / w,
+                                          GF(ctx.esp + 0x14) / h);
+    }
     __imp__sub_002E3011(ctx, base);
 }
 
@@ -679,10 +688,11 @@ X86_FUNC(sub_002C64E0) {
     g_decided = false;
 }
 
-// Magma frame; canvas outside pages is full width in a level, 4:3 in menus
+// Magma frame; canvas outside pages is full width in a level, 4:3 in menus. The font pages' sharp copies follow
 X86_EXTERN_FUNC(__imp__sub_002303E8);
 X86_FUNC(sub_002303E8) {
     __imp__sub_002303E8(ctx, base);
+    game::fonts::Poll();
     if (app::Get().fps_counter) Draw(ctx, base, Mode::Left, [](X86Context& c, uint8_t*) { app::DrawFps(c); });
     g_offset = g_hud_seen ? kNone : kCentre;
     g_in_level = g_hud_seen;

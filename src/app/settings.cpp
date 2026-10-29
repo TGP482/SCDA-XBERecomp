@@ -97,6 +97,9 @@ void Load() {
     s.fps_counter = t["fps_counter"].value_or(s.fps_counter);
     s.fmv_scale = std::min(t["fmv_scale"].value_or(s.fmv_scale), 1u);
     s.colour_blind = std::min(t["colour_blind"].value_or(s.colour_blind), 3u);
+    // true was the first build's ON, now sharpened
+    if (auto on = t["sharp_text"].value<bool>()) s.sharp_text = *on;
+    s.sharp_text = std::min(t["sharp_text"].value_or(s.sharp_text), 2u);
     s.vsync = t["vsync"].value_or(s.vsync);
     s.hdr_output = t["hdr_output"].value_or(s.hdr_output);
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
@@ -140,6 +143,7 @@ void Load() {
     s.aim_horizontal_sensitivity = float(t["aim_horizontal_sensitivity"].value_or(double(s.aim_horizontal_sensitivity)));
     s.aim_vertical_sensitivity = float(t["aim_vertical_sensitivity"].value_or(double(s.aim_vertical_sensitivity)));
     s.skip_intros = t["skip_intros"].value_or(s.skip_intros);
+    s.subtitles = t["subtitles"].value_or(s.subtitles);
     s.pause_on_focus_loss = t["pause_on_focus_loss"].value_or(s.pause_on_focus_loss);
     std::string language = t["language"].value_or(s.language);
     bool known = std::find(std::begin(kLanguages), std::end(kLanguages), language) != std::end(kLanguages);
@@ -184,6 +188,7 @@ toml::table Table() {
                   {"fps_counter", s.fps_counter},
                   {"fmv_scale", int64_t(s.fmv_scale)},
                   {"colour_blind", int64_t(s.colour_blind)},
+                  {"sharp_text", int64_t(s.sharp_text)},
                   {"vsync", s.vsync},
                   {"hdr_output", s.hdr_output},
                   {"anisotropic_filtering", int64_t(s.aniso)},
@@ -224,6 +229,7 @@ toml::table Table() {
                   {"aim_horizontal_sensitivity", double(s.aim_horizontal_sensitivity)},
                   {"aim_vertical_sensitivity", double(s.aim_vertical_sensitivity)},
                   {"skip_intros", s.skip_intros},
+                  {"subtitles", s.subtitles},
                   {"pause_on_focus_loss", s.pause_on_focus_loss},
                   {"language", s.language},
                   {"audio_output", int64_t(s.audio_output)},

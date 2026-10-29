@@ -576,22 +576,6 @@ struct Target {
     uint64_t hdr_frame = ~0ull;    // the present count it last went HDR, once a frame
 };
 
-// MemSig hashes a surface up to kSigWholeMax bytes whole, a bigger one as evenly spaced samples
-constexpr uint32_t kSigWholeMax = 65536;
-constexpr uint32_t kSigSamples = 64;
-constexpr uint32_t kSigSampleBytes = 64;
-
-uint64_t MemSig(uint32_t data, uint32_t total) {
-    const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(data));
-    uint64_t sig = Hash(&total, sizeof(total));
-    if (total <= kSigWholeMax) return Hash(p, total, sig);
-    for (uint32_t i = 0; i < kSigSamples; i++) {
-        const uint8_t* sample = p + uint64_t(total - kSigSampleBytes) * i / (kSigSamples - 1);
-        sig = Hash(sample, kSigSampleBytes, sig);
-    }
-    return sig;
-}
-
 // MemSig samples a big surface and misses small writes (XFONT text): after a Sync every byte is compared
 bool Changed(const Target& t) {
     if (t.drawn || t.read.empty()) return false;
@@ -626,6 +610,7 @@ struct Tex {
     const Tex* swap = nullptr;  // the texture pack's image drawn in its place
     uint64_t pack_key = 0;      // its pack image is still loading
     uint32_t pack_gen = 0;      // texturedumper::Generation the key was taken at, 0 after new bytes
+    uint64_t made = 0;  // the revision of the TextureOverride it holds, 0 the guest's own texels
 };
 
 struct PsoKey {
@@ -720,6 +705,7 @@ struct DrawTextures {
     ID3D12Resource* res[4];
     bool rt[4] = {};     // stage samples a render target
     float wide[4] = {};  // host texels per console texel of a target read into a smaller one, 0 otherwise
+    bool made[4] = {};   // stage samples a TextureOverride: it has its own levels
 };
 
 // a draw's shaders: what they are made from, their cache keys and the hashes Register returned
@@ -894,8 +880,9 @@ private:
     ID3D12Resource* BindTexture(const State& s, int stage, DrawTextures& stages);
     ID3D12Resource* BindTargetTexture(const State& s, int stage, const TextureDesc& d, Target& t, DrawTextures& stages);
     ID3D12Resource* BindGuestTexture(int stage, const TextureDesc& d, const FormatInfo& fi, DrawTextures& stages);
-    bool CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi);
+    bool CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const TextureOverride* o);
     void UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const uint8_t* p, bool same);
+    void UploadOverride(Tex& tx, const TextureOverride& o, bool same);
     void UploadTextureLevel(Tex& tx, uint32_t f, uint32_t l, const std::vector<uint8_t>& px, uint32_t pitch);
     void LatchPackKey(Tex& tx, const TextureDesc& d, const FormatInfo& fi);
     void LatchPackImage(Tex& tx);
@@ -964,6 +951,7 @@ private:
     void DrawHdrFrame(Target* t, ID3D12Resource* r, bool pillarbox, D3D12_CPU_DESCRIPTOR_HANDLE bb);
     void BlitFrame(const Target& t, ID3D12Resource* r, bool pillarbox, DXGI_FORMAT rtv = kBgra);
     void RenderUi();
+    void UploadUiImages();
     void ReleaseOldTextures();
     void ResetFrame();
     void CountFps();
@@ -1049,7 +1037,10 @@ private:
     ComPtr<ID3D12DescriptorHeap> smp_heap_;
     ComPtr<ID3D12DescriptorHeap> rtv_heap_;
     ComPtr<ID3D12DescriptorHeap> dsv_heap_;
-    ComPtr<ID3D12DescriptorHeap> ui_heap_;
+    ComPtr<ID3D12DescriptorHeap> ui_heap_;  // ImGui's font, then two views a UI image, used in turn
+    ComPtr<ID3D12Resource> ui_images_[kUiImages];
+    uint32_t ui_views_ = 0;  // bit i: image i's view is in its second slot
+    uint32_t ui_inc_ = 0;
     uint32_t srv_inc_ = 0;
     uint32_t smp_inc_ = 0;
     uint32_t rtv_inc_ = 0;
@@ -1282,7 +1273,7 @@ void D3D12Backend::CreateHeaps() {
     rtv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_RTV, kRtvCount + kFrames + kPostRtvs, false, rtv_heap_);
     post_rtv_ = kRtvCount + kFrames;
     dsv_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_DSV, kDsvCount, false, dsv_heap_);
-    CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1, true, ui_heap_);
+    ui_inc_ = CreateHeap(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV, 1 + 2 * kUiImages, true, ui_heap_);
     for (uint32_t i = kRtvCount; i-- > 0;) free_rtv_.push_back(i);
     for (uint32_t i = kDsvCount; i-- > 0;) free_dsv_.push_back(i);
 }
@@ -2803,16 +2794,17 @@ bool SameTexture(const Tex& tx, const TextureDesc& d) {
            tx.d.depth == d.depth && tx.d.levels == d.levels && tx.d.cube == d.cube && tx.d.pitch == d.pitch;
 }
 
-// false when the texture could not be made, its entry dropped
-bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi) {
+// false when the texture could not be made, its entry dropped; with an override, made as that is
+bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const TextureOverride* o) {
     if (tx.res) CurrentFrame().garbage.push_back(tx.res);
     tx = Tex{};
     tx.d = d;
-    tx.fmt = HostFormat(fi.host);
-    bool bc = fi.compressed;
-    uint32_t w = d.width;
-    uint32_t h = d.height;
-    tx.levels = d.levels;
+    tx.fmt = HostFormat(o ? Host::BGRA8 : fi.host);
+    bool bc = fi.compressed && !o;
+    uint32_t w = o ? o->width : d.width;
+    uint32_t h = o ? o->height : d.height;
+    tx.levels = o ? uint32_t(o->levels.size()) : d.levels;
+    tx.made = o ? o->revision : 0;
     if (bc && ((w & 3) || (h & 3))) {
         w = (w + 3) & ~3u;
         h = (h + 3) & ~3u;
@@ -2898,6 +2890,13 @@ void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo
     Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
 }
 
+void D3D12Backend::UploadOverride(Tex& tx, const TextureOverride& o, bool same) {
+    D3D12_RESOURCE_STATES st = same ? D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_DEST;
+    Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_COPY_DEST);
+    for (uint32_t l = 0; l < tx.levels; l++) UploadTextureLevel(tx, 0, l, o.levels[l], std::max(o.width >> l, 1u) * 4);
+    Transition(tx.res.Get(), st, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+}
+
 void FillTextureView(const Tex& tx, const TextureDesc& d, D3D12_SHADER_RESOURCE_VIEW_DESC& sv) {
     sv.Format = tx.fmt;
     if (d.cube) {
@@ -2911,22 +2910,28 @@ void FillTextureView(const Tex& tx, const TextureDesc& d, D3D12_SHADER_RESOURCE_
     }
 }
 
-// a texture in guest memory: made again when its layout changed, uploaded again when its bytes did
+// a texture in guest memory: made again when its layout changed, uploaded again when its bytes did. An override
+// stands in for it while the bytes are the ones the override was made from
 ID3D12Resource* D3D12Backend::BindGuestTexture(int stage, const TextureDesc& d, const FormatInfo& fi,
                                                DrawTextures& stages) {
     TexInfo& info = stages.info[stage];
     Tex& tx = textures_[d.data];
     uint32_t total = TotalSize(d);
     bool same = SameTexture(tx, d);
-    if (!same && !CreateTexture(tx, d, fi)) return nullptr;
     // cheap change check once per frame: lock epochs plus a sample of the bytes
     if (tx.frame != presents_ + 1 || !same) {
         tx.frame = presents_ + 1;
         const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(d.data));
-        uint64_t sig = MemSig(d.data, total) ^ DirtyEpoch(d.data);
+        uint64_t mem = MemSig(d.data, total);
+        std::shared_ptr<const TextureOverride> o = FindTextureOverride(d.data);
+        if (o && (o->sig != mem || d.cube || d.depth > 1)) o = nullptr;
+        if (same && tx.made != (o ? o->revision : 0)) same = false;
+        if (!same && !CreateTexture(tx, d, fi, o.get())) return nullptr;
+        uint64_t sig = mem ^ DirtyEpoch(d.data);
         if (sig != tx.sig || !same) {
             tx.sig = sig;
-            UploadTexture(tx, d, fi, p, same);
+            if (o) UploadOverride(tx, *o, same);
+            else UploadTexture(tx, d, fi, p, same);
             tx.pack_gen = 0;
         }
     }
@@ -2934,6 +2939,7 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(int stage, const TextureDesc& d, 
     if (tx.pack_key) LatchPackImage(tx);
     const Tex& drawn = tx.swap ? *tx.swap : tx;
     FillTextureView(drawn, d, stages.sv[stage]);
+    stages.made[stage] = drawn.made != 0;
     if (fi.depth) info.shadow = ShadowDepthKind(d.format);
     if (tx.norm && d.cube && hdr_) info.flags |= kTexNormCube;
     return drawn.res.Get();
@@ -2997,6 +3003,7 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
     sv = {};
     stages.rt[stage] = false;
     stages.wide[stage] = 0;
+    stages.made[stage] = false;
     sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
     sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
     sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -3047,6 +3054,15 @@ D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stage
     sd.MipLODBias = Bits(t[kTssMipLodBias]);
     sd.MinLOD = float(t[kTssMaxMipLevel]);
     sd.MaxLOD = mip ? D3D12_FLOAT32_MAX : sd.MinLOD;
+    // an override's own levels, the larger of the two about a pixel's footprint: one drawn near the size it was made
+    // for stays on its full level, one drawn much smaller steps down instead of shimmering
+    if (stages.made[i]) {
+        sd.Filter = D3D12_FILTER(fmin << 4 | fmag << 2 | D3D12_FILTER_TYPE_POINT);
+        sd.MaxAnisotropy = 0;
+        sd.MipLODBias = -0.5f;
+        sd.MinLOD = 0;
+        sd.MaxLOD = D3D12_FLOAT32_MAX;
+    }
     Color(t[kTssBorderColor], sd.BorderColor);
     if (stages.info[i].shadow) {
         // the console tests texel OP r, D3D12 tests r OP texel
@@ -4087,8 +4103,42 @@ void D3D12Backend::BlitFrame(const Target& t, ID3D12Resource* r, bool pillarbox,
     if (r) Blit(r, t.fmt, uv, {.gamma = gamma_, .rtv = rtv, .colour = mode ? colour.data() : nullptr});
 }
 
+struct UiImagePixels {
+    std::vector<uint8_t> bgra;
+    uint32_t w = 0, h = 0;
+    bool set = false;
+};
+std::mutex g_ui_images_lock;
+UiImagePixels g_ui_pending[kUiImages];
+std::atomic<uint64_t> g_ui_ids[kUiImages];
+
+// a UI image set since the last frame becomes a texture; its view goes in the slot the frames in flight are not using
+void D3D12Backend::UploadUiImages() {
+    for (int i = 0; i < kUiImages; i++) {
+        UiImagePixels p;
+        {
+            std::lock_guard lock(g_ui_images_lock);
+            if (!g_ui_pending[i].set) continue;
+            p = std::move(g_ui_pending[i]);
+            g_ui_pending[i] = {};
+        }
+        if (ui_images_[i]) CurrentFrame().garbage.push_back(ui_images_[i]);
+        ui_images_[i] = CreatePixelTexture(p.bgra, p.w * 4, p.w, p.h);
+        ui_views_ ^= 1u << i;
+        uint32_t view = 1 + 2 * uint32_t(i) + (ui_views_ >> i & 1);
+        D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+        sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+        sv.Texture2D.MipLevels = 1;
+        dev_->CreateShaderResourceView(ui_images_[i].Get(), &sv, Cpu(ui_heap_.Get(), view, ui_inc_));
+        g_ui_ids[i] = Gpu(ui_heap_.Get(), view, ui_inc_).ptr;
+    }
+}
+
 void D3D12Backend::RenderUi() {
     std::lock_guard lock(app::UiLock());
+    UploadUiImages();
     ImGui_ImplDX12_NewFrame();
     ImGui_ImplWin32_NewFrame();
     ImGui::NewFrame();
@@ -4520,5 +4570,13 @@ void D3D12Backend::SetGamma(const uint8_t*) {}
 }  // namespace
 
 std::unique_ptr<Backend> CreateBackend() { return std::make_unique<D3D12Backend>(); }
+
+void SetUiImage(int slot, std::vector<uint8_t> bgra, uint32_t w, uint32_t h) {
+    if (slot < 0 || slot >= kUiImages || !w || !h || bgra.size() < size_t(w) * h * 4) return;
+    std::lock_guard lock(g_ui_images_lock);
+    g_ui_pending[slot] = {std::move(bgra), w, h, true};
+}
+
+uint64_t UiImage(int slot) { return slot >= 0 && slot < kUiImages ? g_ui_ids[slot].load() : 0; }
 
 }  // namespace gpu

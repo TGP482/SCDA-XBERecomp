@@ -48,6 +48,8 @@ constexpr uint32_t kColourBlindModes[] = {0, 1, 2, 3};
 const char* const kColourBlindNames[] = {"OFF", "PROTANOPIA", "DEUTERANOPIA", "TRITANOPIA"};
 constexpr uint32_t kDumpFormats[] = {0, 1};
 const char* const kDumpFormatNames[] = {"PNG", "DDS"};
+constexpr uint32_t kSharpTexts[] = {0, 1, 2};
+const char* const kSharpTextNames[] = {"OFF (DEFAULT)", "SHARPENED", "CLEARTYPE"};
 constexpr uint32_t kAudioOutputs[] = {audio::kOutputAuto, audio::kOutputMono, audio::kOutputStereo,
                                       audio::kOutputSurround};
 const char* const kAudioOutputNames[] = {"AUTOMATIC", "MONO", "2.0 STEREO", "5.1 SURROUND"};
@@ -317,7 +319,7 @@ enum RowId {
     kSniperSensitivity, kFmvScale, kColourBlind, kAimHorizontal, kAimVertical, kInvertMouseX, kInvertPadX, kInvertPadY,
     kSensitivityVertical, kPadDeadZone, kPadHorizontal, kPadVertical, kPadAimHorizontal, kPadAimVertical,
     kVibration, kGyroAiming, kGyroSensitivity, kGyroAxis, kGyroButton, kGyroButtonMode, kGyroRecenter, kGyroCalibrate,
-    kTextureReplacement, kTextureDumping, kDumpFormat
+    kTextureReplacement, kTextureDumping, kDumpFormat, kSharpText, kSubtitles
 };
 
 using rows::Kind;
@@ -331,7 +333,8 @@ bool IsGyroRow(int id) { return id >= kGyroAiming && id <= kGyroCalibrate; }
 bool VersusHides(int id) {
     if (!kVersus) return false;
     return id == kShaderModel || id == kHdr || id == kToneMapping || id == kShadowResolution ||
-           id == kShadowDistance || id == kShadowFilter || id == kTickRate || id == kInputDelay || IsGyroRow(id);
+           id == kShadowDistance || id == kShadowFilter || id == kTickRate || id == kInputDelay ||
+           id == kSharpText || id == kSubtitles || IsGyroRow(id);
 }
 
 constexpr Row kSettingsRows[] = {
@@ -349,6 +352,7 @@ constexpr Row kSettingsRows[] = {
     {Kind::Value, kFpsCounter, "FPS COUNTER"},
     {Kind::Value, kFmvScale, "FMV SCALE"},
     {Kind::Value, kColourBlind, "COLOUR BLIND MODE"},
+    {Kind::Value, kSharpText, "SHARP TEXT"},
     {Kind::Heading, -1, "GRAPHICS"},
     {Kind::Value, kShaderModel, "SHADER MODEL"},
     {Kind::Value, kHdr, "HDR RENDERING"},
@@ -364,6 +368,7 @@ constexpr Row kSettingsRows[] = {
     {Kind::Value, kSkipIntros, "SKIP INTROS"},
     {Kind::Value, kPauseOnFocusLoss, "PAUSE ON FOCUS LOSS"},
     {Kind::Value, kLanguage, "LANGUAGE"},
+    {Kind::Value, kSubtitles, "SUBTITLES"},
     {Kind::Value, kAudioOutput, "AUDIO OUTPUT"},
     {Kind::Value, kTickRate, "COOP TICK RATE"},
     {Kind::Value, kInputDelay, "COOP MIN INPUT DELAY"},
@@ -451,6 +456,7 @@ bool* ToggleFlag(Settings& s, int id) {
         case kToneMapping: return &s.tone_mapping;
         case kSmaa: return &s.smaa;
         case kSkipIntros: return &s.skip_intros;
+        case kSubtitles: return &s.subtitles;
         case kPauseOnFocusLoss: return &s.pause_on_focus_loss;
         case kPushToTalk: return &s.push_to_talk;
         case kInvertMouse: return &s.invert_mouse;
@@ -555,6 +561,9 @@ bool StepDisplayRow(int id, int step, Settings& s, char (&text)[64]) {
             std::snprintf(text, sizeof(text), "%s", kColourBlindNames[mode]);
             return true;
         }
+        case kSharpText:
+            std::snprintf(text, sizeof(text), "%s", kSharpTextNames[StepTable(kSharpTexts, s.sharp_text, step)]);
+            return true;
         case kFov:
             // 45 to 140 in steps of 1
             if (step) s.fov = uint32_t(StepRange(int(s.fov), 45, 140, 1, step));
@@ -1214,6 +1223,7 @@ void DrawUi() {
     io.KeyRepeatRate = 0.1f;  // held arrows step ten times a second, ImGui's twenty is too fast for settings
     // scale the font with the output height
     io.FontGlobalScale = std::max(1.0f, io.DisplaySize.y / 720.0f);
+    if (g_draw_overlay) g_draw_overlay();
     if (ConsoleOpen()) DrawConsole();
     if (MenuOpen()) {
         PollCapture();
