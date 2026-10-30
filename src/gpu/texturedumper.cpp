@@ -49,6 +49,16 @@ constexpr uint32_t kWatchRetry = 120;  // presents between tries while the pack 
 constexpr DWORD kPackChanges = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
                                FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
 
+// With Xbox One button prompts the game's White and Black button icons (Magma's Button_white and Button_black, 32x32
+// DXT5) are drawn as LB and RB, the bumpers that press them: xbox\<file> beside the exe, by the key Texture Dumping
+// names the icons by
+struct Builtin {
+    uint64_t key;
+    const char* file;
+};
+constexpr Builtin kXboxOneIcons[] = {{0x1f65e78c3ad5b4cbull, "lb.png"}, {0xda912222d91d83cdull, "rb.png"}};
+constexpr uint32_t kIconFormat = 0x0F, kIconSide = 32;  // DXT5
+
 using Clock = std::chrono::steady_clock;
 
 // the settings as Update latched them, the render thread's
@@ -56,6 +66,7 @@ struct Latched {
     bool replacing = false;
     bool dumping = false;
     uint32_t format = 0;
+    bool xbox_one = false;  // Xbox One button prompts
     bool operator==(const Latched&) const = default;
 };
 
@@ -65,6 +76,8 @@ struct Pack {
     fs::path pack_dir;
     fs::path dump_dir;
     std::unordered_map<uint64_t, fs::path> files;  // by the key in their names; written by Update alone
+    // with Xbox One prompts, their icons by the game icon's key (kXboxOneIcons); written by Update alone
+    std::unordered_map<uint64_t, fs::path> builtin;
     HANDLE watch = INVALID_HANDLE_VALUE;           // changes under pack_dir
     uint32_t watch_tries = 0;
     std::optional<Clock::time_point> changed;      // the last change seen, not listed yet
@@ -488,12 +501,28 @@ Image Decode(const TextureDesc& d, const uint8_t* guest, const uint32_t* palette
     return img;
 }
 
-// the settings into g.set; false when none changed
-bool LatchSettings() {
+// a load started before is dropped, every image is asked for again
+void Forget() {
+    std::lock_guard l(g.lock);
+    g.revision++;
+    g.asked.clear();
+    g.loaded.clear();
+}
+
+// the settings into g.set; false when none changed. icons: the Xbox One icons came or went, so GPU copies made for
+// their keys are stale
+bool LatchSettings(bool& icons) {
     const app::Settings& s = app::Get();
-    Latched now{s.custom_textures, s.dump_textures, s.texture_dump_format};
+    Latched now{s.custom_textures, s.dump_textures, s.texture_dump_format, s.button_prompts == app::kPromptsXboxOne};
     if (now == g.set) return false;
+    icons = now.xbox_one != g.set.xbox_one;
     g.set = now;
+    if (icons) {
+        g.builtin.clear();
+        if (now.xbox_one)
+            for (const Builtin& i : kXboxOneIcons) g.builtin.emplace(i.key, app::ExeDir() / "xbox" / i.file);
+        Forget();
+    }
     fs::path root = app::ExeDir() / "textures";
     g.pack_dir = root / "replacement";
     if (now.dumping) {
@@ -533,30 +562,33 @@ bool UpdatePackFiles() {
     if (!g.changed || now - *g.changed < kSettle) return false;
     g.changed.reset();
     ListPack(g.pack_dir);
-    std::lock_guard l(g.lock);
-    g.revision++;
-    g.asked.clear();
-    g.loaded.clear();
+    Forget();
     return true;
 }
+
+// the player's pack applies, or dumping: every texture is named
+bool PackOrDumps() { return (g.set.replacing && !g.files.empty()) || g.set.dumping; }
 
 }  // namespace
 
 bool Update() {
-    bool changed = LatchSettings();
+    bool icons = false;
+    bool changed = LatchSettings(icons);
     bool reloaded = g.set.replacing && UpdatePackFiles();
     if (changed || reloaded) g.generation++;
-    return reloaded;
+    return reloaded || icons;
 }
 
 uint32_t Generation() { return g.generation; }
 
-bool Replacing() { return g.set.replacing && !g.files.empty(); }
+bool Replacing() { return (g.set.replacing && !g.files.empty()) || !g.builtin.empty(); }
 
 uint64_t Key(const TextureDesc& d, const FormatInfo& fi, const uint8_t* guest, const uint32_t* palette) {
     if (!Replacing() && !g.set.dumping) return 0;
     // cube maps, volumes and depth stay the console's; linear ones are movie frames and the game's own copies
     if (d.cube || d.depth > 1 || d.linear || UploadFormat(fi.host) == DXGI_FORMAT_UNKNOWN) return 0;
+    // for the built-in icons alone only their shape is worth naming
+    if (!PackOrDumps() && (d.format != kIconFormat || d.width != kIconSide || d.height != kIconSide)) return 0;
     uint32_t shape[] = {d.format, d.width, d.height};
     uint64_t key = Hash(guest, LevelSize(d, 0), Hash(shape, sizeof(shape)));
     if (palette) key = Hash(palette, kPaletteBytes, key);
@@ -581,8 +613,11 @@ void Dump(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32
 }
 
 Lookup Take(uint64_t key, Image& out) {
-    auto file = g.files.find(key);
-    if (!g.set.replacing || file == g.files.end()) return Lookup::None;
+    // the player's own pack first, then a built-in icon
+    const fs::path* file = nullptr;
+    if (auto it = g.files.find(key); g.set.replacing && it != g.files.end()) file = &it->second;
+    else if (auto icon = g.builtin.find(key); icon != g.builtin.end()) file = &icon->second;
+    if (!file) return Lookup::None;
     uint32_t revision = 0;
     {
         std::lock_guard l(g.lock);
@@ -596,7 +631,7 @@ Lookup Take(uint64_t key, Image& out) {
         if (!g.asked.insert(key).second) return Lookup::Loading;
         revision = g.revision;
     }
-    Post([key, path = file->second, revision] { Load(key, path, revision); });
+    Post([key, path = *file, revision] { Load(key, path, revision); });
     return Lookup::Loading;
 }
 

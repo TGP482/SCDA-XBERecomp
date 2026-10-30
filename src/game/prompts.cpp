@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <utility>
 
+#include "app/app.h"
 #include "core/input.h"
 #include "game/magma.h"
 #include "xdk/hle.h"
@@ -23,6 +24,7 @@ uint32_t StackOwner(uint32_t page);  // options_menu.cpp
 uint32_t DrawingPage();  // hud.cpp
 uint32_t KeyboardPlayer();  // mouse.cpp
 std::u16string KeyWording(std::u16string text);  // text.cpp
+std::u16string XboxOneWording(std::u16string text);  // text.cpp
 }
 
 X86_EXTERN_FUNC(__imp__sub_002C64E0);  // Magma element draw (thiscall instance), hooked in hud.cpp
@@ -600,16 +602,17 @@ bool ComboElement(X86Context& ctx, uint8_t* base, uint32_t instance) {
 }
 
 // hud.cpp, any element about to draw. On the keyboard a text naming the pad's buttons draws with the bound keys
-// in their place, given to the draw the way a list gives a row its text, so what is kept follows the device: true
-// when drawn here.
+// in their place, with Xbox One prompts on the pad with LB and RB for the White and Black buttons, given to the draw
+// the way a list gives a row its text, so what is kept follows the device: true when drawn here.
 bool WordingElement(X86Context& ctx, uint8_t* base, uint32_t instance) {
     static bool drawing = false;
     static uint32_t buffer = 0;
     uint32_t widget = R32(instance + kInstanceWidget);
     uint32_t screen = R32(kScreen);
-    if (drawing || !widget || !screen || R32(widget) != kTextWidget || !(G<uint8_t>(instance + kVisible) & 1) ||
-        !Keyboard(game::DrawingPage()))
+    if (drawing || !widget || !screen || R32(widget) != kTextWidget || !(G<uint8_t>(instance + kVisible) & 1))
         return false;
+    bool keyboard = Keyboard(game::DrawingPage());
+    if (!keyboard && app::Get().button_prompts != app::kPromptsXboxOne) return false;
     uint32_t given = R32(screen + kGivenText);
     if (!given && R32(widget + kTextString + kStringLength) > kMaxReadChars) return false;
     std::u16string text = given ? std::u16string() : ReadText(widget);
@@ -617,7 +620,7 @@ bool WordingElement(X86Context& ctx, uint8_t* base, uint32_t instance) {
         if (i == kMaxWording) return false;
         text += char16_t(R16(given + i * 2));
     }
-    std::u16string keys = KeyWording(text);
+    std::u16string keys = keyboard ? KeyWording(text) : XboxOneWording(text);
     if (keys == text || keys.size() > kMaxWording) return false;
     if (!buffer) buffer = mem::AllocSystem((kMaxWording + 1) * 2);
     if (!buffer) return false;
