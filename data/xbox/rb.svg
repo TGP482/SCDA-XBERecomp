@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <!-- Xbox One right bumper, lb.svg mirrored: the outer end (right) slopes; the letters read the right way round. -->
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#8a8d92"/>
+      <stop offset="0.12" stop-color="#5a5d62"/>
+      <stop offset="0.2" stop-color="#3c3f44"/>
+      <stop offset="0.65" stop-color="#2a2c30"/>
+      <stop offset="1" stop-color="#1b1c1f"/>
+    </linearGradient>
+    <linearGradient id="ink" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#e4e6e8"/>
+      <stop offset="1" stop-color="#a6a9ae"/>
+    </linearGradient>
+  </defs>
+  <path transform="matrix(-1 0 0 1 32 0)"
+        d="M11 9.5H25.5A2.5 2.5 0 0 1 28 12V20.5A2.5 2.5 0 0 1 25.5 23H6.5A2.5 2.5 0 0 1 4 20.5V16C4 12 7 9.5 11 9.5Z"
+        fill="url(#body)" stroke="#0e0f11" stroke-width="0.9"/>
+  <g fill="url(#ink)" fill-rule="evenodd" transform="translate(9.75 12.25) scale(1.05)">
+    <path d="M0 0H3.1C4.4 0 5.2 0.9 5.2 2.1C5.2 3.1 4.65 3.8 3.8 4.1L5.5 7.6H3.2L2.2 5.2V7.6H0Z
+      M2.2 1.55H2.9C3.35 1.55 3.6 1.85 3.6 2.2C3.6 2.6 3.35 2.9 2.9 2.9H2.2Z"/>
+    <path transform="translate(6.6 0)" d="M0 0H3C4.2 0 4.9 0.8 4.9 1.85C4.9 2.7 4.5 3.3 3.9 3.6C4.7 3.9 5.3 4.6 5.3 5.6C5.3 6.8 4.4 7.6 3.2 7.6H0Z
+      M2.1 1.55H2.8C3.2 1.55 3.4 1.85 3.4 2.15C3.4 2.5 3.2 2.8 2.8 2.8H2.1Z
+      M2.1 4.45H3C3.5 4.45 3.75 4.8 3.75 5.2C3.75 5.65 3.5 5.95 3 5.95H2.1Z"/>
+  </g>
+</svg>
