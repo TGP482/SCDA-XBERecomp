@@ -14,12 +14,13 @@ struct TexInfo {
     uint8_t kind = kTexNone;
     uint8_t rect = 0;    // linear texture, coordinates in texels
     uint8_t shadow = 0;  // depth texture: 1 D24, 2 D16
-    uint8_t flags = 0;   // kTexHdr, kTexNormCube, kTexWide
+    uint8_t flags = 0;   // kTexHdr, kTexNormCube, kTexWide, kTexRamp
 };
 enum : uint8_t {
     kTexHdr = 1,       // a render target holding HDR colour divided by the headroom
     kTexNormCube = 2,  // a normalization cube: computed per pixel instead, with HDR
     kTexWide = 4,      // an upscaled target shrunk by the pass: each tap averaged over console texels
+    kTexRamp = 8,      // a dithered ramp: dependent reads smooth over its entries, with HDR
 };
 
 struct PixelKey {

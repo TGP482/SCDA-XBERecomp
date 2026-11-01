@@ -650,6 +650,7 @@ struct Tex {
     uint64_t sig = 0;
     uint64_t frame = 0;
     bool norm = false;  // a normalization cube
+    bool ramp = false;  // a dithered ramp, see UpdateRamp
     const Tex* swap = nullptr;  // the texture pack's image drawn in its place
     uint64_t pack_key = 0;      // its pack image is still loading
     uint32_t pack_gen = 0;      // texturedumper::Generation the key was taken at, 0 after new bytes
@@ -2883,6 +2884,30 @@ void UpdateNormCube(Tex& tx, const TextureDesc& d, const FormatInfo& fi, uint32_
     }
 }
 
+// a dithered ramp: a strip of BGRA entries at most kRampRows high, quantized from a curve with dither, so along its
+// first row some channel turns back kRampTurns times or more where a smooth curve never does. The game's glow reads
+// one through the scene's brightness: at HDR's finer brightness its turns show as contour lines
+constexpr uint32_t kRampRows = 4;
+constexpr uint32_t kRampMinWidth = 64;
+constexpr int kRampTurns = 8;
+
+void UpdateRamp(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const std::vector<uint8_t>& px) {
+    tx.ramp = false;
+    bool strip = fi.host == Host::BGRA8 && !d.cube && d.depth == 1;
+    if (!strip || d.height > kRampRows || d.width < kRampMinWidth || px.size() < size_t(d.width) * 4) return;
+    for (int ch = 0; ch < 4 && !tx.ramp; ch++) {
+        int turns = 0;
+        int last = 0;  // the sign of the last step that moved
+        for (uint32_t x = 1; x < d.width; x++) {
+            int step = px[x * 4 + ch] - px[(x - 1) * 4 + ch];
+            int sign = (step > 0) - (step < 0);
+            if (sign && last && sign != last) turns++;
+            if (sign) last = sign;
+        }
+        tx.ramp = turns >= kRampTurns;
+    }
+}
+
 void CopyLevelRows(uint8_t* out, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp, UINT rows, UINT64 row_size,
                    const std::vector<uint8_t>& px, uint32_t pitch) {
     uint32_t slices = fp.Footprint.Depth;
@@ -2928,6 +2953,7 @@ void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo
             uint32_t pitch;
             DecodeLevel(d, l, f, p, nullptr, px, pitch);
             if (d.cube && !l) UpdateNormCube(tx, d, fi, f, px, pitch);
+            if (!d.cube && !l) UpdateRamp(tx, d, fi, px);
             UploadTextureLevel(tx, f, l, px, pitch);
         }
     }
@@ -2972,6 +2998,7 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(int stage, const TextureDesc& d, 
     FillTextureView(drawn, d, stages.sv[stage]);
     if (fi.depth) info.shadow = ShadowDepthKind(d.format);
     if (tx.norm && d.cube && hdr_) info.flags |= kTexNormCube;
+    if (drawn.ramp && hdr_) info.flags |= kTexRamp;
     return drawn.res.Get();
 }
 
