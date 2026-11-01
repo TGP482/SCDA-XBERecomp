@@ -14,6 +14,9 @@ void AfterShowScreen(X86Context& ctx);
 // copied back on the GPU (the game's copy goes through 640x480 memory)
 void BothBuffers(X86Context& ctx, uint32_t render_device);
 
+// a font the game has loaded, before the loader's last step (fonts.cpp): Title_18's glyphs are kept for the pictures
+void FontLoaded(uint32_t font);
+
 // a movie frame is being drawn: hud.cpp redoes its fit for the frame's shape
 inline thread_local bool g_movie = false;
 

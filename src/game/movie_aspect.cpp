@@ -8,6 +8,7 @@
 #include <thread>
 
 #include "game/loading.h"
+#include "game/subtitles.h"
 #include "xdk/hle.h"
 
 using namespace kernel;
@@ -51,13 +52,16 @@ X86_FUNC(sub_002E6D5B) {
     else
         __imp__sub_002E6D5B(ctx, base);
     g_wide_movie = game::loading::g_movie = false;
+    if (bink) game::subtitles::AfterPageMovie(bink);
 }
 
 X86_FUNC(sub_002E708A) {
-    g_wide_movie = Wide(R32(ctx.esp + 4));
+    uint32_t movie = R32(ctx.esp + 4), bink = movie ? R32(movie + kMovieBink) : 0;
+    g_wide_movie = Wide(movie);
     game::loading::g_movie = true;
     __imp__sub_002E708A(ctx, base);
     g_wide_movie = game::loading::g_movie = false;
+    if (bink) game::subtitles::AfterPageMovie(bink);
 }
 
 // the level is the menu (thiscall, no arguments)

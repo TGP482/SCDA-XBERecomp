@@ -1,4 +1,8 @@
 #include "build_info.h"
+#include "resources.h"
+
+IDR_FONT_TOMORROW_BOLD_ITALIC RCDATA "../../fonts/Tomorrow-BoldItalic.ttf"
+IDR_FONT_DSEG7_CLASSIC_BOLD_ITALIC RCDATA "../../fonts/DSEG7Classic-BoldItalic.ttf"
 
 1 VERSIONINFO
 FILEVERSION SCDA_VERSION, 0, 0, 0

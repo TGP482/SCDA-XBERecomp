@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstring>
 #include <mutex>
 #include <unordered_map>
 
 #include "core/log.h"
+#include "gpu/shaders.h"
 #include "kernel/kernel.h"
 
 namespace gpu {
@@ -258,9 +260,50 @@ float DepthTexel(uint32_t fmt, const uint8_t* p) {
     }
 }
 
+// a DXT colour block's four colours as B, G, R, A; DXT1 has a three colour mode with transparent black when
+// colour 0 is not above colour 1, DXT3 and DXT5 always use four
+void BlockColours(const uint8_t* b, bool dxt1, uint8_t (&c)[4][4]) {
+    uint32_t c0 = b[0] | b[1] << 8, c1 = b[2] | b[3] << 8;
+    for (int i = 0; i < 2; i++) {
+        uint32_t v = i ? c1 : c0;
+        c[i][0] = Expand5(v & 31);
+        c[i][1] = Expand6((v >> 5) & 63);
+        c[i][2] = Expand5(v >> 11);
+        c[i][3] = 255;
+    }
+    bool four = !dxt1 || c0 > c1;
+    for (int ch = 0; ch < 3; ch++) {
+        c[2][ch] = uint8_t(four ? (2 * c[0][ch] + c[1][ch] + 1) / 3 : (c[0][ch] + c[1][ch]) / 2);
+        c[3][ch] = uint8_t(four ? (c[0][ch] + 2 * c[1][ch] + 1) / 3 : 0);
+    }
+    c[2][3] = 255;
+    c[3][3] = four ? 255 : 0;
+}
+
+// texel i (row major) of a DXT5 alpha block
+uint8_t Dxt5Alpha(const uint8_t* b, int i) {
+    int a0 = b[0], a1 = b[1];
+    uint64_t bits = 0;
+    for (int k = 0; k < 6; k++) bits |= uint64_t(b[2 + k]) << (8 * k);
+    int code = int(bits >> (3 * i) & 7);
+    if (code < 2) return uint8_t(code ? a1 : a0);
+    if (a0 > a1) return uint8_t(((8 - code) * a0 + (code - 1) * a1) / 7);
+    return uint8_t(code == 6 ? 0 : code == 7 ? 255 : ((6 - code) * a0 + (code - 1) * a1) / 5);
+}
+
 std::mutex g_dirty_lock;
 std::unordered_map<uint32_t, uint64_t> g_dirty;
 uint64_t g_epoch = 1;
+
+std::mutex g_override_lock;
+std::unordered_map<uint32_t, std::shared_ptr<TextureOverride>> g_overrides;
+std::atomic<size_t> g_override_count{0};  // looked at before the lock: most binds find none
+uint64_t g_override_revision = 0;
+
+// MemSig hashes a surface up to kSigWholeMax bytes whole, a bigger one as evenly spaced samples
+constexpr uint32_t kSigWholeMax = 65536;
+constexpr uint32_t kSigSamples = 64;
+constexpr uint32_t kSigSampleBytes = 64;
 
 }  // namespace
 
@@ -400,6 +443,48 @@ void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint
             }
 }
 
+bool DecodeLevelBgra(const TextureDesc& d, const uint8_t* guest, const uint32_t* palette, std::vector<uint8_t>& out) {
+    const FormatInfo& f = Format(d.format);
+    if (f.depth) return false;
+    uint32_t pitch = 0;
+    if (!f.compressed) {
+        DecodeLevel(d, 0, 0, guest, palette, out, pitch);
+        return true;
+    }
+    std::vector<uint8_t> blocks;
+    DecodeLevel(d, 0, 0, guest, palette, blocks, pitch);
+    uint32_t w = d.width, h = d.height, bw = std::max(1u, (w + 3) / 4), bytes = f.bits;
+    out.assign(size_t(w) * h * 4, 0);
+    for (uint32_t by = 0; by < std::max(1u, (h + 3) / 4); by++)
+        for (uint32_t bx = 0; bx < bw; bx++) {
+            const uint8_t* b = &blocks[(size_t(by) * bw + bx) * bytes];
+            const uint8_t* colour = f.host == Host::BC1 ? b : b + 8;
+            uint8_t c[4][4];
+            BlockColours(colour, f.host == Host::BC1, c);
+            uint32_t indices = colour[4] | colour[5] << 8 | colour[6] << 16 | uint32_t(colour[7]) << 24;
+            for (int i = 0; i < 16; i++) {
+                uint32_t x = bx * 4 + uint32_t(i % 4), y = by * 4 + uint32_t(i / 4);
+                if (x >= w || y >= h) continue;
+                uint8_t* o = &out[(size_t(y) * w + x) * 4];
+                std::memcpy(o, c[indices >> (2 * i) & 3], 4);
+                if (f.host == Host::BC2) o[3] = Expand4(b[i / 2] >> (i % 2 * 4) & 15);
+                if (f.host == Host::BC3) o[3] = Dxt5Alpha(b, i);
+            }
+        }
+    return true;
+}
+
+uint64_t MemSig(uint32_t data, uint32_t total) {
+    const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(data));
+    uint64_t sig = Hash(&total, sizeof(total));
+    if (total <= kSigWholeMax) return Hash(p, total, sig);
+    for (uint32_t i = 0; i < kSigSamples; i++) {
+        const uint8_t* sample = p + uint64_t(total - kSigSampleBytes) * i / (kSigSamples - 1);
+        sig = Hash(sample, kSigSampleBytes, sig);
+    }
+    return sig;
+}
+
 uint32_t LinearColorFormat(uint32_t f) {
     switch (f) {
         case 0x06: return 0x12;
@@ -443,6 +528,26 @@ uint64_t DirtyEpoch(uint32_t data) {
     std::lock_guard<std::mutex> lock(g_dirty_lock);
     auto it = g_dirty.find(data);
     return it == g_dirty.end() ? 0 : it->second;
+}
+
+void SetTextureOverride(uint32_t data, std::shared_ptr<TextureOverride> o) {
+    std::lock_guard<std::mutex> lock(g_override_lock);
+    o->revision = ++g_override_revision;
+    g_overrides[data] = std::move(o);
+    g_override_count = g_overrides.size();
+}
+
+void ClearTextureOverride(uint32_t data) {
+    std::lock_guard<std::mutex> lock(g_override_lock);
+    g_overrides.erase(data);
+    g_override_count = g_overrides.size();
+}
+
+std::shared_ptr<const TextureOverride> FindTextureOverride(uint32_t data) {
+    if (!g_override_count) return nullptr;
+    std::lock_guard<std::mutex> lock(g_override_lock);
+    auto it = g_overrides.find(data);
+    return it == g_overrides.end() ? nullptr : it->second;
 }
 
 bool CopySurfaceMemory(const Surface& src, const Surface& dst, uint32_t count, uint32_t rects, uint32_t points) {

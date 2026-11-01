@@ -2,6 +2,7 @@
 #include <atomic>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 #include "gpu/state.h"
 
@@ -76,6 +77,12 @@ inline std::atomic<int> g_in_splash{0};
 inline std::atomic<bool> g_shown_splash{false};  // the frame on screen was presented 4:3
 // the game side drew a 4:3 picture this frame (versus' loading page): the next Swap shows it 4:3, whatever drew after
 inline std::atomic<bool> g_splash_next{false};
+
+// pictures the ImGui pass draws (ImDrawList::AddImage), B, G, R, A rows: set from any thread, uploaded when the next
+// frame is drawn; UiImage is its ImTextureID, 0 until then (render thread). Slot 0: the movie subtitles' font
+constexpr int kUiImages = 1;
+void SetUiImage(int slot, std::vector<uint8_t> bgra, uint32_t w, uint32_t h);
+uint64_t UiImage(int slot);
 
 // F3: save the next frame, every draw and target, under captures
 inline std::atomic<bool> g_capture{false};

@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <memory>
 #include <vector>
 
 #include "gpu/state.h"
@@ -40,6 +41,25 @@ uint32_t TotalSize(const TextureDesc& d);
 // converts one level (one face) from guest memory into what Host describes, rows tightly packed
 void DecodeLevel(const TextureDesc& d, uint32_t level, uint32_t face, const uint8_t* guest, const uint32_t* palette,
                  std::vector<uint8_t>& out, uint32_t& row_pitch);
+// level 0 as B, G, R, A rows tightly packed, DXT blocks expanded; false for depth formats
+bool DecodeLevelBgra(const TextureDesc& d, const uint8_t* guest, const uint32_t* palette, std::vector<uint8_t>& out);
+
+// guest bytes hashed: whole up to 64 KB, a bigger range as evenly spaced samples
+uint64_t MemSig(uint32_t data, uint32_t total);
+
+// a texture the host made to be sampled in a guest texture's place (fonts.cpp: font pages at the render scale). It
+// is bound while the guest texture's bytes still have the signature it was made from; coordinates are fractions of
+// the texture, so a larger one samples the same picture
+struct TextureOverride {
+    uint64_t sig = 0;  // MemSig of the guest texture over its TotalSize
+    uint32_t width = 0, height = 0;
+    std::vector<std::vector<uint8_t>> levels;  // B, G, R, A rows tightly packed, from level 0
+    uint64_t revision = 0;                     // given by SetTextureOverride, a new one each time
+};
+// keyed by the guest texture's level 0 address; any thread
+void SetTextureOverride(uint32_t data, std::shared_ptr<TextureOverride> o);
+void ClearTextureOverride(uint32_t data);
+std::shared_ptr<const TextureOverride> FindTextureOverride(uint32_t data);
 
 uint32_t LinearColorFormat(uint32_t fmt);
 uint32_t LinearDepthFormat(uint32_t fmt);
