@@ -149,6 +149,19 @@ constexpr Words kWords[] = {{"int", u"PRESS ANY KEY"},
 std::u16string_view g_press_text;  // the picture ShowScreen is loading waits for a key: its words
 bool g_edges = true;               // the picture ShowScreen is loading is shown 4:3 (the ESRB notice is not)
 bool g_bar_in_picture = false;     // the picture ShowScreen is loading is the kept one: the full bar goes into it
+std::string g_tip_path;            // the picture ShowScreen is loading, in lower case: its tip may be edited
+
+// a guest path, TCHAR or char, in lower case
+std::string LowerPath(uint32_t p) {
+    bool wide = !G<uint8_t>(p + 1);
+    std::string path;
+    for (uint32_t i = 0; i < 519; i++) {
+        uint32_t c = wide ? R16(p + i * 2) : G<uint8_t>(p + i);
+        if (!c) break;
+        path += char(std::tolower(int(c & 0xFF)));
+    }
+    return path;
+}
 
 // D:\Default\DataXb\Screens\<language>\<map>_loading<n>.tga
 std::u16string_view WordsFor(const std::string& path) {
@@ -384,6 +397,11 @@ X86_FUNC(sub_00051673) {
     __imp__sub_00051673(ctx, base);
     if (picture && std::exchange(g_bar_in_picture, false)) PaintBar(ctx.ebp);
     if (picture && g_edges && app::Widescreen()) PaintEdges(ctx.ebp);
+    if (picture && !g_tip_path.empty()) {
+        uint32_t pitch = 0;
+        if (uint8_t* texels = PictureTexels(ctx.ebp, pitch))
+            game::loading::EditTip(std::exchange(g_tip_path, {}), texels, pitch);
+    }
     if (!picture || g_press_text.empty()) return;
     KeepPage();
     PressText(ctx.ebp, std::exchange(g_press_text, {}));
@@ -405,10 +423,10 @@ void game::loading::BeforeShowScreen(X86Context& ctx) {
         while (n < 519 && (wide ? R16(p + n * 2) : G<uint8_t>(p + n))) n++;
         uint32_t bytes = (n + 1) * (wide ? 2 : 1);
         SetShownPicture(std::string(static_cast<const char*>(HostPtr(p)), bytes));
-        std::string path;
-        for (uint32_t i = 0; i < n; i++) path += char(std::tolower(wide ? R16(p + i * 2) & 0xFF : G<uint8_t>(p + i)));
+        std::string path = LowerPath(p);
         g_press_text = g_mission_load ? WordsFor(path) : std::u16string_view{};
         g_edges = path.find("esrb") == std::string::npos;
+        g_tip_path = path;
         return;
     }
     const std::string& kept = KeptPicture();
@@ -416,6 +434,7 @@ void game::loading::BeforeShowScreen(X86Context& ctx) {
     g_reloaded = true;
     if (!g_path) g_path = mem::AllocSystem(1040);
     std::memcpy(HostPtr(g_path), kept.data(), std::min<size_t>(kept.size(), 1040));
+    g_tip_path = LowerPath(g_path);
     W32(ctx.esp + 4, g_path);
     W32(ctx.esp + 0xC, 0);
     g_bar_after = g_bar_in_picture = KeptDisplayMarked();
@@ -424,6 +443,7 @@ void game::loading::BeforeShowScreen(X86Context& ctx) {
 void game::loading::AfterShowScreen(X86Context& ctx) {
     g_press_text = {};
     g_bar_in_picture = false;
+    g_tip_path.clear();
     if (!std::exchange(g_bar_after, false)) return;
     FullBar(ctx);
     FullBar(ctx);

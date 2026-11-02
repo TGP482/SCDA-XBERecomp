@@ -17,6 +17,7 @@ namespace app {
 
 inline constexpr int kVersion = 3;  // release number, the GitHub release tag is V<number>
 inline constexpr uint32_t kFpsCapRefresh = 1;  // fps_cap: the monitor's refresh rate
+inline constexpr uint32_t kPromptsXboxOne = 1;  // button_prompts: Xbox One
 // versus caps top out here, as SCCT PC versus, so a player's net traffic stays bounded; UNLIMITED lifts it
 inline constexpr uint32_t kVersusMaxFps = 240;
 
@@ -72,6 +73,9 @@ struct Settings {
     float pad_aim_horizontal_sensitivity = 1.0f;
     float pad_aim_vertical_sensitivity = 1.0f;
     uint32_t vibration_strength = 100;  // percent of the game's rumble, 0 to 200
+    // the pad's look: 0 Xbox, 1 Xbox One (LB and RB in place of the White and Black buttons they press, in icons, text
+    // and the loading tips; xbox\ beside the exe has the icons)
+    uint32_t button_prompts = 0;
     gyro::Settings gyro;               // story only: the controller's gyro turns the view, beside the right stick
     // versus only, in place of mouse_sensitivity: third person, weapon raised, sniper scope
     float free_look_sensitivity = 1.0f;

@@ -49,6 +49,14 @@ add_custom_target(compiler_files ALL
     COMMAND ${CMAKE_COMMAND} -E copy_if_different ${FREESTANDING_HEADERS} ${COMPILER_DIR}/include/freestanding
     VERBATIM)
 
+# The Xbox One button prompts' LB and RB icons beside the executables (data/xbox without their SVG sources)
+set(XBOX_DIR ${CMAKE_BINARY_DIR}/xbox)
+file(GLOB XBOX_ICONS CONFIGURE_DEPENDS data/xbox/*.png)
+add_custom_target(xbox_files ALL
+    COMMAND ${CMAKE_COMMAND} -E make_directory ${XBOX_DIR}
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different ${XBOX_ICONS} ${XBOX_DIR}
+    VERBATIM)
+
 # x86 to C++ recompiler
 file(GLOB RECOMP_SOURCES CONFIGURE_DEPENDS tools/recomp/*.cpp)
 add_executable(xbe_recomp ${RECOMP_SOURCES})

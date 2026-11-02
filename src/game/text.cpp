@@ -4,11 +4,14 @@
 // The storage messages never show while the hard disk reports its fixed free space; their "Select OK to free %i
 // blocks" tail went to the dashboard, so it is dropped.
 // On keyboard and mouse the English tutorial text names the bound keys in place of the pad's buttons, as it is
-// drawn (prompts.cpp), so it follows the device.
+// drawn (prompts.cpp), so it follows the device. With Xbox One button prompts the pad's text, in every language, calls
+// the White and Black buttons LB and RB, the bumpers that press them.
 #include <algorithm>
 #include <initializer_list>
+#include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 
 #include "app/translations.h"
 #include "xdk/hle.h"
@@ -18,6 +21,7 @@ using namespace kernel;
 namespace game {
 std::string KeyNames(std::initializer_list<const char*> ids);  // prompts.cpp
 std::u16string KeyWording(std::u16string text);
+std::u16string XboxOneWording(std::u16string text);
 }
 
 namespace {
@@ -87,6 +91,16 @@ constexpr Swap kSwaps[] = {
     {"X to equip", "{scope} to equip"},
 };
 
+// the White and Black buttons' colour words in each language's phrase for them, the only place the game writes them
+// in capitals; Spanish's botón is past ASCII, so its colour words stand alone
+constexpr Swap kXboxOneSwaps[] = {
+    {"WHITE button", "LB button"},     {"BLACK button", "RB button"},       // int
+    {"touche BLANCHE", "touche LB"},   {"touche NOIRE", "touche RB"},       // fra
+    {"WEISSE Taste", "LB-Taste"},      {"SCHWARZE Taste", "RB-Taste"},      // deu
+    {"pulsante BIANCO", "pulsante LB"}, {"pulsante NERO", "pulsante RB"},  // ita
+    {"BLANCO", "LB"},                  {"NEGRO", "RB"},                     // esp
+};
+
 // letters in either case
 bool Equals(uint32_t text, std::u16string_view want) {
     if (!text) return false;
@@ -123,14 +137,11 @@ std::u16string Expand(std::string_view to, bool upper, bool caps) {
     return out;
 }
 
-}  // namespace
-
-// prompts.cpp, a text about to draw on the keyboard. Whole words; small letters match capitals too, as the message
-// box shows its text
-std::u16string game::KeyWording(std::u16string text) {
+// Whole words; small letters match capitals too, as the message box shows its text
+std::u16string Reword(std::u16string text, std::span<const Swap> swaps) {
     bool caps = std::none_of(text.begin(), text.end(), [](char16_t c) { return c >= 'a' && c <= 'z'; });
     auto same = [](char p, char16_t c) { return c == char16_t(p) || (p >= 'a' && p <= 'z' && c == char16_t(p - 0x20)); };
-    for (const Swap& s : kSwaps)
+    for (const Swap& s : swaps)
         for (size_t at = 0; at + s.from.size() <= text.size(); at++) {
             size_t end = at + s.from.size();
             if ((at && Letter(text[at - 1])) || (end < text.size() && Letter(text[end]))) continue;
@@ -142,6 +153,14 @@ std::u16string game::KeyWording(std::u16string text) {
         }
     return text;
 }
+
+}  // namespace
+
+// prompts.cpp, a text about to draw on the keyboard
+std::u16string game::KeyWording(std::u16string text) { return Reword(std::move(text), kSwaps); }
+
+// prompts.cpp, a text about to draw on the pad with Xbox One prompts
+std::u16string game::XboxOneWording(std::u16string text) { return Reword(std::move(text), kXboxOneSwaps); }
 
 X86_EXTERN_FUNC(__imp__sub_00070FC9);
 X86_FUNC(sub_00070FC9) {
