@@ -83,13 +83,31 @@ constexpr float kDefaultPeakNits = 1000.0f;
 constexpr float kSdrWhiteUnit = 0.08f;  // Windows' SDR white level: 1000 is 80 nits
 // longest a frame missing draws still on the build threads keeps the last whole frame on screen instead
 constexpr auto kHoldMax = std::chrono::milliseconds(50);
+constexpr uint64_t kDitherFrames = 65536;  // the dither changes every frame, its pattern repeats after this many
+
+// noise of one step of the target's precision added before the frame is quantized to it: a smooth gradient of the
+// 16 bit frame shows as fine noise instead of steps. Triangular in -1..1, from a hash of the pixel and the frame
+const char* kDitherHlsl = R"(
+uint DitherHash(uint v) {
+    v = v * 747796405u + 2891336453u;
+    v = ((v >> ((v >> 28u) + 4u)) ^ v) * 277803737u;
+    return (v >> 22u) ^ v;
+}
+float Dither(float2 p, float frame) {
+    uint h = DitherHash(uint(p.x) + DitherHash(uint(p.y) + DitherHash(uint(frame))));
+    return float(h & 0xFFFF) / 65535 + float(h >> 16) / 65535 - 1;
+}
+// c plus noise of the step, faded out towards 0 and 1 so black and white stay exact
+float3 Dithered(float3 c, float2 p, float frame, float step) {
+    return c + Dither(p, frame) * step * saturate(min(c, 1 - c) / step);
+}
+)";
 
 const char* kBlitHlsl = R"(
-cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 colour[3]; };
+cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 colour[3]; float4 dither; };
 Texture2D img : register(t0);
 Texture2D lut : register(t1);
 SamplerState ls : register(s0);
-SamplerState ps : register(s1);
 struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
 O vs(uint id : SV_VertexID) {
     O o;
@@ -106,12 +124,19 @@ float4 psmain(O i) : SV_Target {
         for (int x = 0; x < n; x++) c += img.SampleLevel(ls, i.uv + px * ((float2(x, y) + 0.5) / n - 0.5), 0);
     c /= n * n;
     c.rgb *= opts.w;
-    if (opts.x > 0) c.rgb = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
+    // the ramp's entries at their texel centres, linear between them: the frame keeps its precision through it
+    if (opts.x > 0) {
+        float3 at = (saturate(c.rgb) * 255 + 0.5) / 256;
+        c.rgb = float3(lut.SampleLevel(ls, float2(at.r, 0.5), 0).r, lut.SampleLevel(ls, float2(at.g, 0.5), 0).g,
+                       lut.SampleLevel(ls, float2(at.b, 0.5), 0).b);
+    }
     // colour[0].w: the rows hold a colour matrix, applied to linear colour
     if (colour[0].w > 0) {
         float3x3 m = float3x3(colour[0].xyz, colour[1].xyz, colour[2].xyz);
         c.rgb = pow(saturate(mul(m, pow(saturate(c.rgb), 2.2))), 1 / 2.2);
     }
+    // dither.x: a step of the target's precision, 0 for none; dither.y: the frame
+    if (dither.x > 0) c.rgb = Dithered(saturate(c.rgb), i.p.xy, dither.y, dither.x);
     return float4(c.rgb, opts.y > 0 ? c.a : 1);
 }
 )";
@@ -194,13 +219,14 @@ float3 pq(float3 nits) {
     float3 y = pow(saturate(nits / 10000), 0.1593017578125);
     return pow((0.8359375 + 18.8515625 * y) / (1 + 18.6875 * y), 78.84375);
 }
-// p0: SDR white nits, peak nits
+// p0: SDR white nits, peak nits, the frame; dithered to the back buffer's 10 bits, the stretched highlights
+// would show its steps
 float4 hdr10(O i) : SV_Target {
     int3 px = int3(i.p.xy, 0);
     float3 f = min(expand(to_linear(frame.Load(px).rgb), max(p0.y / p0.x, 1)) * p0.x, p0.y);
     float4 u = ui.Load(px);
     float3 panel = to_linear(u.a > 0 ? u.rgb / u.a : 0) * p0.x;
-    return float4(pq(mul(k709To2020, lerp(f, panel, u.a))), 1);
+    return float4(Dithered(pq(mul(k709To2020, lerp(f, panel, u.a))), i.p.xy, p0.z, 1.0 / 1023), 1);
 }
 )";
 
@@ -572,6 +598,7 @@ struct Target {
     D3D12_RESOURCE_STATES fb_state = D3D12_RESOURCE_STATE_COPY_DEST;
     uint32_t samples = 1;         // above 1 on the back buffer sized targets under MSAA
     DXGI_FORMAT fmt = kBgra;
+    bool scene = false;            // the HDR scene: back buffer sized, its 3D draws go over the headroom
     bool hdr = false;              // colour held over kHeadroom until resolved
     uint64_t hdr_frame = ~0ull;    // the present count it last went HDR, once a frame
 };
@@ -623,6 +650,7 @@ struct Tex {
     uint64_t sig = 0;
     uint64_t frame = 0;
     bool norm = false;  // a normalization cube
+    bool ramp = false;  // a dithered ramp, see UpdateRamp
     const Tex* swap = nullptr;  // the texture pack's image drawn in its place
     uint64_t pack_key = 0;      // its pack image is still loading
     uint32_t pack_gen = 0;      // texturedumper::Generation the key was taken at, 0 after new bytes
@@ -680,6 +708,7 @@ struct BlitOptions {
     bool over = false;        // premultiplied over the target, which keeps its alpha
     uint32_t samples = 1;     // the target's sample count
     const float* colour = nullptr;  // 3x3 colour matrix by rows, nullptr leaves colours alone
+    bool dither = false;            // noise of one 8 bit step before the target quantizes the colour
 };
 
 // a full screen pass's target
@@ -1483,8 +1512,11 @@ bool D3D12Backend::CreateTargetResource(Target& t, bool shadow, bool blur) {
         cv.DepthStencil.Depth = 1;
         t.state = D3D12_RESOURCE_STATE_DEPTH_WRITE;
     } else {
-        // the back buffer sized colour targets: the scene and the game's copies of it
-        t.fmt = hdr_ && !blur && screen ? kHdrFormat : kBgra;
+        // the back buffer sized colour targets past the edge blur: the scene and the game's copies of it. Under HDR
+        // rendering every colour target keeps 16 bits: the game's glow chain adds back onto the tone mapped scene,
+        // where the 8 bit steps of a faint glow show as bands
+        t.scene = hdr_ && !blur && screen;
+        t.fmt = hdr_ ? kHdrFormat : kBgra;
         td.Format = t.fmt;
         td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
         cv.Format = td.Format;
@@ -1729,11 +1761,15 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     dev_->CreateShaderResourceView(lut_.Get(), &sv, Cpu(srv_heap_.Get(), slot + 1, srv_inc_));
     uint32_t si = EnsureBlitSamplers();
     Alloc cb = Upload(256, 256);
-    float c[20] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
+    float c[24] = {uvrect[0], uvrect[1], uvrect[2], uvrect[3],
                    o.gamma ? 1.0f : 0.0f, o.alpha ? 1.0f : 0.0f, float(o.taps), o.mul};
     if (o.colour) {
         for (int row = 0; row < 3; row++) std::memcpy(c + 8 + row * 4, o.colour + row * 3, 3 * sizeof(float));
         c[11] = 1.0f;
+    }
+    if (o.dither) {
+        c[20] = 1.0f / 255;
+        c[21] = float(presents_ % kDitherFrames);
     }
     std::memcpy(cb.cpu, c, sizeof(c));
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over, o.samples), cb.gpu, slot, si);
@@ -1835,8 +1871,9 @@ ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over
     uint64_t key = uint64_t(rtv) | uint64_t(over) << 32 | uint64_t(samples) << 40;
     auto& pso = blit_psos_[key];
     if (pso) return pso.Get();
-    ID3DBlob* vs = Compile(kBlitHlsl, "vs", "vs_5_0");
-    ID3DBlob* ps = Compile(kBlitHlsl, "psmain", "ps_5_0");
+    static const std::string hlsl = std::string(kDitherHlsl) + kBlitHlsl;
+    ID3DBlob* vs = Compile(hlsl, "vs", "vs_5_0");
+    ID3DBlob* ps = Compile(hlsl, "psmain", "ps_5_0");
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv, samples);
     if (over) {
         auto& blend = d.BlendState.RenderTarget[0];
@@ -2847,6 +2884,30 @@ void UpdateNormCube(Tex& tx, const TextureDesc& d, const FormatInfo& fi, uint32_
     }
 }
 
+// a dithered ramp: a strip of BGRA entries at most kRampRows high, quantized from a curve with dither, so along its
+// first row some channel turns back kRampTurns times or more where a smooth curve never does. The game's glow reads
+// one through the scene's brightness: at HDR's finer brightness its turns show as contour lines
+constexpr uint32_t kRampRows = 4;
+constexpr uint32_t kRampMinWidth = 64;
+constexpr int kRampTurns = 8;
+
+void UpdateRamp(Tex& tx, const TextureDesc& d, const FormatInfo& fi, const std::vector<uint8_t>& px) {
+    tx.ramp = false;
+    bool strip = fi.host == Host::BGRA8 && !d.cube && d.depth == 1;
+    if (!strip || d.height > kRampRows || d.width < kRampMinWidth || px.size() < size_t(d.width) * 4) return;
+    for (int ch = 0; ch < 4 && !tx.ramp; ch++) {
+        int turns = 0;
+        int last = 0;  // the sign of the last step that moved
+        for (uint32_t x = 1; x < d.width; x++) {
+            int step = px[x * 4 + ch] - px[(x - 1) * 4 + ch];
+            int sign = (step > 0) - (step < 0);
+            if (sign && last && sign != last) turns++;
+            if (sign) last = sign;
+        }
+        tx.ramp = turns >= kRampTurns;
+    }
+}
+
 void CopyLevelRows(uint8_t* out, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp, UINT rows, UINT64 row_size,
                    const std::vector<uint8_t>& px, uint32_t pitch) {
     uint32_t slices = fp.Footprint.Depth;
@@ -2892,6 +2953,7 @@ void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo
             uint32_t pitch;
             DecodeLevel(d, l, f, p, nullptr, px, pitch);
             if (d.cube && !l) UpdateNormCube(tx, d, fi, f, px, pitch);
+            if (!d.cube && !l) UpdateRamp(tx, d, fi, px);
             UploadTextureLevel(tx, f, l, px, pitch);
         }
     }
@@ -2936,6 +2998,7 @@ ID3D12Resource* D3D12Backend::BindGuestTexture(int stage, const TextureDesc& d, 
     FillTextureView(drawn, d, stages.sv[stage]);
     if (fi.depth) info.shadow = ShadowDepthKind(d.format);
     if (tx.norm && d.cube && hdr_) info.flags |= kTexNormCube;
+    if (drawn.ramp && hdr_) info.flags |= kTexRamp;
     return drawn.res.Get();
 }
 
@@ -3085,7 +3148,7 @@ uint32_t SimpleState(const State& s, uint32_t method) {
 // HDR starts at a frame's first 3D draw into the HDR scene target; screen space quads never start it: a loading
 // screen's fade redraws over the last tone mapped picture every frame
 bool D3D12Backend::EnterHdrForScene(const State& s, const Assembled& a) {
-    bool scene_target = bound_rt_ && bound_ds_ && bound_rt_->fmt == kHdrFormat;
+    bool scene_target = bound_rt_ && bound_ds_ && bound_rt_->scene;
     bool not_started = scene_target && !bound_rt_->hdr && bound_rt_->hdr_frame != presents_;
     bool depth_written_3d = !a.pretransformed && s.rs[kRsZEnable] && SimpleState(s, kMZWriteEnable);
     if (not_started && depth_written_3d) {
@@ -4084,7 +4147,10 @@ void D3D12Backend::BlitFrame(const Target& t, ID3D12Resource* r, bool pillarbox,
     cl_->RSSetScissorRects(1, &scissor);
     uint32_t mode = app::Get().colour_blind;
     std::array<float, 9> colour = mode ? ColourBlindMatrix(mode) : std::array<float, 9>{};
-    if (r) Blit(r, t.fmt, uv, {.gamma = gamma_, .rtv = rtv, .colour = mode ? colour.data() : nullptr});
+    BlitOptions o{.gamma = gamma_, .rtv = rtv, .colour = mode ? colour.data() : nullptr};
+    // a 16 bit frame going to an 8 bit back buffer is dithered
+    o.dither = rtv == kBgra && t.fmt != kBgra;
+    if (r) Blit(r, t.fmt, uv, o);
 }
 
 void D3D12Backend::RenderUi() {
@@ -4144,8 +4210,9 @@ void D3D12Backend::DrawHdrFrame(Target* t, ID3D12Resource* r, bool pillarbox, D3
     Begin();  // RenderUi left ImGui's heap and root signature bound
     for (int i = 0; i < 2; i++) Transition(out_[i].Get(), out_state_[i], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     PostInputs in{{out_[0].Get(), out_[1].Get(), nullptr}, {kHdrFormat, kBgra, kBgra}};
-    float p[8] = {paper_nits_, peak_nits_, 0, 0};
-    DrawPostPass("hdr10", {bb, kHdr10Format, bb_w_, bb_h_}, in, p, {.hlsl = kHdrHlsl});
+    static const std::string hlsl = std::string(kDitherHlsl) + kHdrHlsl;
+    float p[8] = {paper_nits_, peak_nits_, float(presents_ % kDitherFrames), 0};
+    DrawPostPass("hdr10", {bb, kHdr10Format, bb_w_, bb_h_}, in, p, {.hlsl = hlsl.c_str()});
 }
 
 void D3D12Backend::ReleaseOldTextures() {

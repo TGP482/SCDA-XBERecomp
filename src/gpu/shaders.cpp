@@ -370,6 +370,12 @@ std::string TexFetch(const PixelKey& k, int i) {
         if (t.kind == kTex3D) return F("tex%d.Sample(smp%d, float3(%s, 0))", i, i, uv.c_str());
         return std::string("float4(0,0,0,1)");
     };
+    // a dependent read: a dithered ramp is read through ramp(), smoothing over its entries
+    auto lookup2 = [&](const std::string& uv) {
+        if (t.kind == kTex2D && (t.flags & kTexRamp))
+            return F("ramp(tex%d, smp%d, (%s)%s, texsize[%d].x)", i, i, uv.c_str(), norm.c_str(), i);
+        return sample2(uv);
+    };
     auto sample3 = [&](const std::string& uvw) {
         if (t.kind == kTex2D) return tex2d(F("(%s).xy%s", uvw.c_str(), norm.c_str()));
         if (t.kind == kTexCube) return cube(uvw);
@@ -405,7 +411,7 @@ std::string TexFetch(const PixelKey& k, int i) {
             return s;
         case 9:  // dot st
             return F("float dot%d = dot(pT%d.xyz, %s(t%u));\nfloat4 t%d = %s;\n", i, i, dotmap[dm], in, i,
-                     sample2(F("float2(dot%d, dot%d)", i - 1, i)).c_str());
+                     lookup2(F("float2(dot%d, dot%d)", i - 1, i)).c_str());
         case 0xA:
         case 0x11:  // dot zw, dot product
             return F("float dot%d = dot(pT%d.xyz, %s(t%u));\nfloat4 t%d = 0;\n", i, i, dotmap[dm], in, i);
@@ -424,8 +430,8 @@ std::string TexFetch(const PixelKey& k, int i) {
         case 0xE:  // dot str 3d, cube
             return F("float dot%d = dot(pT%d.xyz, %s(t%u));\nfloat4 t%d = %s;\n", i, i, dotmap[dm], in, i,
                      sample3(F("float3(dot%d, dot%d, dot%d)", i - 2, i - 1, i)).c_str());
-        case 0xF: return F("float4 t%d = %s;\n", i, sample2(F("t%u.ar", in)).c_str());
-        case 0x10: return F("float4 t%d = %s;\n", i, sample2(F("t%u.gb", in)).c_str());
+        case 0xF: return F("float4 t%d = %s;\n", i, lookup2(F("t%u.ar", in)).c_str());
+        case 0x10: return F("float4 t%d = %s;\n", i, lookup2(F("t%u.gb", in)).c_str());
         default: return F("float4 t%d = 0;\n", i);
     }
 }
@@ -458,6 +464,19 @@ void alphatest(float a) {
     int v = (int)round(a * 255), r = (int)misc.x;
     bool ok = f == 0 ? false : f == 1 ? v < r : f == 2 ? v == r : f == 3 ? v <= r : f == 4 ? v > r : f == 5 ? v != r : f == 6 ? v >= r : true;
     if (!ok) discard;
+}
+)";
+
+// only in shaders reading a kTexRamp stage, the others keep their source and so their cached code:
+// a dithered ramp w entries wide, looked up at a coordinate finer than its 8 bit steps: binomial over five entries
+// along u, the curve it was quantized from instead of contours where the dither steps back
+const char* kPsRamp = R"(
+float4 ramp(Texture2D t, SamplerState s, float2 uv, float w) {
+    float lo = 0.5 / w, hi = 1 - lo;
+    float4 c = t.Sample(s, uv) * 6;
+    c += (t.Sample(s, float2(clamp(uv.x - 1 / w, lo, hi), uv.y)) + t.Sample(s, float2(clamp(uv.x + 1 / w, lo, hi), uv.y))) * 4;
+    c += t.Sample(s, float2(clamp(uv.x - 2 / w, lo, hi), uv.y)) + t.Sample(s, float2(clamp(uv.x + 2 / w, lo, hi), uv.y));
+    return c / 16;
 }
 )";
 
@@ -768,6 +787,12 @@ std::string FixedVertexHlsl(uint16_t regs, bool pretransformed, uint64_t decode,
 std::string PixelHlsl(const PixelKey& k) {
     std::string s = kCommon;
     s += kPsHelpers;
+    for (const TexInfo& t : k.tex) {
+        if (t.flags & kTexRamp) {
+            s += kPsRamp;
+            break;
+        }
+    }
     for (int i = 0; i < 4; i++) {
         const TexInfo& t = k.tex[i];
         const char* type = t.shadow ? "Texture2D<float>" : t.kind == kTex3D ? "Texture3D" : t.kind == kTexCube ? "TextureCube" : "Texture2D";
