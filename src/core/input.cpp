@@ -1000,10 +1000,33 @@ void Rebind(Pad& p, int port, int slot, WORD buttons) {
     }
 }
 
+// The PlayStation 2 game's layout, which comes with its button prompts: fire and alternate fire on the shoulder
+// buttons (R1, L1), the black and white buttons' controls on the triggers (L2 whistle / co-op action, R2 quick
+// inventory, in versus help and spectating's next player). The console control a physical button presses by default.
+int LayoutControl(int physical) {
+    if (app::Get().button_prompts != app::kPromptsPs2) return physical;
+    switch (physical) {
+        case 4: return 7;  // RB: right trigger
+        case 5: return 6;  // LB: left trigger
+        case 6: return 4;  // LT: black
+        case 7: return 5;  // RT: white
+        default: return physical;
+    }
+}
+
+// a pad action's physical button by default: the one that presses its control in the layout
+int DefaultPadButton(const PadAction& a) {
+    for (int b = 0; a.button >= 0 && b < kPadControls; b++) {
+        if (LayoutControl(b) == a.button) return b;
+    }
+    return a.button;
+}
+
 void ApplyPadBinds() {
     for (int b = 0; b < kPadButtons; b++) {
-        bool stock = std::ranges::any_of(kPadActions, [b](const PadAction& a) { return a.button == b; });
-        g_pad_map[size_t(b)] = stock ? -1 : 0;
+        bool stock = std::ranges::any_of(kPadActions, [b](const PadAction& a) { return DefaultPadButton(a) == b; });
+        int own = b < kPadControls ? LayoutControl(b) : b;
+        g_pad_map[size_t(b)] = stock ? -1 : own == b ? 0 : own + 1;
     }
     for (size_t i = 0; i < kPadCount; i++) {
         const PadAction& a = kPadActions[i];
@@ -1515,10 +1538,10 @@ bool ConsoleChar(unsigned c) {
     return false;
 }
 
-// pad action i's button as saved, the stock one when none is
+// pad action i's button as saved, the layout's default when none is
 static int SavedPadButton(const std::map<std::string, std::string>& pads, size_t i) {
     auto it = pads.find(kPadActions[i].id);
-    if (it == pads.end()) return kPadActions[i].button;
+    if (it == pads.end()) return DefaultPadButton(kPadActions[i]);
     if (it->second.empty()) return -1;
     return PadButton(it->second);
 }
@@ -1551,7 +1574,7 @@ void LoadBindings() {
         if (b >= 0) taken[size_t(b)] = true;
     }
     for (size_t i : later) {
-        int b = kPadActions[i].button;
+        int b = DefaultPadButton(kPadActions[i]);
         g_pad_binds[i] = b >= 0 && !taken[size_t(b)] ? b : -1;
         if (g_pad_binds[i] >= 0) taken[size_t(b)] = true;
     }
@@ -1559,14 +1582,12 @@ void LoadBindings() {
 }
 
 const Action* PadActions(size_t* count) {
-    static const auto list = [] {
-        std::array<Action, kPadCount> a{};
-        for (size_t i = 0; i < kPadCount; i++) {
-            int b = kPadActions[i].button;
-            a[i] = {kPadActions[i].id, kPadActions[i].label, b >= 0 ? kPadNames[b] : ""};
-        }
-        return a;
-    }();
+    // the defaults follow the button prompts' layout
+    static std::array<Action, kPadCount> list{};
+    for (size_t i = 0; i < kPadCount; i++) {
+        int b = DefaultPadButton(kPadActions[i]);
+        list[i] = {kPadActions[i].id, kPadActions[i].label, b >= 0 ? kPadNames[b] : ""};
+    }
     *count = kPadCount;
     return list.data();
 }
@@ -1592,7 +1613,7 @@ void BindPad(size_t action, int button) {
         auto& saved = app::Get().pad_buttons;
         for (size_t i = 0; i < kPadCount; i++) {
             int b = g_pad_binds[i];
-            if (b == kPadActions[i].button) saved.erase(kPadActions[i].id);
+            if (b == DefaultPadButton(kPadActions[i])) saved.erase(kPadActions[i].id);
             else saved[kPadActions[i].id] = b >= 0 ? kPadNames[b] : "";
         }
         ApplyPadBinds();

@@ -127,6 +127,7 @@ The latest version of [SCDA-XBERecomp](https://github.com/TGP482/SCDA-XBERecomp/
 ### Input
 - **Mouse and Keyboard** - Full keyboard and mouse support with raw input, adjustable horizontal and vertical sensitivity, inverted look and rebindable controls.
 - **Controller** - Controller with SDL3 support, buttons can be rebound from the Controller page. Defaults match the Xbox layout.
+- **Button Prompts** - Choose between Xbox and PlayStation 2 on the Controller page. PlayStation 2 shows DualShock 2 button icons in every prompt, redraws the controller loading screens with a DualShock 2, lays out the Options Controls page as the PS2 game's (and the controller screen a new game starts with the same way), names the PS2 buttons in the English tutorial text and switches the controller to the PS2 game's layout: fire on R1, alternate fire on L1, whistle and co-op action on L2 and quick inventory on R2. The button icons are original art made for this project (`data/ps2`), no PlayStation 2 game assets are included.
 
 <div align="center">
   <table>

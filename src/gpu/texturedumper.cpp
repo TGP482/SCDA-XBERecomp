@@ -30,6 +30,7 @@
 
 #include "app/app.h"
 #include "core/log.h"
+#include "gpu/ps2_icons.h"
 #include "gpu/shaders.h"
 
 using Microsoft::WRL::ComPtr;
@@ -56,6 +57,7 @@ struct Latched {
     bool replacing = false;
     bool dumping = false;
     uint32_t format = 0;
+    bool ps2 = false;  // PlayStation 2 button prompts
     bool operator==(const Latched&) const = default;
 };
 
@@ -65,6 +67,8 @@ struct Pack {
     fs::path pack_dir;
     fs::path dump_dir;
     std::unordered_map<uint64_t, fs::path> files;  // by the key in their names; written by Update alone
+    // with PlayStation 2 prompts, their icons by the Xbox icon's key (ps2_icons.h); written by Update alone
+    std::unordered_map<uint64_t, fs::path> ps2;
     HANDLE watch = INVALID_HANDLE_VALUE;           // changes under pack_dir
     uint32_t watch_tries = 0;
     std::optional<Clock::time_point> changed;      // the last change seen, not listed yet
@@ -488,12 +492,30 @@ Image Decode(const TextureDesc& d, const uint8_t* guest, const uint32_t* palette
     return img;
 }
 
-// the settings into g.set; false when none changed
-bool LatchSettings() {
+// a load started before is dropped, every image is asked for again
+void Forget() {
+    std::lock_guard l(g.lock);
+    g.revision++;
+    g.asked.clear();
+    g.loaded.clear();
+}
+
+// the settings into g.set; false when none changed. icons: the PlayStation 2 icons came or went, so GPU copies made
+// for their keys are stale
+bool LatchSettings(bool& icons) {
     const app::Settings& s = app::Get();
-    Latched now{s.custom_textures, s.dump_textures, s.texture_dump_format};
+    Latched now{s.custom_textures, s.dump_textures, s.texture_dump_format, s.button_prompts == app::kPromptsPs2};
     if (now == g.set) return false;
+    icons = now.ps2 != g.set.ps2;
     g.set = now;
+    if (icons) {
+        g.ps2.clear();
+        if (now.ps2) {
+            fs::path dir = app::ExeDir() / "ps2" / "icons";
+            for (const Ps2Icon& i : kPs2Icons) g.ps2.emplace(i.key, dir / (std::string(i.name) + ".png"));
+        }
+        Forget();
+    }
     fs::path root = app::ExeDir() / "textures";
     g.pack_dir = root / "replacement";
     if (now.dumping) {
@@ -533,25 +555,23 @@ bool UpdatePackFiles() {
     if (!g.changed || now - *g.changed < kSettle) return false;
     g.changed.reset();
     ListPack(g.pack_dir);
-    std::lock_guard l(g.lock);
-    g.revision++;
-    g.asked.clear();
-    g.loaded.clear();
+    Forget();
     return true;
 }
 
 }  // namespace
 
 bool Update() {
-    bool changed = LatchSettings();
+    bool icons = false;
+    bool changed = LatchSettings(icons);
     bool reloaded = g.set.replacing && UpdatePackFiles();
     if (changed || reloaded) g.generation++;
-    return reloaded;
+    return reloaded || icons;
 }
 
 uint32_t Generation() { return g.generation; }
 
-bool Replacing() { return g.set.replacing && !g.files.empty(); }
+bool Replacing() { return (g.set.replacing && !g.files.empty()) || !g.ps2.empty(); }
 
 uint64_t Key(const TextureDesc& d, const FormatInfo& fi, const uint8_t* guest, const uint32_t* palette) {
     if (!Replacing() && !g.set.dumping) return 0;
@@ -581,8 +601,11 @@ void Dump(uint64_t key, const TextureDesc& d, const uint8_t* guest, const uint32
 }
 
 Lookup Take(uint64_t key, Image& out) {
-    auto file = g.files.find(key);
-    if (!g.set.replacing || file == g.files.end()) return Lookup::None;
+    // the player's own pack first, then a PlayStation 2 icon
+    const fs::path* file = nullptr;
+    if (auto it = g.files.find(key); g.set.replacing && it != g.files.end()) file = &it->second;
+    else if (auto icon = g.ps2.find(key); icon != g.ps2.end()) file = &icon->second;
+    if (!file) return Lookup::None;
     uint32_t revision = 0;
     {
         std::lock_guard l(g.lock);
@@ -596,7 +619,7 @@ Lookup Take(uint64_t key, Image& out) {
         if (!g.asked.insert(key).second) return Lookup::Loading;
         revision = g.revision;
     }
-    Post([key, path = file->second, revision] { Load(key, path, revision); });
+    Post([key, path = *file, revision] { Load(key, path, revision); });
     return Lookup::Loading;
 }
 

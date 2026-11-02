@@ -23,6 +23,11 @@
 
 using namespace kernel;
 
+namespace game {
+void PrepareControlsScreen();                                // ps2_controls.cpp
+bool PaintControlsScreen(uint8_t* picture, uint32_t pitch);  // ps2_controls.cpp
+}
+
 namespace {
 
 bool g_mission_load = false;  // game thread
@@ -106,25 +111,39 @@ X86_FUNC(sub_0026AB34) {
 }
 
 // Draw "Press Any Key" text for loading screens
-// Title_18 is Magma's title font used for the picture's header line, from the copy of the font included with the game
-namespace {
+// Title_18 is Magma's title font used for the picture's header line, from the copy of the font included with the game;
+// Text_16 its labels' (ps2_controls.cpp)
 
 // font (loaded by sub_002D2630): +0x08 name, +0x50 glyph count, +0x54 glyphs of 24 bytes (u16 char, u8 width, height,
-// s8 x, y above the baseline, u8 advance, f32 u, v), +0x468 / +0x46C page widths / heights (u16 arrays), +0x470
-// pages, +0x478 page textures. Each page is a texture loaded from the package (sub_002B62BC) whose pixels never reach
-// the CPU side: the render device fills its D3D texture straight from the package and detaches the mip's lazy array.
-// Once uploaded, the texture's render resource (+0x6C) leads to that D3D texture, found by its size.
+// s8 x, y above the baseline, u8 advance, f32 u, v: the page and where on it, page + fraction), +0x468 / +0x46C page
+// widths / heights (u16 arrays), +0x470 pages, +0x478 page textures. Each page is a texture loaded from the package
+// (sub_002B62BC) whose pixels never reach the CPU side: the render device fills its D3D texture straight from the
+// package and detaches the mip's lazy array. Once uploaded, the texture's render resource (+0x6C) leads to that D3D
+// texture, found by its size.
+struct game::loading::Font {
+    struct Glyph {
+        char16_t c;
+        int w, h, x, y, advance, page, u, v;  // u, v: top left texel on its page
+    };
+    struct Page {
+        int width = 0, height = 0;
+        uint32_t texture = 0;
+        std::vector<uint8_t> texels;  // its alpha, rows top down
+    };
+    std::string_view name;
+    std::vector<Glyph> glyphs;
+    std::vector<Page> pages;
+    bool tried = false;
+};
+
+namespace {
+
+using game::loading::Font;
 constexpr uint32_t kFontName = 0x08, kGlyphCount = 0x50, kGlyphs = 0x54, kGlyphSize = 24, kPageWidths = 0x468,
                    kPageHeights = 0x46C, kPages = 0x470, kPageTextures = 0x478;
 constexpr uint32_t kTextureResource = 0x6C;
-struct Glyph {
-    char16_t c;
-    int w, h, x, y, advance, u, v;  // u, v: top left texel
-};
-std::vector<Glyph> g_glyphs;
-std::vector<uint8_t> g_texels;  // the page's alpha, rows top down
-int g_texels_width = 0, g_texels_height = 0;
-uint32_t g_page_texture = 0;
+Font g_fonts[] = {{"Title_18"}, {"Text_16"}};
+Font& g_title = g_fonts[0];
 
 // ShowScreen (sub_002E5F95) closes the TGA (sub_00051673, CloseHandle) right after expanding it into the picture
 // texture and before drawing it. Its frame: ebp+0x44 the texture header (+4 data), +0x58 width, +0x64 height;
@@ -149,6 +168,7 @@ constexpr Words kWords[] = {{"int", u"PRESS ANY KEY"},
 std::u16string_view g_press_text;  // the picture ShowScreen is loading waits for a key: its words
 bool g_edges = true;               // the picture ShowScreen is loading is shown 4:3 (the ESRB notice is not)
 bool g_bar_in_picture = false;     // the picture ShowScreen is loading is the kept one: the full bar goes into it
+bool g_controls_layout = false;    // it is the controller screen a new game starts with, PlayStation 2 prompts on
 
 // D:\Default\DataXb\Screens\<language>\<map>_loading<n>.tga
 std::u16string_view WordsFor(const std::string& path) {
@@ -163,8 +183,14 @@ std::u16string_view WordsFor(const std::string& path) {
     return {};
 }
 
-const Glyph* FindGlyph(char16_t c) {
-    for (const Glyph& g : g_glyphs)
+// its glyphs kept and every page read
+bool Read(const Font& f) {
+    return !f.glyphs.empty() && !f.pages.empty() &&
+           std::all_of(f.pages.begin(), f.pages.end(), [](const Font::Page& p) { return !p.texels.empty(); });
+}
+
+const Font::Glyph* FindGlyph(const Font& f, char16_t c) {
+    for (const Font::Glyph& g : f.glyphs)
         if (g.c == c) return &g;
     return nullptr;
 }
@@ -206,15 +232,17 @@ void PaintEdges(uint32_t frame) {
         for (int x : {0, 639}) std::memset(picture + size_t(y) * pitch + size_t(x) * 4, 0, 3);
 }
 
-void PressText(uint32_t frame, std::u16string_view text) {
-    int w = int(R32(frame + kPictureWidth)), h = int(R32(frame + kPictureHeight));
-    if (w != 640 || h != 480 || g_glyphs.empty() || g_texels.empty() || text.empty()) return;
+// a letter's advance, a missing one a space's
+int Advance(const Font& f, char16_t c) {
+    const Font::Glyph* g = FindGlyph(f, c);
+    if (!g) g = FindGlyph(f, u' ');
+    return g ? g->advance : 0;
+}
+
+void DrawStrip(uint8_t* picture, uint32_t pitch, int w, int h, const Font& f, std::u16string_view text, float left,
+               float baseline, float sx, float sy, const float (&ink)[3]) {
     int width = 0;
-    for (char16_t c : text) {
-        const Glyph* g = FindGlyph(c);
-        if (!g) return;
-        width += g->advance;
-    }
+    for (char16_t c : text) width += Advance(f, c);
 
     // the text at the font's own size, as coverage
     constexpr int kPad = 10, kStripHeight = 30, kStripBase = 20;
@@ -222,16 +250,48 @@ void PressText(uint32_t frame, std::u16string_view text) {
     std::vector<float> strip(size_t(strip_width) * kStripHeight);
     int pen = kPad;
     for (char16_t c : text) {
-        const Glyph& g = *FindGlyph(c);
-        for (int y = 0; y < g.h; y++)
-            for (int x = 0; x < g.w; x++) {
-                int sx = pen + g.x + x, sy = kStripBase - g.y + y;
-                size_t t = size_t(g.v + y) * g_texels_width + g.u + x;
-                if (sx < 0 || sx >= strip_width || sy < 0 || sy >= kStripHeight || t >= g_texels.size()) continue;
-                float a = g_texels[t] / 255.0f, &s = strip[size_t(sy) * strip_width + sx];
-                s = a + s * (1 - a);
-            }
-        pen += g.advance;
+        if (const Font::Glyph* g = FindGlyph(f, c))
+            for (int y = 0; y < g->h; y++)
+                for (int x = 0; x < g->w; x++) {
+                    const Font::Page& page = f.pages[size_t(g->page)];
+                    int px = pen + g->x + x, py = kStripBase - g->y + y;
+                    size_t t = size_t(g->v + y) * page.width + g->u + x;
+                    if (px < 0 || px >= strip_width || py < 0 || py >= kStripHeight || t >= page.texels.size()) continue;
+                    float a = page.texels[t] / 255.0f, &s = strip[size_t(py) * strip_width + px];
+                    s = a + s * (1 - a);
+                }
+        pen += Advance(f, c);
+    }
+
+    auto at = [&](int x, int y) { return picture + size_t(y) * pitch + size_t(x) * 4; };
+    float ox = left - kPad * sx, oy = baseline - kStripBase * sy;
+    int x0 = std::max(0, int(std::floor(ox))), x1 = std::min(w, int(std::ceil(ox + strip_width * sx)));
+    int y0 = std::max(0, int(std::floor(oy))), y1 = std::min(h, int(std::ceil(oy + kStripHeight * sy)));
+    std::vector<std::vector<std::pair<int, float>>> columns;
+    for (int x = x0; x < x1; x++) columns.push_back(Taps(x, ox, sx, strip_width));
+    for (int y = y0; y < y1; y++) {
+        auto rows = Taps(y, oy, sy, kStripHeight);
+        for (int x = x0; x < x1; x++) {
+            float cover = 0;
+            for (auto [j, wy] : rows)
+                for (auto [i, wx] : columns[x - x0]) cover += wx * wy * strip[size_t(j) * strip_width + i];
+            if (cover <= 0) continue;
+            cover = std::min(cover, 1.0f);
+            uint8_t* t = at(x, y);
+            for (int c = 0; c < 3; c++) t[c] = uint8_t(std::lround(t[c] + (ink[c] - t[c]) * cover));
+        }
+    }
+}
+
+void PressText(uint32_t frame, std::u16string_view text) {
+    int w = int(R32(frame + kPictureWidth)), h = int(R32(frame + kPictureHeight));
+    const Font& f = g_title;
+    if (w != 640 || h != 480 || !Read(f) || text.empty()) return;
+    int width = 0;
+    for (char16_t c : text) {
+        const Font::Glyph* g = FindGlyph(f, c);
+        if (!g) return;
+        width += g->advance;
     }
 
     uint32_t pitch = 0;
@@ -255,23 +315,7 @@ void PressText(uint32_t frame, std::u16string_view text) {
                     (kPaperRight - kPaperLeft) * 4);
 
     float sy = kTextScale, sx = std::min(kTextScale, float(kTextMaxWidth) / width);
-    float ox = kTextRight - (width + kPad) * sx, oy = kTextBaseline - kStripBase * sy;
-    int x0 = std::max(0, int(std::floor(ox))), x1 = std::min(w, int(std::ceil(ox + strip_width * sx)));
-    int y0 = std::max(0, int(std::floor(oy))), y1 = std::min(h, int(std::ceil(oy + kStripHeight * sy)));
-    std::vector<std::vector<std::pair<int, float>>> columns;
-    for (int x = x0; x < x1; x++) columns.push_back(Taps(x, ox, sx, strip_width));
-    for (int y = y0; y < y1; y++) {
-        auto rows = Taps(y, oy, sy, kStripHeight);
-        for (int x = x0; x < x1; x++) {
-            float cover = 0;
-            for (auto [j, wy] : rows)
-                for (auto [i, wx] : columns[x - x0]) cover += wx * wy * strip[size_t(j) * strip_width + i];
-            if (cover <= 0) continue;
-            cover = std::min(cover, 1.0f);
-            uint8_t* t = at(x, y);
-            for (int c = 0; c < 3; c++) t[c] = uint8_t(std::lround(t[c] + (ink[c] - t[c]) * cover));
-        }
-    }
+    DrawStrip(picture, pitch, w, h, f, text, kTextRight - width * sx, kTextBaseline, sx, sy, ink);
 }
 
 }  // namespace
@@ -281,19 +325,22 @@ X86_EXTERN_FUNC(__imp__sub_002D1BA0);
 X86_FUNC(sub_002D1BA0) {
     uint32_t font = ctx.ecx, textures = R32(font + kPageTextures);
     auto* name = static_cast<const char*>(HostPtr(font + kFontName));
-    if (g_glyphs.empty() && textures && G<uint8_t>(font + kPages) == 1 &&
-        std::string_view(name, strnlen(name, 64)) == "Title_18") {
-        g_texels_width = R16(R32(font + kPageWidths));
-        g_texels_height = R16(R32(font + kPageHeights));
-        g_page_texture = R32(textures);
+    for (Font& f : g_fonts) {
+        if (!f.glyphs.empty() || !textures || std::string_view(name, strnlen(name, 64)) != f.name) continue;
+        for (uint32_t p = 0, n = G<uint8_t>(font + kPages); p < n; p++)
+            f.pages.push_back({R16(R32(font + kPageWidths) + p * 2), R16(R32(font + kPageHeights) + p * 2),
+                               R32(textures + p * 4)});
         for (uint32_t i = 0, n = R16(font + kGlyphCount); i < n; i++) {
             uint32_t g = R32(font + kGlyphs) + i * kGlyphSize;
-            g_glyphs.push_back({char16_t(R16(g)), G<uint8_t>(g + 2), G<uint8_t>(g + 3), G<int8_t>(g + 4),
-                                G<int8_t>(g + 5), G<uint8_t>(g + 6), int(std::ceil(GF(g + 8) * g_texels_width)),
-                                int(std::ceil(GF(g + 12) * g_texels_height))});
+            float u = GF(g + 8), v = GF(g + 12);
+            int page = int(u);
+            if (page < 0 || size_t(page) >= f.pages.size()) continue;
+            const Font::Page& at = f.pages[size_t(page)];
+            f.glyphs.push_back({char16_t(R16(g)), G<uint8_t>(g + 2), G<uint8_t>(g + 3), G<int8_t>(g + 4),
+                                G<int8_t>(g + 5), G<uint8_t>(g + 6), page, int(std::ceil((u - page) * at.width)),
+                                int(std::ceil((v - page) * at.height))});
         }
-        LOGI("loading: Title_18 glyphs kept (%zu), page %dx%d in texture %08X", g_glyphs.size(), g_texels_width,
-             g_texels_height, g_page_texture);
+        LOGI("loading: %s glyphs kept (%zu) on %zu pages", name, f.glyphs.size(), f.pages.size());
     }
     __imp__sub_002D1BA0(ctx, base);
 }
@@ -301,14 +348,13 @@ X86_FUNC(sub_002D1BA0) {
 namespace {
 
 // the page's D3D texture header: the render resource or something it points at, two levels deep
-uint32_t FindPageHeader() {
-    auto header = [](uint32_t p) {
+uint32_t FindPageHeader(const Font::Page& page) {
+    auto header = [&](uint32_t p) {
         gpu::TextureDesc d;
         return p && mem::IsCommitted(p) && mem::IsCommitted(p + 19) && gpu::Describe(p, d) && !d.cube &&
-               d.width == uint32_t(g_texels_width) && d.height == uint32_t(g_texels_height) &&
-               mem::IsCommitted(d.data);
+               d.width == uint32_t(page.width) && d.height == uint32_t(page.height) && mem::IsCommitted(d.data);
     };
-    std::vector<uint32_t> near{R32(g_page_texture + kTextureResource)};
+    std::vector<uint32_t> near{R32(page.texture + kTextureResource)};
     for (size_t level = 0; level < 2; level++) {
         std::vector<uint32_t> next;
         for (uint32_t p : near) {
@@ -324,26 +370,24 @@ uint32_t FindPageHeader() {
     return 0;
 }
 
-// the page's coverage from its D3D texture, once the render device has made it
-void KeepPage() {
-    static bool tried = false;
-    if (!g_texels.empty() || !g_page_texture || std::exchange(tried, true)) return;
-    uint32_t header = FindPageHeader();
+// a page's coverage from its D3D texture, once the render device has made it
+void KeepPage(const char* name, Font::Page& page) {
+    uint32_t header = FindPageHeader(page);
     gpu::TextureDesc d;
     if (!header || !gpu::Describe(header, d)) {
-        LOGI("loading: Title_18 page texture not found (resource %08X)", R32(g_page_texture + kTextureResource));
+        LOGI("loading: %s page texture not found (resource %08X)", name, R32(page.texture + kTextureResource));
         return;
     }
     const gpu::FormatInfo& f = gpu::Format(d.format);
     uint32_t size = gpu::LevelSize(d, 0);
     if (d.format == 0x0B || !mem::IsCommitted(d.data + size - 1)) {  // P8 would want its palette
-        LOGI("loading: Title_18 page texture %08X, %s, not read", header, f.name);
+        LOGI("loading: %s page texture %08X, %s, not read", name, header, f.name);
         return;
     }
     std::vector<uint8_t> out;
     uint32_t pitch = 0;
     gpu::DecodeLevel(d, 0, 0, static_cast<const uint8_t*>(HostPtr(d.data)), nullptr, out, pitch);
-    int w = g_texels_width, h = g_texels_height;
+    int w = page.width, h = page.height;
     std::vector<uint8_t> texels(size_t(w) * h);
     bool luminance = d.format == 0x00 || d.format == 0x13;  // L8: the coverage is the colour
     for (int y = 0; y < h; y++)
@@ -366,17 +410,49 @@ void KeepPage() {
                 else if (a0 > a1) t = uint8_t(((8 - code) * a0 + (code - 1) * a1) / 7);
                 else t = uint8_t(code == 6 ? 0 : code == 7 ? 255 : ((6 - code) * a0 + (code - 1) * a1) / 5);
             } else {
-                LOGI("loading: Title_18 page texture %08X, %s, not read", header, f.name);
+                LOGI("loading: %s page texture %08X, %s, not read", name, header, f.name);
                 return;
             }
         }
-    g_texels = std::move(texels);
-    size_t inked = std::count_if(g_texels.begin(), g_texels.end(), [](uint8_t t) { return t != 0; });
-    LOGI("loading: Title_18 page read from texture %08X (%s), %zu of %zu texels inked", header, f.name, inked,
-         g_texels.size());
+    page.texels = std::move(texels);
+    size_t inked = std::count_if(page.texels.begin(), page.texels.end(), [](uint8_t t) { return t != 0; });
+    LOGI("loading: %s page read from texture %08X (%s), %zu of %zu texels inked", name, header, f.name, inked,
+         page.texels.size());
+}
+
+// the font's pages read, once
+void KeepPages(Font& font) {
+    if (font.pages.empty() || Read(font) || std::exchange(font.tried, true)) return;
+    for (Font::Page& page : font.pages)
+        if (page.texels.empty() && page.texture) KeepPage(font.name.data(), page);
 }
 
 }  // namespace
+
+const Font* game::loading::KeptFont(std::string_view name) {
+    for (Font& f : g_fonts) {
+        if (f.name != name) continue;
+        KeepPages(f);
+        return Read(f) ? &f : nullptr;
+    }
+    return nullptr;
+}
+
+float game::loading::TextWidth(const Font& font, std::u16string_view text) {
+    int width = 0;
+    for (char16_t c : text) width += Advance(font, c);
+    return float(width);
+}
+
+int game::loading::CapHeight(const Font& font) {
+    const Font::Glyph* g = FindGlyph(font, u'H');
+    return g ? g->y : 0;
+}
+
+void game::loading::DrawText(uint8_t* picture, uint32_t pitch, int w, int h, const Font& font,
+                             std::u16string_view text, float left, float baseline, const float (&ink)[3]) {
+    DrawStrip(picture, pitch, w, h, font, text, left, baseline, 1.0f, 1.0f, ink);
+}
 
 X86_EXTERN_FUNC(__imp__sub_00051673);
 X86_FUNC(sub_00051673) {
@@ -384,9 +460,15 @@ X86_FUNC(sub_00051673) {
     __imp__sub_00051673(ctx, base);
     if (picture && std::exchange(g_bar_in_picture, false)) PaintBar(ctx.ebp);
     if (picture && g_edges && app::Widescreen()) PaintEdges(ctx.ebp);
+    if (picture && std::exchange(g_controls_layout, false)) {
+        uint32_t pitch = 0;
+        if (uint8_t* texels = PictureTexels(ctx.ebp, pitch)) game::PaintControlsScreen(texels, pitch);
+    }
     if (!picture || g_press_text.empty()) return;
-    KeepPage();
+    KeepPages(g_title);
     PressText(ctx.ebp, std::exchange(g_press_text, {}));
+    // the mission's instance shows the controller screen before its fonts are up: drawn here, kept for it
+    if (app::Get().button_prompts == app::kPromptsPs2) game::PrepareControlsScreen();
 }
 
 // A relaunched instance starts from the display the old one kept, a 640x480 copy that reads softer than the same
@@ -409,6 +491,7 @@ void game::loading::BeforeShowScreen(X86Context& ctx) {
         for (uint32_t i = 0; i < n; i++) path += char(std::tolower(wide ? R16(p + i * 2) & 0xFF : G<uint8_t>(p + i)));
         g_press_text = g_mission_load ? WordsFor(path) : std::u16string_view{};
         g_edges = path.find("esrb") == std::string::npos;
+        g_controls_layout = app::Get().button_prompts == app::kPromptsPs2 && path.ends_with("controller2.tga");
         return;
     }
     const std::string& kept = KeptPicture();
@@ -424,6 +507,7 @@ void game::loading::BeforeShowScreen(X86Context& ctx) {
 void game::loading::AfterShowScreen(X86Context& ctx) {
     g_press_text = {};
     g_bar_in_picture = false;
+    g_controls_layout = false;
     if (!std::exchange(g_bar_after, false)) return;
     FullBar(ctx);
     FullBar(ctx);
