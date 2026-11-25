@@ -51,7 +51,7 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done (built on Linux), `[t]`
 - [~] in-game rendering: attract demo (Iceland) draws characters, terrain, HUD, night vision; brightness of snow levels not yet compared with the D3D12 build
 - [~] audio: output opens on PipeWire (not listened to yet)
 - [ ] keyboard/mouse/controller
-- [ ] mission relaunch (handover)
+- [t] mission relaunch (handover): menus to a new game, relaunched into x01_iceland_a with the handover
 - [ ] MSAA, SMAA, HDR10 output, AO, soft shadows, HDR rendering
 - [t] first-start game code build (rebuilds the .so when stale)
 - [ ] versus executable
@@ -62,6 +62,9 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done (built on Linux), `[t]`
 - 2026-11-25: Vulkan backend written; everything builds. `tools/linux/shader_test.cpp`: 243 generated/post shaders compile and pass spirv-val. Testing starts.
 - 2026-11-25: first runs. Fixed: X86_EXTERN_FUNC name stringizing (GUEST_ORIG), process groups in the first-start
   build. Title screen and attract demo render, ~72 fps (v-sync) in the debug build, no errors in the log.
+- 2026-11-25: fixed: the game window never appeared on Wayland with pause on focus loss on (the default). The window
+  is only mapped at its first frame, so it had no focus yet and the game paused before presenting. Focus pause now
+  waits for the window's first focus (win32::EverFocused). Present/acquire failures are logged.
 
 ## Testing aids
 - `SCDA_DUMP_FRAMES=n`: every nth presented frame to `captures/frame_NNNNN.bmp` (BGRA with alpha: view with alpha off)

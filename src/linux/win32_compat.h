@@ -121,6 +121,9 @@ void SetWindow(void* sdl_window);
 void OnKey(int scancode, bool down);  // SDL_Scancode
 void OnMouseButton(int vk, bool down);
 void OnFocus(bool focused);
+// the window has had the keyboard focus since it opened: on Wayland a window is not on screen (so can't have the
+// focus) before its first frame, which must not count as focus lost
+bool EverFocused();
 void OnMouseMove(float x, float y);
 // the virtual key a scancode is on the current layout, 0 for none
 int VkOf(int scancode);

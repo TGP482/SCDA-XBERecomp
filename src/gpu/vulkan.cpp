@@ -4038,13 +4038,17 @@ void VulkanBackend::RenderUi(Img* into) {
 
 // false when there is no swap chain image to draw to this frame
 bool VulkanBackend::DrawFrame(Target* t, bool pillarbox) {
-    if (!swap_ || swap_stale_) return false;
+    if (!swap_ || swap_stale_) {
+        LOG_FIRST(16, "vulkan: no swap chain to draw to (stale %d)", int(swap_stale_));
+        return false;
+    }
     Frame& f = CurrentFrame();
     VkResult r = vkAcquireNextImageKHR(dev_, swap_, UINT64_MAX, f.acquired, VK_NULL_HANDLE, &bb_index_);
     if (r == VK_ERROR_OUT_OF_DATE_KHR) {
         swap_stale_ = true;
         return false;
     }
+    if (r != VK_SUCCESS) LOG_FIRST(16, "vulkan: acquire: %d", int(r));
     if (r == VK_SUBOPTIMAL_KHR) swap_stale_ = true;
     else if (r != VK_SUCCESS) {
         LOG_FIRST(8, "vulkan: acquire failed (%d)", int(r));
@@ -4182,6 +4186,8 @@ void VulkanBackend::Present(const Surface& front, bool pillarbox) {
         pi.pSwapchains = &swap_;
         pi.pImageIndices = &bb_index_;
         VkResult r = vkQueuePresentKHR(queue_, &pi);
+        if (r != VK_SUCCESS) LOG_FIRST(16, "vulkan: present %llu: %d", (unsigned long long)presents_, int(r));
+        LOG_FIRST(3, "vulkan: presented %llu (image %u)", (unsigned long long)presents_, bb_index_);
         if (r == VK_ERROR_OUT_OF_DATE_KHR || r == VK_SUBOPTIMAL_KHR) swap_stale_ = true;
         shown_ = true;
         shown_t_ = now_t;

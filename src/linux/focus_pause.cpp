@@ -10,6 +10,7 @@
 #include "core/input.h"
 #include "core/log.h"
 #include "kernel/kernel.h"
+#include "linux/win32_compat.h"
 
 namespace xnet {
 bool InSession();  // xdk/xnet.cpp
@@ -26,6 +27,8 @@ bool ShouldPause() {
     if (!window) return false;
     SDL_WindowFlags f = SDL_GetWindowFlags(window);
     if (f & SDL_WINDOW_HIDDEN) return false;
+    // not yet on screen (Wayland maps a window at its first frame): that is no focus lost
+    if (!win32::EverFocused()) return false;
     return !(f & SDL_WINDOW_INPUT_FOCUS) || (f & SDL_WINDOW_MINIMIZED);
 }
 

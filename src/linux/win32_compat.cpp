@@ -75,6 +75,7 @@ constexpr size_t kKeyCount = sizeof(kKeys) / sizeof(kKeys[0]);
 
 SDL_Window* g_window = nullptr;
 std::atomic<bool> g_focused{false};
+std::atomic<bool> g_ever_focused{false};
 std::atomic<bool> g_down[kKeyCount] = {};
 std::atomic<bool> g_mouse[8] = {};
 // per kKeys entry: its virtual key and character on the current layout, written on the main thread
@@ -301,6 +302,7 @@ void OnMouseButton(int vk, bool down) {
 
 void OnFocus(bool focused) {
     g_focused = focused;
+    if (focused) g_ever_focused = true;
     if (focused) {
         ReadLayout();  // the layout may have changed while away
         return;
@@ -313,6 +315,8 @@ void OnMouseMove(float x, float y) {
     g_cursor_x = x;
     g_cursor_y = y;
 }
+
+bool EverFocused() { return g_ever_focused; }
 
 int VkOf(int scancode) {
     int i = Index(scancode);
