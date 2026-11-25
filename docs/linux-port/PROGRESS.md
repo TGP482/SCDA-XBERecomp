@@ -49,7 +49,7 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done (built on Linux), `[t]`
 ### Testing
 - [t] boots to the title screen (Bink video background, prompt): frames dumped and checked
 - [~] in-game rendering: attract demo (Iceland) draws characters, terrain, HUD, night vision; brightness of snow levels not yet compared with the D3D12 build
-- [~] audio: output opens on PipeWire (not listened to yet)
+- [~] audio: plays on PipeWire; crackling reported, output reworked to a queued pump thread (retest)
 - [ ] keyboard/mouse/controller
 - [t] mission relaunch (handover): menus to a new game, relaunched into x01_iceland_a with the handover
 - [ ] MSAA, SMAA, HDR10 output, AO, soft shadows, HDR rendering
@@ -65,6 +65,9 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done (built on Linux), `[t]`
 - 2026-11-25: fixed: the game window never appeared on Wayland with pause on focus loss on (the default). The window
   is only mapped at its first frame, so it had no focus yet and the game paused before presenting. Focus pause now
   waits for the window's first focus (win32::EverFocused). Present/acquire failures are logged.
+- 2026-11-25: first level played by hand and ran well. Audio crackled: the SDL output ran the mixer inside SDL's
+  callback with a 10 ms device buffer. Now a thread of its own keeps 30 ms queued and adds 10 ms each time the
+  device runs dry (up to 100 ms, logged "audio: output starved"), as the XAudio2 path does.
 
 ## Testing aids
 - `SCDA_DUMP_FRAMES=n`: every nth presented frame to `captures/frame_NNNNN.bmp` (BGRA with alpha: view with alpha off)

@@ -7,6 +7,7 @@
 #include <atomic>
 #include <functional>
 #include <mutex>
+#include <thread>
 #include <vector>
 
 #include "audio/output.h"
@@ -67,21 +68,44 @@ void Convert(const float* mix, float* out, int channels) {
     }
 }
 
-void SDLCALL Pull(void*, SDL_AudioStream* stream, int additional, int) {
+// as audio/xaudio2.cpp's Pump: the mixer runs on this thread, kMinQueued chunks ahead of the device; a starved
+// device crackles, so each time it runs dry one chunk more is kept queued, up to kMaxQueued
+void Pump() {
     Output& o = g_out;
-    if (g_paused) {
-        // the voices keep their place: silence goes out, the mixer is not run
-        std::fill(o.out.begin(), o.out.end(), 0.0f);
-        int bytes = int(o.out.size() * sizeof(float));
-        for (; additional > 0; additional -= bytes) SDL_PutAudioStreamData(stream, o.out.data(), bytes);
-        return;
-    }
-    int chunk_bytes = int(kChunk * uint32_t(o.channels) * sizeof(float));
-    while (additional > 0) {
+    constexpr uint32_t kMinQueued = 3;
+    constexpr uint32_t kMaxQueued = 10;
+    const int chunk_bytes = int(kChunk * uint32_t(o.channels) * sizeof(float));
+    uint32_t depth = kMinQueued;
+    bool stopped = false;
+    bool started = false;
+    for (;;) {
+        if (g_paused != stopped) {
+            stopped = !stopped;
+            // paused: the device stops, the mixer is not run, so every voice keeps its place
+            if (stopped) SDL_PauseAudioStreamDevice(o.stream);
+            else SDL_ResumeAudioStreamDevice(o.stream);
+        }
+        if (stopped) {
+            SDL_Delay(10);
+            continue;
+        }
+        int queued = SDL_GetAudioStreamQueued(o.stream);
+        if (queued < 0) {
+            SDL_Delay(10);
+            continue;
+        }
+        if (started && queued == 0 && depth < kMaxQueued) {
+            depth++;
+            LOGI("audio: output starved, queueing %u ms", depth * 10);
+        }
+        if (queued >= int(depth) * chunk_bytes) {
+            SDL_Delay(2);
+            continue;
+        }
         o.render(o.mix.data(), kChunk);
         Convert(o.mix.data(), o.out.data(), o.channels);
-        SDL_PutAudioStreamData(stream, o.out.data(), chunk_bytes);
-        additional -= chunk_bytes;
+        SDL_PutAudioStreamData(o.stream, o.out.data(), chunk_bytes);
+        started = true;
     }
 }
 
@@ -98,7 +122,6 @@ void SetOutputMode(uint32_t mode) {
 void SetPaused(bool paused) { g_paused = paused; }
 
 void StartOutput(std::function<void(float*, uint32_t)> render) {
-    SDL_SetHint(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, "480");
     if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
         LOGE("audio: SDL audio unavailable, no sound: %s", SDL_GetError());
         return;
@@ -114,7 +137,7 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
     g_out.out.resize(size_t(kChunk) * size_t(g_out.channels));
     ApplyMode();
     SDL_AudioSpec spec{SDL_AUDIO_F32, g_out.channels, int(kRate)};
-    g_out.stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, Pull, nullptr);
+    g_out.stream = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, nullptr, nullptr);
     if (!g_out.stream) {
         LOGE("audio: no output device, no sound: %s", SDL_GetError());
         return;
@@ -122,6 +145,10 @@ void StartOutput(std::function<void(float*, uint32_t)> render) {
     const char* driver = SDL_GetCurrentAudioDriver();
     LOGI("audio: SDL %s, %d device channels, %d frame buffer", driver ? driver : "?", channels, frames);
     SDL_ResumeAudioStreamDevice(g_out.stream);
+    std::thread([] {
+        SDL_SetCurrentThreadPriority(SDL_THREAD_PRIORITY_HIGH);
+        Pump();
+    }).detach();
 }
 
 }  // namespace audio
