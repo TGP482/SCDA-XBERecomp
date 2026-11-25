@@ -1,0 +1,9 @@
+#!/bin/sh
+# The AppImage's entry: the launcher, or with --exe NAME one of the executables (a game relaunching itself)
+HERE="$(dirname "$(readlink -f "$0")")"
+if [ "$1" = "--exe" ] && [ -n "$2" ]; then
+    exe="$2"
+    shift 2
+    exec "$HERE/usr/bin/$exe" "$@"
+fi
+exec "$HERE/usr/bin/SCDA_Launcher" "$@"

@@ -124,6 +124,10 @@ std::vector<Mode> DisplayModes(const std::string& device);
 Mode WindowPixels();
 void RequestQuit();
 bool Relaunched();  // --relaunched on the command line
+// src/linux/paths.cpp: the executables' folder (read only in an AppImage), and whether this runs from one; ExeDir is
+// where the game writes, the data folder in an AppImage
+std::filesystem::path InstallDir();
+bool InAppImage();
 #endif
 // counts the window's display applies: the window may be on another monitor, with another desktop mode
 inline std::atomic<uint32_t> g_display_applied{0};

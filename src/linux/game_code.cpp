@@ -83,8 +83,10 @@ int64_t NowMs() {
     return duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count();
 }
 
-fs::path CompilerDir() { return ExeDir() / "compiler"; }
-fs::path WorkDir(const Image& image) { return CompilerDir() / "work" / image.exe; }
+// the compiler's files beside the executables (read only in an AppImage); its work and the .so go where the game writes
+fs::path CompilerDir() { return InstallDir() / "compiler"; }
+fs::path WorkDir(const Image& image) { return ExeDir() / "compiler" / "work" / image.exe; }
+fs::path BundledLibs() { return CompilerDir() / "lib"; }
 fs::path CodeDll(const Image& image) { return ExeDir() / (std::string(image.exe) + ".so"); }
 fs::path StampFile(const Image& image) { return WorkDir(image) / "built.txt"; }
 fs::path CompileLog() { return ExeDir() / "logs" / "compile.log"; }
@@ -110,10 +112,17 @@ std::string FindProgram(const char* name) {
     return {};
 }
 
-// SCDA_CXX, else clang++ on PATH
+// SCDA_CXX, else the clang the AppImage carries (compiler/bin), else clang++ on PATH
 std::string Compiler() {
     if (const char* c = std::getenv("SCDA_CXX"); c && *c) return FindProgram(c);
+    if (std::string b = (CompilerDir() / "bin" / "clang").string(); access(b.c_str(), X_OK) == 0) return b;
     return FindProgram("clang++");
+}
+
+// the carried lld, else ld.lld on PATH; empty: clang++ links with the system's linker
+std::string Linker() {
+    if (std::string b = (CompilerDir() / "bin" / "ld.lld").string(); access(b.c_str(), X_OK) == 0) return b;
+    return FindProgram("ld.lld");
 }
 
 struct Target {
@@ -124,7 +133,7 @@ struct Target {
 
 bool StampFor(const Image& image, const std::vector<uint8_t>& xbe, std::string& stamp) {
     std::error_code ec;
-    fs::path path = ExeDir() / image.exe;
+    fs::path path = InstallDir() / image.exe;
     uint64_t size = fs::file_size(path, ec);
     if (ec) return false;
     auto time = fs::last_write_time(path, ec).time_since_epoch().count();
@@ -138,7 +147,7 @@ bool Current(const Target& target) {
     fs::file_time_type built = fs::last_write_time(CodeDll(*target.image), ec);
     if (ec) return false;
     std::ifstream f(StampFile(*target.image));
-    if (!f) return built > fs::last_write_time(ExeDir() / target.image->exe, ec);
+    if (!f) return built > fs::last_write_time(InstallDir() / target.image->exe, ec);
     std::string line;
     return std::getline(f, line) && line == target.stamp;
 }
@@ -162,7 +171,7 @@ std::vector<Target> StaleTargets(const GameFiles& game) {
     for (const Image& image : kImages) {
         Target target{&image};
         std::error_code ec;
-        if (!fs::exists(ExeDir() / image.exe, ec)) continue;  // only the executables that are here
+        if (!fs::exists(InstallDir() / image.exe, ec)) continue;  // only the executables that are here
         if (!ReadXbe(game, image.xbe, target.xbe)) {
             LOGW("game code: no %s in the game files, %s is not built", image.xbe, image.exe);
             continue;
@@ -225,6 +234,20 @@ public:
         std::error_code ec;
         fs::create_directories(CompileLog().parent_path(), ec);
         log_ = open(CompileLog().c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        // the carried compiler finds its libraries beside it; nothing else the game starts sees them
+        std::string libs = BundledLibs().string();
+        bool carried = fs::is_directory(BundledLibs());
+        for (char** e = environ; *e; e++) {
+            std::string_view v = *e;
+            if (carried && v.rfind("LD_LIBRARY_PATH=", 0) == 0) continue;
+            env_strings_.emplace_back(v);
+        }
+        if (carried) {
+            const char* old = std::getenv("LD_LIBRARY_PATH");
+            env_strings_.push_back("LD_LIBRARY_PATH=" + libs + (old && *old ? ":" + std::string(old) : ""));
+        }
+        for (std::string& e : env_strings_) env_.push_back(e.data());
+        env_.push_back(nullptr);
     }
     ~Processes() {
         if (log_ >= 0) close(log_);
@@ -248,7 +271,7 @@ public:
         for (std::string& a : copy) argv.push_back(a.data());
         argv.push_back(nullptr);
         pid_t pid = 0;
-        int r = posix_spawn(&pid, copy[0].c_str(), &fa, &at, argv.data(), environ);
+        int r = posix_spawn(&pid, copy[0].c_str(), &fa, &at, argv.data(), env_.data());
         posix_spawn_file_actions_destroy(&fa);
         posix_spawnattr_destroy(&at);
         if (r != 0) {
@@ -300,6 +323,8 @@ public:
 
 private:
     int log_ = -1;
+    std::vector<std::string> env_strings_;
+    std::vector<char*> env_;
     std::vector<pid_t> live_;  // every process started; one already reaped is no group any more
 };
 
@@ -384,10 +409,14 @@ bool Link(const std::string& cxx, const Target& target, Processes& run) {
     fs::path out = CodeDll(image);
     fs::path temp = out;
     temp += ".tmp";
-    std::vector<std::string> c{cxx, "-shared", "-o", temp.string(), "x86_func_mapping.o"};
-    if (!FindProgram("ld.lld").empty()) c.insert(c.begin() + 1, {"-fuse-ld=lld", "-Wl,--icf=none"});
+    // lld alone: no C runtime start files and no libraries, which need a system's development packages. What the
+    // code calls in libc, libm and libstdc++ is bound when the executable (which has them) opens it
+    std::string lld = Linker();
+    std::vector<std::string> c;
+    if (!lld.empty()) c = {lld, "-shared", "--icf=none", "-o", temp.string(), "x86_func_mapping.o"};
+    else c = {cxx, "-shared", "-o", temp.string(), "x86_func_mapping.o"};
     for (uint32_t i = 0; i < PartitionCount(image); i++) c.push_back("x86_recomp." + std::to_string(i) + ".o");
-    c.push_back("-lm");
+    if (lld.empty()) c.push_back("-lm");
     pid_t pid = run.Start(c, work);
     if (!pid) return RecordFailure("clang++ could not be started to link.");
     std::vector<int> codes;
@@ -421,12 +450,14 @@ std::string Blocker(const std::vector<Target>& targets) {
     if (Compiler().empty())
         return "Preparing the game needs clang (clang++ on PATH, or SCDA_CXX naming it). Install clang and lld with "
                "your package manager, then start the game again.";
+    std::error_code wc;
+    fs::create_directories(ExeDir() / "compiler" / "work", wc);
     for (const Target& target : targets) {
         fs::create_directories(WorkDir(*target.image), ec);
         if (ec) return "The game's folder cannot be written to. Move it somewhere you can write to, such as your home folder.";
     }
     struct statvfs st{};
-    if (statvfs(CompilerDir().c_str(), &st) == 0 && uint64_t(st.f_bavail) * st.f_frsize < kDiskNeeded)
+    if (statvfs(ExeDir().c_str(), &st) == 0 && uint64_t(st.f_bavail) * st.f_frsize < kDiskNeeded)
         return "Preparing the game needs 1 GB of free space on the drive it is on.";
     return {};
 }
@@ -584,8 +615,8 @@ bool BuildWithWindow(std::vector<Target>& targets) {
 bool PrepareGameCode(const GameFiles& game) {
     // one build at a time: a second copy of the game started meanwhile waits for it, then finds the .so current
     std::error_code ec;
-    fs::create_directories(CompilerDir(), ec);
-    int lock = open((CompilerDir() / ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    fs::create_directories(ExeDir() / "compiler", ec);
+    int lock = open((ExeDir() / "compiler" / ".lock").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0644);
     if (lock >= 0) flock(lock, LOCK_EX);
     std::vector<Target> stale = StaleTargets(game);
     for (const Target& target : stale) LOGR("Game code: building %s.so", target.image->exe);

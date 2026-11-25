@@ -15,6 +15,9 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done (built on Linux), `[t]`
 - [x] xbe_recomp runs on Linux and generates `generated/game` and `generated/versus`
 - [x] Game code `.so` builds (`SCDA.so`, `SCDA_Versus.so`), ~36 s on 32 threads
 - [ ] `build.sh` (counterpart of `build.bat`)
+- [x] AppImage: `tools/linux/make_appimage.sh` (needs appimagetool installed: AUR appimagetool-bin, or APPIMAGETOOL=path).
+  Launcher GUI (`src/launcher`), bundled clang + lld, data in `~/.local/share/scda-xberecomp`. Built on this machine
+  it needs this glibc (2.43+): build in an older distro's container to share it
 
 ### OS layer
 - [x] memory (Commit/Decommit already had POSIX paths)
@@ -68,6 +71,12 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done (built on Linux), `[t]`
 - 2026-11-25: first level played by hand and ran well. Audio crackled: the SDL output ran the mixer inside SDL's
   callback with a 10 ms device buffer. Now a thread of its own keeps 30 ms queued and adds 10 ms each time the
   device runs dry (up to 100 ms, logged "audio: output starved"), as the XAudio2 path does.
+- 2026-11-25: AppImage. Launcher (SDL3 + ImGui, F10 panel colours): pick the disc image or game folder (linked as
+  assets/ in the data folder), checks both xbes against the releases this build was made from, display settings,
+  Play / Versus. In an AppImage the game writes to the data folder (`app::ExeDir`), reads the compiler from the
+  install folder (`app::InstallDir`), relaunches through `$APPIMAGE --exe NAME`. The first start links the .so with
+  lld alone (no C runtime files or libraries: they bind at dlopen). Tested from the AppDir with the system clang off
+  PATH: game code built with the bundled compiler, the game ran from the ISO.
 
 ## Testing aids
 - `SCDA_DUMP_FRAMES=n`: every nth presented frame to `captures/frame_NNNNN.bmp` (BGRA with alpha: view with alpha off)
@@ -75,6 +84,8 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done (built on Linux), `[t]`
 - `SCDA_VULKAN_DEBUG=1`: validation layer (install vulkan-validation-layers), `SCDA_VULKAN_DEVICE=<name part>`
 - `SCDA_HDR_PAPER_NITS`, `SCDA_HDR_PEAK_NITS`: HDR10 output levels (Linux can't read them from the system)
 - For runs in the background, put `pause_on_focus_loss = false` and `display_mode = 'windowed'` in `scda.toml` beside the exe
+- `SCDA_LAUNCHER_SHOT=file.bmp`: the launcher saves a frame there and quits (with `SDL_VIDEO_DRIVER=offscreen`)
+- `SCDA_DATA_DIR=dir`: where the game writes (an AppImage defaults to `~/.local/share/scda-xberecomp`)
 - `tools/linux/shader_test.cpp`: compiles every post pass and a spread of generated shaders through the Vulkan path:
   `clang++ -std=c++20 -Isrc tools/linux/shader_test.cpp src/gpu/shaders.cpp src/gpu/vulkan_shaders.cpp -lglslang -lSPIRV-Tools-opt -lSPIRV-Tools -lglslang-default-resource-limits -o shader_test && ./shader_test outdir`
 

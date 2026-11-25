@@ -102,7 +102,7 @@ else()
 endif()
 
 file(GLOB HOST_SOURCES CONFIGURE_DEPENDS src/*/*.cpp)
-list(FILTER HOST_SOURCES EXCLUDE REGEX "/src/(game|versus)/")
+list(FILTER HOST_SOURCES EXCLUDE REGEX "/src/(game|versus|launcher)/")
 if(WIN32)
     list(FILTER HOST_SOURCES EXCLUDE REGEX "/src/linux/|/src/gpu/vulkan[^/]*\\.cpp$")
 else()
@@ -168,6 +168,7 @@ function(scda_image target xbe config partitions game_dir)
     file(SHA1 ${xbe_file} xbe_sha1)
     set(XBE_HASH ${CMAKE_CURRENT_BINARY_DIR}/${target}_xbe.cpp)
     file(CONFIGURE OUTPUT ${XBE_HASH} CONTENT "extern const char kImageSha1[] = \"${xbe_sha1}\";\n")
+    set(${target}_SHA1 ${xbe_sha1} PARENT_SCOPE)
     if(WIN32)
         add_executable(${target} WIN32 ${HOST_SOURCES} ${GAME_SOURCES} ${IMGUI_SOURCES} ${XBE_HASH}
             ${CMAKE_CURRENT_SOURCE_DIR}/src/app/version.rc)
@@ -192,7 +193,9 @@ function(scda_image target xbe config partitions game_dir)
         target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> $<LINK_ONLY:opus>
             Vulkan::Vulkan glslang::glslang glslang::SPIRV glslang::glslang-default-resource-limits PNG::PNG
             Threads::Threads ${CMAKE_DL_LIBS})
-        target_link_options(${target} PRIVATE -fuse-ld=lld -rdynamic -g)
+        # the libraries an AppImage carries in usr/lib, found from usr/bin; RPATH (not RUNPATH) so theirs are too
+        target_link_options(${target} PRIVATE -fuse-ld=lld -rdynamic -g -Wl,--disable-new-dtags
+            "-Wl,-rpath,\$ORIGIN/../lib")
     endif()
 
     if(WIN32)
@@ -232,3 +235,17 @@ endfunction()
 
 scda_image(SCDA default.xbe scda_v2.toml 128 game)        # solo and co-op
 scda_image(SCDA_Versus sc4_adv.xbe sc4_adv.toml 64 versus)  # versus
+
+if(NOT WIN32)
+    # Linux: the launcher an AppImage opens with (src/launcher): picks the game files, display settings, starts a game
+    file(CONFIGURE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/launcher_xbe.cpp CONTENT
+        "extern const char kLauncherGameSha1[] = \"${SCDA_SHA1}\";\nextern const char kLauncherVersusSha1[] = \"${SCDA_Versus_SHA1}\";\n")
+    add_executable(SCDA_Launcher src/launcher/launcher.cpp src/linux/paths.cpp src/kernel/disc.cpp src/kernel/crypto.cpp
+        ${imgui_SOURCE_DIR}/imgui.cpp ${imgui_SOURCE_DIR}/imgui_draw.cpp ${imgui_SOURCE_DIR}/imgui_tables.cpp
+        ${imgui_SOURCE_DIR}/imgui_widgets.cpp ${imgui_SOURCE_DIR}/backends/imgui_impl_sdl3.cpp
+        ${imgui_SOURCE_DIR}/backends/imgui_impl_sdlrenderer3.cpp ${CMAKE_CURRENT_BINARY_DIR}/launcher_xbe.cpp)
+    target_include_directories(SCDA_Launcher PRIVATE src)
+    target_include_directories(SCDA_Launcher SYSTEM PRIVATE ${imgui_SOURCE_DIR} ${sdl3_SOURCE_DIR}/include)
+    target_link_libraries(SCDA_Launcher PRIVATE tomlplusplus::tomlplusplus SDL3::SDL3-static)
+    target_link_options(SCDA_Launcher PRIVATE -fuse-ld=lld)
+endif()

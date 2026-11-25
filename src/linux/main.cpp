@@ -416,12 +416,6 @@ void RunLoop() {
 
 }  // namespace
 
-std::filesystem::path ExeDir() {
-    char p[4096] = {};
-    ssize_t n = readlink("/proc/self/exe", p, sizeof(p) - 1);
-    return std::filesystem::path(std::string(p, n > 0 ? size_t(n) : 0)).parent_path();
-}
-
 int Instance() {
     static const int n = [] {
         for (size_t i = 0; i + 1 < g_args.size(); i++)
@@ -505,6 +499,7 @@ int main(int argc, char** argv) {
     logx::Init((app::ExeDir() / "logs").string(), log, relaunched);
     // SDL picks Wayland or X11 itself; the joystick and video subsystems run their events on this thread
     SDL_SetHint(SDL_HINT_APP_NAME, "Splinter Cell: Double Agent");
+    SDL_SetHint(SDL_HINT_APP_ID, "scda-xberecomp");  // the desktop file's name: the taskbar shows its icon
     SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_MODE_CENTER, "1");
     // audio through PulseAudio (pipewire-pulse on PipeWire systems) first: SDL's native PipeWire output crackled here;
     // SDL_AUDIODRIVER in the environment still picks another

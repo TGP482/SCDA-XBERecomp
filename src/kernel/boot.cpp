@@ -222,6 +222,11 @@ void Relaunch(const char* exe) {
     path = path.substr(0, path.find_last_of('/') + 1) + exe;
     // the arguments (--instance) carry over, as on Windows
     std::vector<std::string> args{path};
+    // from an AppImage, through the AppImage again: this one's mount goes when this process ends
+    if (const char* appimage = std::getenv("APPIMAGE"); appimage && *appimage) {
+        path = appimage;
+        args = {path, "--exe", exe};
+    }
     {
         std::ifstream f("/proc/self/cmdline", std::ios::binary);
         std::string all((std::istreambuf_iterator<char>(f)), {});

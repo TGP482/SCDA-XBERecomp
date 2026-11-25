@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Splinter Cell: Double Agent (XBE Recomp)
+Comment=Native port of the original Xbox version, statically recompiled. Needs your own copy of the game.
+Exec=SCDA_Launcher
+Icon=scda-xberecomp
+Categories=Game;ActionGame;
+Terminal=false
+StartupWMClass=scda-xberecomp
