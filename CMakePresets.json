@@ -21,11 +21,33 @@
         {"name": "release", "displayName": "Release", "inherits": "windows-base",
          "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}},
         {"name": "relwithdebinfo", "displayName": "RelWithDebInfo", "inherits": "windows-base",
+         "cacheVariables": {"CMAKE_BUILD_TYPE": "RelWithDebInfo"}},
+        {
+            "name": "linux-base",
+            "hidden": true,
+            "generator": "Ninja",
+            "binaryDir": "${sourceDir}/out/build/${presetName}",
+            "cacheVariables": {
+                "CMAKE_C_COMPILER": "clang",
+                "CMAKE_CXX_COMPILER": "clang++",
+                "CMAKE_C_FLAGS": "-march=x86-64-v2",
+                "CMAKE_CXX_FLAGS": "-march=x86-64-v2"
+            },
+            "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux"}
+        },
+        {"name": "linux-debug", "displayName": "Linux Debug", "inherits": "linux-base",
+         "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug", "CMAKE_C_FLAGS_DEBUG": "-O3 -g", "CMAKE_CXX_FLAGS_DEBUG": "-O3 -g"}},
+        {"name": "linux-release", "displayName": "Linux Release", "inherits": "linux-base",
+         "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}},
+        {"name": "linux-relwithdebinfo", "displayName": "Linux RelWithDebInfo", "inherits": "linux-base",
          "cacheVariables": {"CMAKE_BUILD_TYPE": "RelWithDebInfo"}}
     ],
     "buildPresets": [
         {"name": "debug", "configurePreset": "debug"},
         {"name": "release", "configurePreset": "release"},
-        {"name": "relwithdebinfo", "configurePreset": "relwithdebinfo"}
+        {"name": "relwithdebinfo", "configurePreset": "relwithdebinfo"},
+        {"name": "linux-debug", "configurePreset": "linux-debug"},
+        {"name": "linux-release", "configurePreset": "linux-release"},
+        {"name": "linux-relwithdebinfo", "configurePreset": "linux-relwithdebinfo"}
     ]
 }

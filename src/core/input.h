@@ -26,7 +26,14 @@ void Rumble(int port, uint16_t left, uint16_t right);
 void SetBlocked(bool blocked);  // the options panel takes the input
 
 // window thread
+#ifdef _WIN32
 void OnRawInput(void* handle);
+#else
+// relative counts, the wheel in WHEEL_DELTA units, any button change: SDL's mouse events
+void OnMouse(int dx, int dy, int wheel, bool buttons);
+// SDL_EVENT_GAMEPAD_ADDED / REMOVED, which the main loop takes
+void OnPadEvent(bool added, uint32_t id);
+#endif
 void OnPress();  // the left button went down
 void OnClick();  // and came up: a menu click, when it also went down in the menu with the input taken
 void ReleaseCursor();

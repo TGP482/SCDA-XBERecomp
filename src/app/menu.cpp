@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -19,6 +20,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include "linux/win32_compat.h"
+#endif
 
 #include <imgui.h>
 
@@ -112,6 +116,7 @@ void StepName(uint32_t& value, const char* const (&names)[N], int step, char (&t
     std::snprintf(text, sizeof(text), "%s", names[value]);
 }
 
+#ifdef _WIN32
 // the monitor's modes smallest first, so Left steps down; the primary's for empty
 std::vector<Mode> Modes(const std::string& monitor) {
     std::vector<Mode> modes;
@@ -129,6 +134,10 @@ std::vector<Mode> Modes(const std::string& monitor) {
     });
     return modes;
 }
+
+#else
+std::vector<Mode> Modes(const std::string& monitor) { return DisplayModes(monitor); }
+#endif
 
 // in the game's language, as ImGui's UTF-8; caps for the panel's capitals (its own font has the accents)
 std::string Ui(std::string_view text, bool caps = true) {

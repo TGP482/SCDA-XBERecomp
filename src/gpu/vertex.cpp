@@ -3,7 +3,7 @@
 #include <algorithm>
 #include <cstring>
 
-#include <dxgiformat.h>
+#include "gpu/dxgi_format.h"
 
 #include "core/log.h"
 #include "kernel/kernel.h"

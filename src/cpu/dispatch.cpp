@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -5,6 +6,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <dlfcn.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -25,6 +29,7 @@
 #include <x86intrin.h>
 #endif
 
+#ifdef _WIN32
 // the C runtime functions the game code DLL calls, passed on to the DLLs that have them
 #pragma comment(linker, "/EXPORT:memcpy=vcruntime140.memcpy")
 #pragma comment(linker, "/EXPORT:memmove=vcruntime140.memmove")
@@ -42,6 +47,7 @@
 #pragma comment(linker, "/EXPORT:exp2=ucrtbase.exp2")
 #pragma comment(linker, "/EXPORT:ldexp=ucrtbase.ldexp")
 #pragma comment(linker, "/EXPORT:frexp=ucrtbase.frexp")
+#endif
 
 namespace {
 
@@ -69,13 +75,24 @@ namespace dispatch {
 
 // the game code DLL and its tables; data comes by name, as the delay loaded imports carry only functions
 bool Load(const std::filesystem::path& dll) {
+#ifdef _WIN32
     HMODULE m = LoadLibraryW(dll.c_str());
     if (!m) return false;
-    g_mappings = reinterpret_cast<const X86FuncMapping*>(GetProcAddress(m, "X86FuncMappings"));
-    g_continuations = reinterpret_cast<const uint32_t*>(GetProcAddress(m, "X86Continuations"));
-    auto* lo = reinterpret_cast<const uint32_t*>(GetProcAddress(m, "X86CodeBase"));
-    auto* hi = reinterpret_cast<const uint32_t*>(GetProcAddress(m, "X86CodeEnd"));
-    auto* entry = reinterpret_cast<const uint32_t*>(GetProcAddress(m, "X86EntryPoint"));
+    auto get = [m](const char* name) { return reinterpret_cast<const void*>(GetProcAddress(m, name)); };
+#else
+    // global: the executable's calls into it (x86_import) find its symbols by name; now: a missing one fails here
+    void* m = dlopen(dll.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    if (!m) {
+        LOGE("dispatch: %s", dlerror());
+        return false;
+    }
+    auto get = [m](const char* name) { return static_cast<const void*>(dlsym(m, name)); };
+#endif
+    g_mappings = static_cast<const X86FuncMapping*>(get("X86FuncMappings"));
+    g_continuations = static_cast<const uint32_t*>(get("X86Continuations"));
+    auto* lo = static_cast<const uint32_t*>(get("X86CodeBase"));
+    auto* hi = static_cast<const uint32_t*>(get("X86CodeEnd"));
+    auto* entry = static_cast<const uint32_t*>(get("X86EntryPoint"));
     if (!g_mappings || !g_continuations || !lo || !hi || !entry) return false;
     g_lo = *lo;
     g_hi = *hi;
@@ -272,3 +289,16 @@ void x86_cpuid(X86Context& ctx) {
             break;
     }
 }
+
+#ifndef _WIN32
+// the executable's calls into the game code .so: its symbols, or an override the executable exports, by name
+void* x86_import(const char* name) {
+    void* p = dlsym(RTLD_DEFAULT, name);
+    if (!p) {
+        LOGE("dispatch: the game code has no %s", name);
+        logx::Flush();
+        std::abort();
+    }
+    return p;
+}
+#endif

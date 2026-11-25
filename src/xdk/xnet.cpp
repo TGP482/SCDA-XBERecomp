@@ -9,6 +9,7 @@
 // (co-op) a LAN address in an XNADDR, which only means something on its owner's LAN, stands for the peer's public
 // one: the join address on the client, the address its packets come from on the host. Ports a NAT rewrote are
 // answered on the port the peer's packets came from.
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -17,6 +18,11 @@
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
+// select's first argument is ignored by Winsock
+inline int HostSelect(fd_set* r, fd_set* w, fd_set* e, timeval* t) { return ::select(0, r, w, e, t); }
+#else
+#include "linux/winsock_compat.h"
+#endif
 
 #include <algorithm>
 #include <array>
@@ -51,7 +57,8 @@ constexpr uint32_t kLinkUp = 0x01 | 0x02 | 0x08;          // active, 100 Mbps, f
 constexpr uint32_t kXnAddrEthernet = 0x02 | 0x04;         // ethernet, static address
 constexpr DWORD kUdpConnReset = 0x9800000C;  // SIO_UDP_CONNRESET: off, or a send to a closed port fails the next recv
 constexpr int kLoopbackInstances = 8;
-constexpr uint32_t kVdpProtocol = 254;  // IPPROTO_VDP: game data and voice in one datagram
+constexpr uint32_t kVdpProtocol = 254;
+constexpr uint32_t kGuestFionbio = 0x8004667E;  // Winsock's FIONBIO, as the guest passes it  // IPPROTO_VDP: game data and voice in one datagram
 
 struct Socket {
     SOCKET s = INVALID_SOCKET;
@@ -235,7 +242,7 @@ bool Wait(SOCKET s, bool write, int ms) {
     FD_ZERO(&f);
     FD_SET(s, &f);
     timeval tv{ms / 1000, (ms % 1000) * 1000};
-    return ::select(0, write ? nullptr : &f, write ? &f : nullptr, nullptr, &tv) > 0;
+    return HostSelect(write ? nullptr : &f, write ? &f : nullptr, nullptr, &tv) > 0;
 }
 
 std::vector<Span> Spans(uint32_t bufs, uint32_t count) {
@@ -402,19 +409,23 @@ void Pump() {
         SendCoop();
         fd_set set;
         FD_ZERO(&set);
+        uint32_t count = 0;  // fd_set's own count is Winsock's alone
         {
             std::lock_guard<std::mutex> lock(g_lock);
             for (auto& p : g_pending) {
                 auto it = g_sockets.find(p.sock);
-                if (it != g_sockets.end() && set.fd_count < FD_SETSIZE) FD_SET(it->second.s, &set);
+                if (it != g_sockets.end() && count < FD_SETSIZE) {
+                    FD_SET(it->second.s, &set);
+                    count++;
+                }
             }
         }
-        if (!set.fd_count) {
+        if (!count) {
             Sleep(1);
             continue;
         }
         timeval tv{0, 2000};
-        if (::select(0, &set, nullptr, nullptr, &tv) <= 0) {
+        if (HostSelect(&set, nullptr, nullptr, &tv) <= 0) {
             Sleep(1);
             continue;
         }
@@ -644,7 +655,7 @@ HLE_STDCALL(ioctlsocket, 3) {
     std::lock_guard<std::mutex> lock(g_lock);
     auto it = g_sockets.find(a[0]);
     if (it == g_sockets.end()) return Fail(WSAENOTSOCK);
-    if (a[1] == uint32_t(FIONBIO)) {
+    if (a[1] == kGuestFionbio) {
         it->second.nonblocking = R32(a[2]) != 0;
         return 0;
     }
@@ -760,7 +771,7 @@ HLE_STDCALL(select, 5) {
     if (!total) {
         if (ptv) Sleep(DWORD(tv.tv_sec * 1000 + tv.tv_usec / 1000));
     } else {
-        r = ::select(0, guest[0] ? &host[0] : nullptr, guest[1] ? &host[1] : nullptr, guest[2] ? &host[2] : nullptr, ptv);
+        r = HostSelect(guest[0] ? &host[0] : nullptr, guest[1] ? &host[1] : nullptr, guest[2] ? &host[2] : nullptr, ptv);
         if (r < 0) return Fail(HostError());
     }
     for (int i = 0; i < 3; i++) {

@@ -1,5 +1,6 @@
 // The game in assets: its files, or a disc image (.iso) with this executable's xbe on it. The xbe must be the one
 // this executable was recompiled from; another release's would run its own data under this code.
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -7,6 +8,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include "linux/win32_compat.h"
+#endif
 
 #include <algorithm>
 #include <cwctype>

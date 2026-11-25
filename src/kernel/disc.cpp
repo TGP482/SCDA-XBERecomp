@@ -4,6 +4,7 @@
 #include <cctype>
 #include <cstring>
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -11,6 +12,10 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace kernel {
 
@@ -44,6 +49,7 @@ std::string Upper(std::string s) {
 
 }  // namespace
 
+#ifdef _WIN32
 Disc::~Disc() {
     if (file_) CloseHandle(file_);
 }
@@ -69,6 +75,33 @@ bool Disc::Open(const std::filesystem::path& path, std::string& error) {
         error = "cannot open the file";
         return false;
     }
+#else
+// the fd is kept in file_ plus one, so null stays "none"
+Disc::~Disc() {
+    if (file_) close(int(reinterpret_cast<intptr_t>(file_) - 1));
+}
+
+// pread carries its own position, so threads reading at once do not share one
+uint32_t Disc::ReadAt(uint64_t at, void* out, uint32_t len) const {
+    int fd = int(reinterpret_cast<intptr_t>(file_) - 1);
+    uint32_t done = 0;
+    while (done < len) {
+        ssize_t n = pread(fd, static_cast<uint8_t*>(out) + done, len - done, off_t(at + done));
+        if (n <= 0) break;
+        done += uint32_t(n);
+    }
+    return done;
+}
+
+bool Disc::Open(const std::filesystem::path& path, std::string& error) {
+    path_ = path;
+    int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        error = "cannot open the file";
+        return false;
+    }
+    file_ = reinterpret_cast<void*>(intptr_t(fd) + 1);
+#endif
     for (uint64_t base : kPartitions) {
         uint8_t volume[kSector];
         if (ReadAt(base + kVolume, volume, kSector) != kSector || std::memcmp(volume, kMagic, kMagicSize) != 0 ||

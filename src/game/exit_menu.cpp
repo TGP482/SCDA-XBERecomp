@@ -4,6 +4,7 @@
 #include <string>
 #include <string_view>
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -11,6 +12,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include "linux/win32_compat.h"
+#endif
 
 #include "app/app.h"
 #include "app/translations.h"
@@ -164,7 +168,8 @@ X86_FUNC(sub_001ACEAB) {
     }
     __imp__sub_001ACEAB(ctx, base);
 }
-
+
+
 // OnCancel of the same listener
 X86_EXTERN_FUNC(__imp__sub_001AD175);
 X86_FUNC(sub_001AD175) {

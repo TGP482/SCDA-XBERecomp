@@ -118,6 +118,13 @@ struct Display {
 };
 std::vector<Display> Displays();
 void* MonitorHandle(const std::string& device);  // HMONITOR, the primary for empty or one not connected
+#ifndef _WIN32
+// Linux (src/linux/display.cpp): the monitor's fullscreen modes smallest first, the window's pixel size
+std::vector<Mode> DisplayModes(const std::string& device);
+Mode WindowPixels();
+void RequestQuit();
+bool Relaunched();  // --relaunched on the command line
+#endif
 // counts the window's display applies: the window may be on another monitor, with another desktop mode
 inline std::atomic<uint32_t> g_display_applied{0};
 float RenderScale(uint32_t guest_height);

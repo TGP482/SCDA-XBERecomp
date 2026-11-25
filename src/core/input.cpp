@@ -15,6 +15,7 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -23,6 +24,9 @@
 #endif
 #include <windows.h>
 #include <xinput.h>
+#else
+#include "linux/win32_compat.h"
+#endif
 
 #include <SDL3/SDL.h>
 
@@ -829,6 +833,7 @@ void RemovePad(SDL_JoystickID id) {
 
 // once a millisecond at most, however many ports and threads read
 void UpdatePads() {
+#ifdef _WIN32
     static uint64_t last = 0;
     uint64_t now = NowMs();
     if (now == last) return;
@@ -839,18 +844,24 @@ void UpdatePads() {
         if (e.type == SDL_EVENT_GAMEPAD_ADDED) AddPad(e.gdevice.which);
         else if (e.type == SDL_EVENT_GAMEPAD_REMOVED) RemovePad(e.gdevice.which);
     }
+#endif
+    // Linux: the main loop pumps SDL's events, video's included, and hands the pads' on (OnPadEvent)
 }
 
 void StartPads() {
     if (g_sdl) return;  // started already for the game code window
     // WGI reads the triggers apart and HIDAPI takes PlayStation and Switch pads. Reads come from the guest's threads,
     // so SDL's own thread takes the device notices.
+#ifdef _WIN32
     SDL_SetHint(SDL_HINT_JOYSTICK_THREAD, "1");
     SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
     SDL_SetHint(SDL_HINT_JOYSTICK_WGI, "1");
     SDL_SetHint(SDL_HINT_JOYSTICK_RAWINPUT, "0");
     SDL_SetHint(SDL_HINT_XINPUT_ENABLED, "0");
     SDL_SetHint(SDL_HINT_JOYSTICK_DIRECTINPUT, "0");
+#else
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+#endif
     if (!SDL_Init(SDL_INIT_GAMEPAD)) {
         LOGE("input: SDL failed to start, no controllers: %s", SDL_GetError());
         return;
@@ -1068,18 +1079,18 @@ uint16_t HeldOnAnyController() {
 
 void Init(void* hwnd) {
     g_hwnd = static_cast<HWND>(hwnd);
+#ifdef _WIN32
     RAWINPUTDEVICE mouse{1, 2, 0, g_hwnd};  // generic desktop page, mouse usage
     RegisterRawInputDevices(&mouse, 1, sizeof(mouse));
+#endif
     StartPads();
 }
 
-void OnRawInput(void* handle) {
-    RAWINPUT ri;
-    UINT size = sizeof(ri);
-    UINT read = GetRawInputData(static_cast<HRAWINPUT>(handle), RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER));
-    if (read == UINT(-1) || ri.header.dwType != RIM_TYPEMOUSE) return;
-    const RAWMOUSE& m = ri.data.mouse;
-    int notch = !(m.usButtonFlags & RI_MOUSE_WHEEL) ? 0 : SHORT(m.usButtonData) > 0 ? 1 : -1;
+namespace {
+
+// a mouse report: relative counts, the wheel in WHEEL_DELTA units (0 for none), any button change
+void MouseInput(int dx, int dy, int wheel, bool buttons) {
+    int notch = !wheel ? 0 : wheel > 0 ? 1 : -1;
     // noted while the input is taken too, so a key capture sees the wheel
     if (notch && g_hwnd && GetForegroundWindow() == g_hwnd) g_wheel_ms[notch < 0] = NowMs();
     if (!Active()) return;
@@ -1087,17 +1098,15 @@ void OnRawInput(void* handle) {
     if (MapDrag()) Pin();
     else if (Pointing()) ClipCursor(nullptr);
     else Clip();
-    if (m.lLastX || m.lLastY || m.usButtonFlags) g_keyboard_ms = NowMs();
-    if (!(m.usFlags & MOUSE_MOVE_ABSOLUTE)) {
-        g_dx += m.lLastX;
-        g_dy += m.lLastY;
-    }
+    if (dx || dy || buttons || wheel) g_keyboard_ms = NowMs();
+    g_dx += dx;
+    g_dy += dy;
     if (!notch) return;
     // the map, menus and the interaction list keep the wheel whatever it is bound to, as the arrows
     if (g_map) {
         Notch(notch);
     } else if (g_menu || g_list) {
-        g_menu_wheel += SHORT(m.usButtonData);
+        g_menu_wheel += wheel;
     }
     if (g_map || g_menu || g_list) return;
     int vk = notch > 0 ? kWheelUp : kWheelDown;
@@ -1106,6 +1115,35 @@ void OnRawInput(void* handle) {
         if (ZoomOf(i) && std::ranges::find(g_binds[i], vk) != g_binds[i].end()) Notch(ZoomOf(i));
     }
 }
+
+}  // namespace
+
+#ifdef _WIN32
+void OnRawInput(void* handle) {
+    RAWINPUT ri;
+    UINT size = sizeof(ri);
+    UINT read = GetRawInputData(static_cast<HRAWINPUT>(handle), RID_INPUT, &ri, &size, sizeof(RAWINPUTHEADER));
+    if (read == UINT(-1) || ri.header.dwType != RIM_TYPEMOUSE) return;
+    const RAWMOUSE& m = ri.data.mouse;
+    int wheel = (m.usButtonFlags & RI_MOUSE_WHEEL) ? SHORT(m.usButtonData) : 0;
+    bool relative = !(m.usFlags & MOUSE_MOVE_ABSOLUTE);
+    if (!relative && (m.lLastX || m.lLastY) && !m.usButtonFlags && !wheel) {
+        // an absolute report moves nothing, but still counts as the mouse being used
+        MouseInput(0, 0, 0, true);
+        return;
+    }
+    MouseInput(relative ? int(m.lLastX) : 0, relative ? int(m.lLastY) : 0, wheel, m.usButtonFlags != 0);
+}
+#else
+void OnMouse(int dx, int dy, int wheel, bool buttons) { MouseInput(dx, dy, wheel, buttons); }
+
+void OnPadEvent(bool added, uint32_t id) {
+    std::lock_guard lock(g_pads_mutex);
+    if (!g_sdl) return;
+    if (added) AddPad(SDL_JoystickID(id));
+    else RemovePad(SDL_JoystickID(id));
+}
+#endif
 
 void OnPress() { g_press_counts = Active() && Pointing(); }
 

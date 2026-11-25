@@ -23,6 +23,7 @@ typedef double __attribute__((aligned(1), may_alias)) x86_f64u;
 
 // The recompiled code is built on the player's PC into a DLL beside the executable (app/game_code.cpp). The executable
 // exports the runtime and its overrides, which the DLL imports; a function with no override links to its body.
+#if defined(_WIN32)
 #ifdef X86_GAME_CODE
 #define X86_HOST_API __declspec(dllimport)
 #define X86_HOST_EXPORT
@@ -34,9 +35,32 @@ extern "C" __attribute__((used)) inline int _fltused = 0;
 #define X86_HOST_API __declspec(dllexport)
 #define X86_HOST_EXPORT __declspec(dllexport)
 #endif
-
 #define X86_FUNC(name) extern "C" X86_HOST_EXPORT void name(X86Context& __restrict ctx, uint8_t* base)
 #define X86_EXTERN_FUNC(name) extern "C" void name(X86Context& __restrict ctx, uint8_t* base)
+#else
+// ELF: the game code is <exe>.so, opened with dlopen. Each sub_X is a weak alias of its body, so an override the
+// executable exports (default visibility, -rdynamic) takes its place when the dynamic linker binds the .so.
+#define X86_HOST_API __attribute__((visibility("default")))
+#define X86_HOST_EXPORT __attribute__((visibility("default")))
+#define X86_FUNC(name) extern "C" X86_HOST_EXPORT void name(X86Context& __restrict ctx, uint8_t* base)
+#ifdef X86_GAME_CODE
+#define X86_WEAK_FUNC(name, impl) \
+    extern "C" X86_HOST_EXPORT void name(X86Context& __restrict ctx, uint8_t* base) __attribute__((weak, alias(#impl)));
+#define X86_EXTERN_FUNC(name) extern "C" void name(X86Context& __restrict ctx, uint8_t* base)
+#else
+// the executable has no link time tie to the .so, which the first start may only now build: what it calls in it
+// (the __imp__ bodies its overrides fall back to) is looked up by name on first use
+extern "C" X86_HOST_API void* x86_import(const char* name);
+#define X86_IMPORT_NAME_(x) #x
+#define X86_IMPORT_NAME(x) X86_IMPORT_NAME_(x)  // a name made by a macro (GUEST_ORIG) expanded first
+#define X86_EXTERN_FUNC(name)                                                                                 \
+    [[maybe_unused]] static inline void name(X86Context& __restrict ctx, uint8_t* base) {                     \
+        static auto* const fn = reinterpret_cast<void (*)(X86Context&, uint8_t*)>(x86_import(X86_IMPORT_NAME(name))); \
+        fn(ctx, base);                                                                                        \
+    }                                                                                                         \
+    static_assert(true)
+#endif
+#endif
 
 #define X86_PUSH32(v)            \
     do {                         \

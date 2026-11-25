@@ -11,7 +11,7 @@
 /generated/
 
 # user's own game files
-/assets/
+/assets
 
 # runtime files
 scda.toml

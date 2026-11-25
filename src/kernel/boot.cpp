@@ -14,7 +14,18 @@
 #endif
 #include <windows.h>
 #else
+#include <fcntl.h>
+#include <poll.h>
+#include <spawn.h>
+#include <sys/wait.h>
 #include <unistd.h>
+
+#include <chrono>
+#include <string>
+#include <string_view>
+#include <vector>
+
+extern char** environ;
 #endif
 #include "xbe/xbe.h"
 #include "xdk/hle.h"
@@ -209,7 +220,56 @@ void Relaunch(const char* exe) {
     ssize_t n = readlink("/proc/self/exe", self, sizeof(self) - 1);
     std::string path = std::string(self, n > 0 ? size_t(n) : 0);
     path = path.substr(0, path.find_last_of('/') + 1) + exe;
-    execl(path.c_str(), path.c_str(), nullptr);
+    // the arguments (--instance) carry over, as on Windows
+    std::vector<std::string> args{path};
+    {
+        std::ifstream f("/proc/self/cmdline", std::ios::binary);
+        std::string all((std::istreambuf_iterator<char>(f)), {});
+        size_t at = all.find('\0');  // past argv[0]
+        while (at != std::string::npos && at + 1 < all.size()) {
+            size_t end = all.find('\0', at + 1);
+            std::string a = all.substr(at + 1, end == std::string::npos ? std::string::npos : end - at - 1);
+            if (a.rfind("--coop-host=", 0) != 0) args.push_back(a);
+            at = end;
+        }
+    }
+    bool relaunched = false;
+    for (const std::string& a : args) relaunched |= a == "--relaunched";
+    if (!relaunched) args.push_back("--relaunched");  // no boot splash again
+    if (uint32_t rate, floor; xnet::CoopHostValues(rate, floor))
+        args.push_back("--coop-host=" + std::to_string(rate) + "," + std::to_string(floor));
+    xnet::CloseSockets();
+    // this window stays up until the new instance shows its first frames: it writes a byte to the pipe whose end it
+    // finds in SCDA_HANDOVER_FD (app/handover)
+    int ready[2] = {-1, -1};
+    bool piped = pipe(ready) == 0;
+    if (piped) fcntl(ready[0], F_SETFD, FD_CLOEXEC);
+    std::vector<std::string> env_strings;
+    for (char** e = environ; *e; e++)
+        if (std::string_view(*e).rfind("SCDA_HANDOVER_FD=", 0) != 0) env_strings.push_back(*e);
+    if (piped) env_strings.push_back("SCDA_HANDOVER_FD=" + std::to_string(ready[1]));
+    std::vector<char*> argv, envp;
+    for (std::string& a : args) argv.push_back(a.data());
+    argv.push_back(nullptr);
+    for (std::string& e : env_strings) envp.push_back(e.data());
+    envp.push_back(nullptr);
+    pid_t child = 0;
+    if (posix_spawn(&child, path.c_str(), nullptr, nullptr, argv.data(), envp.data()) == 0) {
+        g_relaunching = true;
+        if (piped) {
+            close(ready[1]);
+            auto until = std::chrono::steady_clock::now() + std::chrono::seconds(15);
+            while (std::chrono::steady_clock::now() < until) {
+                pollfd p{ready[0], POLLIN, 0};
+                if (poll(&p, 1, 100) != 0) break;  // a byte, or the child gone (end of file)
+                int status = 0;
+                if (waitpid(child, &status, WNOHANG) == child) break;
+            }
+        }
+    } else {
+        LOGE("relaunch: cannot start %s", path.c_str());
+    }
+    logx::Flush();
     std::_Exit(0);
 #endif
 }

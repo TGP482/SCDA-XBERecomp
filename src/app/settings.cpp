@@ -1,4 +1,5 @@
 // scda.toml beside the exe
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -6,6 +7,7 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -47,6 +49,7 @@ Port ParsePort(const std::string& name, Port fallback) {
 
 std::filesystem::path File() { return ExeDir() / "scda.toml"; }
 
+#ifdef _WIN32
 // the Windows display language when the game has it, else English
 std::string SystemLanguage() {
     switch (PRIMARYLANGID(GetUserDefaultUILanguage())) {
@@ -57,6 +60,20 @@ std::string SystemLanguage() {
         default: return "int";
     }
 }
+#else
+// the locale's language (LC_ALL, LC_MESSAGES, LANG) when the game has it, else English
+std::string SystemLanguage() {
+    const char* lang = nullptr;
+    for (const char* var : {"LC_ALL", "LC_MESSAGES", "LANG"})
+        if ((lang = std::getenv(var)) && *lang) break;
+    std::string code = lang ? std::string(lang).substr(0, 2) : "";
+    if (code == "fr") return "fra";
+    if (code == "de") return "deu";
+    if (code == "it") return "ita";
+    if (code == "es") return "esp";
+    return "int";
+}
+#endif
 
 void LoadGyro(const toml::table& t, gyro::Settings& g) {
     g.enabled = t["gyro_aiming"].value_or(g.enabled);
@@ -266,6 +283,7 @@ const std::string& BootLanguage() {
     return language;
 }
 
+#ifdef _WIN32
 Mode Desktop() {
     HMONITOR mon = MonitorFromWindow(static_cast<HWND>(Window()), MONITOR_DEFAULTTOPRIMARY);
     MONITORINFOEXW mi{};
@@ -312,6 +330,8 @@ void* MonitorHandle(const std::string& device) {
     if (!device.empty()) EnumDisplayMonitors(nullptr, nullptr, match, LPARAM(&find));
     return find.found ? find.found : MonitorFromPoint(POINT{0, 0}, MONITOR_DEFAULTTOPRIMARY);
 }
+
+#endif  // Linux: src/linux/display.cpp
 
 Mode Output() {
     const Settings& s = Get();

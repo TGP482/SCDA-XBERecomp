@@ -1,5 +1,6 @@
 #include "gpu/texturedumper.h"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -9,6 +10,12 @@
 #include <windows.h>
 #include <wincodec.h>
 #include <wrl/client.h>
+#else
+#include <png.h>
+#include <strings.h>
+#include <sys/inotify.h>
+#include <unistd.h>
+#endif
 
 #include <algorithm>
 #include <chrono>
@@ -32,7 +39,9 @@
 #include "core/log.h"
 #include "gpu/shaders.h"
 
+#ifdef _WIN32
 using Microsoft::WRL::ComPtr;
+#endif
 
 namespace gpu::texturedumper {
 
@@ -46,8 +55,10 @@ constexpr uint32_t kDumpDds = 1;      // texture_dump_format
 constexpr size_t kPaletteBytes = 256 * 4;
 constexpr auto kSettle = std::chrono::milliseconds(500);  // files still being copied in
 constexpr uint32_t kWatchRetry = 120;  // presents between tries while the pack folder is missing
+#ifdef _WIN32
 constexpr DWORD kPackChanges = FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_DIR_NAME |
                                FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_SIZE;
+#endif
 
 using Clock = std::chrono::steady_clock;
 
@@ -65,7 +76,11 @@ struct Pack {
     fs::path pack_dir;
     fs::path dump_dir;
     std::unordered_map<uint64_t, fs::path> files;  // by the key in their names; written by Update alone
+#ifdef _WIN32
     HANDLE watch = INVALID_HANDLE_VALUE;           // changes under pack_dir
+#else
+    int watch = -1;                                // inotify, every folder under pack_dir
+#endif
     uint32_t watch_tries = 0;
     std::optional<Clock::time_point> changed;      // the last change seen, not listed yet
     std::once_flag worker;
@@ -83,7 +98,9 @@ Pack g;
 // Worker
 
 void Work() {
+#ifdef _WIN32
     CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+#endif
     for (;;) {
         std::function<void()> job;
         {
@@ -168,6 +185,16 @@ std::string DumpName(uint64_t key, const TextureDesc& d, const char* extension) 
     return name;
 }
 
+// any case
+bool HasExtension(const fs::path& p, const char* ext) {
+#ifdef _WIN32
+    std::wstring wide(ext, ext + std::strlen(ext));
+    return _wcsicmp(p.extension().c_str(), wide.c_str()) == 0;
+#else
+    return strcasecmp(p.extension().c_str(), ext) == 0;
+#endif
+}
+
 std::string Utf8(const fs::path& p) {
     std::u8string s = p.u8string();
     return std::string(s.begin(), s.end());
@@ -179,7 +206,7 @@ void ListPack(const fs::path& dir) {
     fs::recursive_directory_iterator it(dir, ec);
     for (; !ec && it != fs::recursive_directory_iterator(); it.increment(ec)) {
         const fs::path& p = it->path();
-        bool image = _wcsicmp(p.extension().c_str(), L".dds") == 0 || _wcsicmp(p.extension().c_str(), L".png") == 0;
+        bool image = HasExtension(p, ".dds") || HasExtension(p, ".png");
         uint64_t key = image ? KeyInName(p.stem().wstring()) : 0;
         if (key) g.files.emplace(key, p);
     }
@@ -335,6 +362,7 @@ void WriteDds(const fs::path& path, const Image& img) {
     if (!out) LOGE("texture dump: %s not written", Utf8(path).c_str());
 }
 
+#ifdef _WIN32
 // PNG and other WIC files
 
 IWICImagingFactory* Wic() {
@@ -420,6 +448,118 @@ bool ReadPng(const fs::path& path, Image& img) {
     return true;
 }
 
+#else
+// PNG through libpng; BC images (dumped as PNG) are decoded here first
+
+// one BC1 colour block's four colours as BGRA
+void Bc1Palette(const uint8_t* b, uint8_t pal[4][4], bool bc1) {
+    uint16_t c0 = uint16_t(b[0] | b[1] << 8), c1 = uint16_t(b[2] | b[3] << 8);
+    auto expand = [](uint16_t c, uint8_t* o) {
+        o[2] = uint8_t(((c >> 11) & 31) * 255 / 31);
+        o[1] = uint8_t(((c >> 5) & 63) * 255 / 63);
+        o[0] = uint8_t((c & 31) * 255 / 31);
+        o[3] = 255;
+    };
+    expand(c0, pal[0]);
+    expand(c1, pal[1]);
+    for (int ch = 0; ch < 3; ch++) {
+        if (c0 > c1 || !bc1) {
+            pal[2][ch] = uint8_t((2 * pal[0][ch] + pal[1][ch] + 1) / 3);
+            pal[3][ch] = uint8_t((pal[0][ch] + 2 * pal[1][ch] + 1) / 3);
+        } else {
+            pal[2][ch] = uint8_t((pal[0][ch] + pal[1][ch]) / 2);
+            pal[3][ch] = 0;
+        }
+    }
+    pal[2][3] = 255;
+    pal[3][3] = c0 > c1 || !bc1 ? 255 : 0;
+}
+
+// level 0 as BGRA rows, w * 4 apart
+std::vector<uint8_t> LevelZeroBgra(const Image& img) {
+    const Level& top = img.levels[0];
+    std::vector<uint8_t> out(size_t(img.width) * img.height * 4);
+    if (Uncompressed(img.format)) {
+        bool rgba = img.format == DXGI_FORMAT_R8G8B8A8_UNORM;
+        for (uint32_t y = 0; y < img.height; y++) {
+            const uint8_t* src = &top.px[size_t(y) * top.pitch];
+            uint8_t* dst = &out[size_t(y) * img.width * 4];
+            for (uint32_t x = 0; x < img.width; x++) {
+                dst[x * 4 + 0] = src[x * 4 + (rgba ? 2 : 0)];
+                dst[x * 4 + 1] = src[x * 4 + 1];
+                dst[x * 4 + 2] = src[x * 4 + (rgba ? 0 : 2)];
+                dst[x * 4 + 3] = src[x * 4 + 3];
+            }
+        }
+        return out;
+    }
+    uint32_t block_bytes = img.format == DXGI_FORMAT_BC1_UNORM ? 8 : 16;
+    uint32_t bw = (img.width + 3) / 4, bh = (img.height + 3) / 4;
+    for (uint32_t by = 0; by < bh; by++)
+        for (uint32_t bx = 0; bx < bw; bx++) {
+            const uint8_t* b = &top.px[size_t(by) * top.pitch + size_t(bx) * block_bytes];
+            const uint8_t* colour = block_bytes == 16 ? b + 8 : b;
+            uint8_t pal[4][4];
+            Bc1Palette(colour, pal, block_bytes == 8);
+            uint8_t alpha[16];
+            if (img.format == DXGI_FORMAT_BC2_UNORM) {
+                for (int i = 0; i < 16; i++) alpha[i] = uint8_t(((b[i / 2] >> ((i & 1) * 4)) & 15) * 17);
+            } else if (img.format == DXGI_FORMAT_BC3_UNORM) {
+                uint8_t a[8] = {b[0], b[1]};
+                for (int i = 2; i < 8; i++) {
+                    a[i] = b[0] > b[1] ? uint8_t(((8 - i) * b[0] + (i - 1) * b[1]) / 7)
+                         : i < 6       ? uint8_t(((6 - i) * b[0] + (i - 1) * b[1]) / 5)
+                         : i == 6      ? 0 : 255;
+                }
+                uint64_t bits = 0;
+                for (int i = 0; i < 6; i++) bits |= uint64_t(b[2 + i]) << (8 * i);
+                for (int i = 0; i < 16; i++) alpha[i] = a[(bits >> (3 * i)) & 7];
+            }
+            uint32_t idx = uint32_t(colour[4] | colour[5] << 8 | colour[6] << 16 | uint32_t(colour[7]) << 24);
+            for (int i = 0; i < 16; i++) {
+                uint32_t x = bx * 4 + uint32_t(i & 3), y = by * 4 + uint32_t(i >> 2);
+                if (x >= img.width || y >= img.height) continue;
+                uint8_t* dst = &out[(size_t(y) * img.width + x) * 4];
+                std::memcpy(dst, pal[(idx >> (2 * i)) & 3], 4);
+                if (block_bytes == 16) dst[3] = alpha[i];
+            }
+        }
+    return out;
+}
+
+void WritePng(const fs::path& path, const Image& img) {
+    std::error_code ec;
+    if (fs::exists(path, ec)) return;
+    std::vector<uint8_t> bgra = LevelZeroBgra(img);
+    png_image pi{};
+    pi.version = PNG_IMAGE_VERSION;
+    pi.width = img.width;
+    pi.height = img.height;
+    pi.format = PNG_FORMAT_BGRA;
+    if (!png_image_write_to_file(&pi, path.c_str(), 0, bgra.data(), int(img.width * 4), nullptr))
+        LOGE("texture dump: %s not written (%s)", Utf8(path).c_str(), pi.message);
+}
+
+bool ReadPng(const fs::path& path, Image& img) {
+    png_image pi{};
+    pi.version = PNG_IMAGE_VERSION;
+    if (!png_image_begin_read_from_file(&pi, path.c_str())) return false;
+    pi.format = PNG_FORMAT_BGRA;
+    uint32_t w = pi.width, h = pi.height;
+    if (!w || !h || w > kMaxSide || h > kMaxSide) {
+        png_image_free(&pi);
+        return false;
+    }
+    Level top{std::vector<uint8_t>(size_t(w) * h * 4), w * 4};
+    if (!png_image_finish_read(&pi, nullptr, top.px.data(), int(top.pitch), nullptr)) return false;
+    img.format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    img.width = w;
+    img.height = h;
+    img.levels.push_back(std::move(top));
+    return true;
+}
+#endif
+
 // Mipmaps
 
 // one 2x2 box of src, its far row and column clamped to the level's edge
@@ -457,7 +597,7 @@ void AddMipmaps(Image& img) {
 
 void Load(uint64_t key, const fs::path& path, uint32_t revision) {
     Image img;
-    bool dds = _wcsicmp(path.extension().c_str(), L".dds") == 0;
+    bool dds = HasExtension(path, ".dds");
     bool ok = dds ? ReadDds(path, img) : ReadPng(path, img);
     // a BC texture's top level is whole blocks
     if (ok && !Uncompressed(img.format) && ((img.width | img.height) & 3)) ok = false;
@@ -509,6 +649,7 @@ bool LatchSettings() {
     return true;
 }
 
+#ifdef _WIN32
 // the pack folder's change handle, tried again now and then while the folder is missing; once made the pack is
 // listed at once
 void EnsureWatch() {
@@ -524,6 +665,51 @@ void NoteFolderChange(Clock::time_point now) {
     FindCloseChangeNotification(g.watch);  // the folder went away
     g.watch = INVALID_HANDLE_VALUE;
 }
+
+#else
+// every folder under the pack folder watched with inotify, tried again now and then while the folder is missing;
+// once made the pack is listed at once
+void WatchTree(const fs::path& dir) {
+    constexpr uint32_t kMask = IN_CREATE | IN_DELETE | IN_MOVED_FROM | IN_MOVED_TO | IN_CLOSE_WRITE | IN_DELETE_SELF;
+    inotify_add_watch(g.watch, dir.c_str(), kMask);
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(dir, ec); !ec && it != fs::recursive_directory_iterator(); it.increment(ec))
+        if (it->is_directory(ec)) inotify_add_watch(g.watch, it->path().c_str(), kMask);
+}
+
+void EnsureWatch() {
+    if (g.watch >= 0 || g.watch_tries++ % kWatchRetry) return;
+    std::error_code ec;
+    if (!fs::is_directory(g.pack_dir, ec)) return;
+    g.watch = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
+    if (g.watch < 0) return;
+    WatchTree(g.pack_dir);
+    g.changed = Clock::time_point{};
+}
+
+void NoteFolderChange(Clock::time_point now) {
+    if (g.watch < 0) return;
+    alignas(inotify_event) char buf[4096];
+    bool any = false, gone = false, folders = false;
+    for (ssize_t n; (n = read(g.watch, buf, sizeof(buf))) > 0;) {
+        for (char* p = buf; p < buf + n;) {
+            auto* e = reinterpret_cast<inotify_event*>(p);
+            any = true;
+            gone |= (e->mask & (IN_DELETE_SELF | IN_IGNORED)) && !fs::is_directory(g.pack_dir);
+            folders |= (e->mask & IN_ISDIR) != 0;
+            p += sizeof(inotify_event) + e->len;
+        }
+    }
+    if (!any) return;
+    g.changed = now;
+    if (gone) {
+        close(g.watch);  // the folder went away
+        g.watch = -1;
+    } else if (folders) {
+        WatchTree(g.pack_dir);  // a new folder: watched too (watching one twice is harmless)
+    }
+}
+#endif
 
 // lists the pack once its folder is watched, then again once its files changed and settled; true when listed
 bool UpdatePackFiles() {
