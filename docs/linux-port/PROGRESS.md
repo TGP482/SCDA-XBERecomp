@@ -49,7 +49,7 @@ Legend: `[ ]` not started, `[~]` in progress, `[x]` done (built on Linux), `[t]`
 ### Testing
 - [t] boots to the title screen (Bink video background, prompt): frames dumped and checked
 - [~] in-game rendering: attract demo (Iceland) draws characters, terrain, HUD, night vision; brightness of snow levels not yet compared with the D3D12 build
-- [~] audio: plays on PipeWire; crackling reported, output reworked to a queued pump thread (retest)
+- [~] audio: crackling on SDL's PipeWire driver; now PulseAudio first (SDL_AUDIODRIVER overrides) + queued pump thread (retest)
 - [ ] keyboard/mouse/controller
 - [t] mission relaunch (handover): menus to a new game, relaunched into x01_iceland_a with the handover
 - [ ] MSAA, SMAA, HDR10 output, AO, soft shadows, HDR rendering

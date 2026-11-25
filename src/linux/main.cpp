@@ -506,6 +506,9 @@ int main(int argc, char** argv) {
     // SDL picks Wayland or X11 itself; the joystick and video subsystems run their events on this thread
     SDL_SetHint(SDL_HINT_APP_NAME, "Splinter Cell: Double Agent");
     SDL_SetHint(SDL_HINT_MOUSE_RELATIVE_MODE_CENTER, "1");
+    // audio through PulseAudio (pipewire-pulse on PipeWire systems) first: SDL's native PipeWire output crackled here;
+    // SDL_AUDIODRIVER in the environment still picks another
+    SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "pulseaudio,pipewire,alsa");
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD | SDL_INIT_EVENTS)) {
         std::fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         LOGE("SDL: %s", SDL_GetError());
