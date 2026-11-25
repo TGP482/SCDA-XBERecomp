@@ -41,9 +41,33 @@ read side by side.
 
 ## Audio
 `src/linux/audio_sdl.cpp` implements `audio/output.h` with an SDL3 audio stream. The mixer renders 5.1. SDL
-gets 6 channels when the device has them, else the same stereo fold the XAudio2 path uses.
+gets 6 channels when the device has them, else the same stereo fold the XAudio2 path uses. A thread of its own
+feeds the stream, as XAudio2's pump does: 30 ms queued, 10 ms more each time the device runs dry, up to 100 ms
+(running the mixer inside SDL's callback with a small buffer crackled). SDL tries PulseAudio first (pipewire-pulse on
+PipeWire systems), then PipeWire and ALSA; `SDL_AUDIODRIVER` overrides.
 
 ## Window and input
 SDL3 owns the window and event loop on the main thread, which plays the part of the Win32 window thread. Mouse look
 uses SDL relative mouse mode in place of raw input + ClipCursor. Keys keep their Windows virtual-key codes inside
 `input.cpp` (bindings are saved by name), mapped from SDL scancodes.
+
+## AppImage
+- An AppImage's files are read only and its mount goes away when its process ends. So the game writes to a data
+  folder (`app::ExeDir()`: `$XDG_DATA_HOME/scda-xberecomp`, or `SCDA_DATA_DIR`), reads its compiler from beside the
+  executables (`app::InstallDir()`), and relaunches through `$APPIMAGE --exe NAME` rather than a path in its mount.
+  Built from source, both are the build folder, as on Windows.
+- The launcher (`src/launcher`) links the player's disc image as `assets/game.iso` in the data folder (or `assets`
+  itself to a game folder), which the game's own `FindGame` then finds. The ISO is never copied.
+- The first start compiles with the clang the AppImage carries and links the `.so` with lld alone: no C runtime
+  start files and no libraries, which would need a system's development packages. The `.so`'s calls into libc,
+  libm and libstdc++ are bound when the executable, which has them, opens it. The carried compiler's libraries are
+  on `LD_LIBRARY_PATH` for its processes only.
+- The game executables find the libraries the AppImage carries (glslang, SPIRV-Tools, libpng) through an `RPATH`
+  of `$ORIGIN/../lib`. The Vulkan loader, glibc and libstdc++ are the system's.
+- Built on a rolling distribution the AppImage needs that glibc or newer. To share it, build it in an older
+  distribution's container (Ubuntu 22.04 with podman).
+- `appimagetool` is not fetched by the script: install it, or point `APPIMAGETOOL` at it.
+
+## Shader compiler risk
+glslang's HLSL front end is deprecated upstream (its issue 4210). It works for everything the renderer makes today
+(`tools/linux/shader_test.cpp`). If a later glslang drops it, DXC (`-spirv`) takes HLSL the same way.

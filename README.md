@@ -1,6 +1,8 @@
 # Splinter Cell: Double Agent - XBE Recomp
 An unofficial native PC port of the original Xbox version of Splinter Cell: Double Agent via static recompilation, built into a 64 bit Windows executable. The game's x86 code is translated to C++ ahead of time, the Xbox kernel, Direct3D and DirectSound calls are implemented on Windows, and everything is drawn with Direct3D 12 and played through XAudio2. Made with the [Xbox XBE Recomp](https://github.com/TGP482/XboxXBE-Recomp) tool, created for this game originally.
 
+A native Linux build is also available: the same recompiled game, drawn with Vulkan and run through SDL3, packaged as an AppImage with a launcher that takes your disc image. See [Linux](#linux).
+
 > [!NOTE]
 > This project does not include any game assets. You must provide the files from your own legally acquired copy of the game to install or build.
 
@@ -12,6 +14,16 @@ The latest version of [SCDA-XBERecomp](https://github.com/TGP482/SCDA-XBERecomp/
 - Recomp Settings can be adjusted in the in-game options menu while the game is running, or through the Settings overlay, which is opened with <kbd>F10</kbd> by default.
 
 <img width="1920" height="1080" alt="Recomp Settings" src="https://github.com/user-attachments/assets/d13e1fb6-ba97-4067-84e1-c2362d66d7c4"/>
+
+### Linux
+> [!NOTE]
+> The Linux port (the Vulkan renderer, the SDL3 host, the AppImage and its launcher) was written with AI assistance (Claude Code), building on the original project's code. See [Credits](#credits).
+
+- Run `SCDA-XBERecomp-x86_64.AppImage`. A launcher opens.
+- Click **Choose disc image...** and pick your game's `.iso` (or **Choose game folder...** for the extracted files). The launcher checks it is the release this build was made from. The ISO stays where it is.
+- Pick the display settings, then **Play** (story and co-op) or **Versus**.
+- The first start compiles the game's code for your PC with the compiler the AppImage carries, this only happens once.
+- Settings, saves, logs and the compiled code are kept in `~/.local/share/scda-xberecomp`.
 
 ## Features
 ### Display
@@ -186,6 +198,11 @@ As the host, you must port forward the following ports on your router so other p
 - **Storage**
   - 6 GB for the game files, the compiled game code, saves and shader cache
 
+### Linux
+- **OS** - a 64-bit Linux distribution with glibc as new as the build machine's (see [Building on Linux](#building-on-linux)), on Wayland or X11
+- **GPU** with a Vulkan 1.3 driver (Mesa RADV, NVIDIA, Intel ANV) that supports push descriptors
+- **Audio** through PulseAudio, PipeWire or ALSA
+
 ## Building
 ### 1. Clone the Repository
 Clone this repository using [Git](https://git-scm.com/).
@@ -211,3 +228,35 @@ Install [Visual Studio 2022](https://visualstudio.microsoft.com/downloads/) and 
 ### 4. Build the Project
 - Run `build.bat`. The first build recompiles the entire game and can take 30 to 90 minutes on weaker systems.
 - When it finishes, run `out\build\release\SCDA.exe`.
+
+## Building on Linux
+### 1. Install Dependencies
+On Arch Linux:
+```
+sudo pacman -S --needed clang lld cmake ninja git vulkan-headers vulkan-icd-loader glslang spirv-tools libpng
+```
+Other distributions need the same tools and the development packages SDL3 builds against (X11, Wayland, PulseAudio).
+
+### 2. Add the Game Files
+As on Windows: `default.xbe` and `sc4_adv.xbe` with the `Default`, `Media` and `adv` folders beside them, in the `assets` folder (a symbolic link to them works too).
+
+### 3. Build
+```
+cmake --preset linux-release
+cmake --build out/build/linux-release -j
+./out/build/linux-release/SCDA
+```
+The game code builds in a minute or two on a fast machine. Use `linux-debug` for full logs.
+
+### 4. AppImage
+```
+tools/linux/make_appimage.sh
+```
+It needs [appimagetool](https://github.com/AppImage/appimagetool) installed (or `APPIMAGETOOL=/path/to/appimagetool`) and writes `out/appimage/SCDA-XBERecomp-x86_64.AppImage`, with no game code or data in it. Built on a rolling distribution, the AppImage needs that glibc or newer: build it in an older distribution's container to share it.
+
+The Linux port's changes, design and progress are in [docs/linux-port](docs/linux-port).
+
+## Credits
+- **[TGP482](https://github.com/TGP482)**: created SCDA-XBERecomp and the [Xbox XBE Recomp](https://github.com/TGP482/XboxXBE-Recomp) tool it is made with.
+- **[Joshhhuaaa](https://github.com/Joshhhuaaa)**: co-author of SCDA-XBERecomp.
+- **Linux port**: written with AI assistance (Claude Code). It reuses the original project's recompiler, kernel, XDK reimplementation, game hooks and renderer design; the Vulkan renderer follows the original Direct3D 12 one function for function.
