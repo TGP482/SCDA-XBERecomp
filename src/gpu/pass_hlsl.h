@@ -404,7 +404,7 @@ float4 shadow_filter(float4 pos : SV_Position) : SV_Target {
 float4 shadow_apply(float4 pos : SV_Position) : SV_Target { return float4(0, 0, 0, scene.Load(int3(pos.xy, 0)).x); }
 )";
 
-// TAA's motion: the scene's depth reprojected into last frame's view (FillMotionConstants)
+// TAA's motion: what the draws wrote, else the scene's depth reprojected into last frame's view (FillMotionConstants)
 inline constexpr const char* kMotionHlsl = R"(
 cbuffer P : register(b1) {
     row_major float4x4 reproject;
@@ -412,12 +412,15 @@ cbuffer P : register(b1) {
     float4 zuv;
 };
 Texture2D<float> depth : register(t0);
+Texture2D<float2> drawn : register(t1);
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 t = float2((id << 1) & 2, id & 2);
     return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
 }
-// last frame's uv minus this one's; 2 where last frame's view can't see it
+// last frame's uv minus this one's, as the draws wrote it below kNoMotion; 2 where last frame's view can't see it
 float2 motion(float4 pos : SV_Position) : SV_Target {
+    float2 m = drawn.Load(int3(pos.xy, 0));
+    if (m.x < 16384) return m;
     float2 n = pos.xy * ndc.xy + ndc.zw;
     float z = (depth.Load(int3(pos.xy, 0)) - zuv.x) * zuv.y;
     float4 last = mul(float4(n, z, 1), reproject);

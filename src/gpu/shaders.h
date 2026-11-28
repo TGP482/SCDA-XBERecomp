@@ -35,6 +35,7 @@ struct PixelKey {
     uint32_t proj = 0;       // fixed function: bit per stage sampled at coordinates divided by w
     uint32_t quad = 0;       // a screen quad: QuadHlsl
     uint32_t alphatest = 0;  // alpha test on: only then may the shader discard, which turns off early depth tests
+    uint32_t motion = 0;     // writes TAA's motion at SV_Target1, see MotionHlsl
     bool operator==(const PixelKey& o) const;
 };
 
@@ -43,8 +44,10 @@ uint64_t Hash(const void* p, size_t n, uint64_t h = 1469598103934665603ull);
 PixelKey MakePixelKey(const State& s, const TexInfo tex[4]);
 
 // vertex program microcode to HLSL, regs is the bit mask of v registers the draw supplies
-// decode: VertexDecode per register, 4 bits each, for elements the input assembler hands over raw
-std::string VertexProgramHlsl(const std::vector<uint32_t>& program, uint16_t regs, uint64_t decode = 0);
+// decode: VertexDecode per register, 4 bits each, for elements the input assembler hands over raw; motion: TAA's
+// variant, which also runs the program over last frame's constants
+std::string VertexProgramHlsl(const std::vector<uint32_t>& program, uint16_t regs, uint64_t decode = 0,
+                              bool motion = false);
 // fixed function vertex state a shader is built for
 struct FixedKey {
     uint32_t light = 0;    // bit 0 lighting, 1 specular, 2 local viewer, 3 normalize, then D3DMCS 2 bits each from bit 8:

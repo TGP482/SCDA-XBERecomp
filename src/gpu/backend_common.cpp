@@ -60,6 +60,7 @@ constexpr uint32_t kCullCw = 0x900;          // D3DCULL_CW
 constexpr uint64_t kDeclarationSalt = 0x10000;    // fixed function seed, above the 16 bit register mask
 constexpr uint64_t kPretransformedSalt = 0x5A5A;  // screen space fixed function vertices, apart from untransformed
 constexpr uint64_t kQuadSalt = 0xC3C30000;        // the QuadHlsl variant, apart from the plain shader
+constexpr uint64_t kMotionSalt = 0x3C3C00000000;  // TAA's motion variant
 
 constexpr float kDepth24Max = 16777215.0f;  // 2^24 minus 1: a 24 bit depth buffer's units per 1.0
 
@@ -433,12 +434,13 @@ uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
     uint64_t vkey = Hash(&a.decode, 8, seed);
     if (!sh.prog && a.pretransformed) vkey ^= kPretransformedSalt;
     if (sh.quad) vkey ^= kQuadSalt;
+    if (sh.motion) vkey ^= kMotionSalt;
     if (!sh.prog) vkey = Hash(&sh.fk, sizeof(sh.fk), vkey);
     return vkey;
 }
 
 std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh) {
-    if (sh.prog) return VertexProgramHlsl(s.vs->program, a.regs, a.decode);
+    if (sh.prog) return VertexProgramHlsl(s.vs->program, a.regs, a.decode, sh.motion);
     return FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
 }
 
@@ -917,6 +919,65 @@ bool FillMotionConstants(const MotionView& v, float out[kMotionConstants]) {
     out[22] = 0.5f * vw / float(v.gw);
     out[23] = -0.5f * vh / float(v.gh);
     return true;
+}
+
+bool WritesMotion(const State& s) {
+    bool depth = s.rs[kRsZEnable] && SimpleState(s, kMZWriteEnable);
+    // the console's colour enables are one per byte, A R G B
+    bool colour = SimpleState(s, kMColorWriteEnable) & 0x00FFFFFF;
+    return depth && colour && !SimpleState(s, kMBlendEnable);
+}
+
+uint64_t MotionSignature(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
+    uint64_t parts[8] = {s.vs->hash, uint64_t(uintptr_t(indices)), uint64_t(prim) << 32 | start, count, s.base_vertex};
+    for (int i = 0; i < 3; i++) parts[5 + i] = uint64_t(s.streams[size_t(i)].vb) << 32 | s.streams[size_t(i)].stride;
+    return Hash(parts, sizeof(parts));
+}
+
+void MotionHistory::Begin() {
+    now_ ^= 1;
+    Frame& f = frames_[now_];
+    f.constants.clear();
+    f.taken.clear();
+    f.by_signature.clear();
+}
+
+namespace {
+
+// summed distance of two constant banks, given up once past limit; a bank's NaN counts as far
+float Gap(const float* a, const float* b, float limit) {
+    constexpr float kFar = 1e30f;
+    float sum = 0;
+    for (uint32_t i = 0; i < kVsConstantFloats && sum < limit; i++) {
+        if (std::memcmp(a + i, b + i, 4) == 0) continue;
+        float d = std::fabs(a[i] - b[i]);
+        sum += d == d ? d : kFar;
+    }
+    return sum;
+}
+
+}  // namespace
+
+const float* MotionHistory::Match(uint64_t signature, const float* constants) {
+    Frame& f = frames_[now_];
+    f.by_signature[signature].push_back(uint32_t(f.taken.size()));
+    f.taken.push_back(false);
+    f.constants.insert(f.constants.end(), constants, constants + kVsConstantFloats);
+    Frame& last = frames_[now_ ^ 1];
+    auto it = last.by_signature.find(signature);
+    if (it == last.by_signature.end()) return nullptr;
+    uint32_t best = UINT32_MAX;
+    float best_gap = INFINITY;
+    for (uint32_t i : it->second) {
+        if (last.taken[i]) continue;
+        float gap = Gap(constants, &last.constants[size_t(i) * kVsConstantFloats], best_gap);
+        if (gap >= best_gap) continue;
+        best_gap = gap;
+        best = i;
+    }
+    if (best == UINT32_MAX) return nullptr;
+    last.taken[best] = true;
+    return &last.constants[size_t(best) * kVsConstantFloats];
 }
 
 }  // namespace gpu

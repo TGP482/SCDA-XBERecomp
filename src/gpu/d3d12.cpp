@@ -62,7 +62,7 @@ constexpr uint32_t kSamplerCount = 2048;
 constexpr uint32_t kRtvCount = 1024;
 constexpr uint32_t kDsvCount = 256;
 // post pass views after the back buffers': bloom pair, exposure, ambient occlusion pair, SMAA's three, HDR10
-// output's frame and panel, the soft shadow targets, TAA's motion and history pair
+// output's frame and panel, the soft shadow targets, TAA's motion, history pair and the motion its draws wrote
 constexpr uint32_t kBloomRtv = 0;
 constexpr uint32_t kExposureRtv = 2;
 constexpr uint32_t kAoRtv = 3;
@@ -71,7 +71,8 @@ constexpr uint32_t kOutRtv = 8;
 constexpr uint32_t kSoftShadowRtv = 10;
 constexpr uint32_t kMotionRtv = 14;
 constexpr uint32_t kTaaRtv = 15;
-constexpr uint32_t kPostRtvs = 17;
+constexpr uint32_t kDrawnMotionRtv = 17;
+constexpr uint32_t kPostRtvs = 18;
 D3D12_BLEND Blend(uint32_t v, bool alpha) {
     switch (v) {
         case 0: return D3D12_BLEND_ZERO;
@@ -355,8 +356,9 @@ private:
     bool DrawSoftShadowPass(const SoftShadowFrame& f, const SoftShadowPass& pass);
     ID3D12PipelineState* EnsureSoftShadowPipeline(const SoftShadowPass& pass, bool ms);
     void CreateSoftShadowViews(uint32_t slot, const SoftShadowPass& pass, bool ms);
-    // SceneEnd, in order
+    // SceneEnd, in order; BindTargets binds the drawn motion through EnsureTaaTargets and BeginDrawnMotion
     bool EnsureTaaTargets(const Target& rt);
+    void BeginDrawnMotion();
     bool DrawMotion(Target& rt, Target& ds, const MotionView& view);
     bool ResolveTaa(Target& rt, bool reset);
     void Sharpen(Target& rt);
@@ -575,9 +577,15 @@ private:
     uint32_t soft_rt_ = 0;  // surface data of the scene FilterShadows filtered, 0 when none is pending
     SoftShadowFrame soft_frame_{};
     // TAA: the view between SceneBegin and SceneEnd, its draws to back buffer sized targets offset by jitter host
-    // pixels; motion and the history pair at the scene's size and format
+    // pixels; motion, the history pair and the motion the draws wrote at the scene's size and format
     struct Taa {
         bool open = false;
+        bool cleared = false;  // the drawn motion, this view
+        MotionHistory draws;
+        uint32_t motion_draws = 0;
+        uint32_t matched = 0;
+        ComPtr<ID3D12Resource> drawn;
+        D3D12_RESOURCE_STATES drawn_state = {};
         bool fresh = true;  // the history holds nothing yet
         float jitter[2] = {};
         uint32_t phase = 0;
@@ -593,6 +601,8 @@ private:
         uint32_t h = 0;
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
     } taa_;
+    bool motion_want_ = false;   // the draw writes motion when its target is the view's
+    bool bound_motion_ = false;  // the drawn motion is bound beside bound_rt_
     // SMAA: edges, blend weights and the blended frame, at the frame's size; its two lookups
     ComPtr<ID3D12Resource> smaa_[3];
     ComPtr<ID3D12Resource> smaa_lut_[2];
@@ -1069,12 +1079,19 @@ bool D3D12Backend::BindTargets(const State& s) {
         Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         ds->drawn = true;
     }
-    if (rt != bound_rt_ || ds != bound_ds_) {
-        D3D12_CPU_DESCRIPTOR_HANDLE rh = rt ? Cpu(rtv_heap_.Get(), rt->view, rtv_inc_) : D3D12_CPU_DESCRIPTOR_HANDLE{};
+    bool scene = rt && ds && rt->gw == guest_w_ && rt->gh == guest_h_ && rt->samples == 1;
+    bool motion = motion_want_ && scene && EnsureTaaTargets(*rt);
+    if (motion) BeginDrawnMotion();
+    if (rt != bound_rt_ || ds != bound_ds_ || motion != bound_motion_) {
+        D3D12_CPU_DESCRIPTOR_HANDLE rh[2] = {};
+        if (rt) rh[0] = Cpu(rtv_heap_.Get(), rt->view, rtv_inc_);
+        rh[1] = PostRtv(kDrawnMotionRtv);
         D3D12_CPU_DESCRIPTOR_HANDLE dh = ds ? Cpu(dsv_heap_.Get(), ds->view, dsv_inc_) : D3D12_CPU_DESCRIPTOR_HANDLE{};
-        cl_->OMSetRenderTargets(rt ? 1 : 0, rt ? &rh : nullptr, FALSE, ds ? &dh : nullptr);
+        uint32_t count = motion ? 2 : 1;
+        cl_->OMSetRenderTargets(rt ? count : 0, rt ? rh : nullptr, FALSE, ds ? &dh : nullptr);
         bound_rt_ = rt;
         bound_ds_ = ds;
+        bound_motion_ = motion;
     }
     return true;
 }
@@ -1685,6 +1702,10 @@ void LogTaa(const char* what) {
 void D3D12Backend::SceneBegin(const float world_to_screen[16]) {
     std::memcpy(taa_.world_to_screen, world_to_screen, sizeof(taa_.world_to_screen));
     TaaJitter(taa_.phase++, taa_.jitter);
+    taa_.draws.Begin();
+    taa_.cleared = false;
+    taa_.motion_draws = 0;
+    taa_.matched = 0;
     taa_.open = true;
 }
 
@@ -1701,8 +1722,8 @@ void D3D12Backend::SceneEnd(const State& s) {
     if (!EnsureTaaTargets(*rt)) return;
     if (cap_.file) {
         CapStep(s.rt);
-        fprintf(cap_.file, "%04u taa rt %08X ds %08X jitter %.3f %.3f\n", cap_.i++, s.rt.data, s.zs.data,
-                taa_.jitter[0], taa_.jitter[1]);
+        fprintf(cap_.file, "%04u taa rt %08X ds %08X jitter %.3f %.3f, %u of %u motion draws matched\n", cap_.i++,
+                s.rt.data, s.zs.data, taa_.jitter[0], taa_.jitter[1], taa_.matched, taa_.motion_draws);
     }
     // a history older than the last present shows another view
     bool reset = taa_.fresh || presents_ - taa_.last_present > 1;
@@ -1732,7 +1753,9 @@ bool D3D12Backend::EnsureTaaTargets(const Target& rt) {
     if (taa_.motion && taa_.w == rt.w && taa_.h == rt.h && taa_.fmt == rt.fmt) return true;
     taa_.w = 0;
     taa_.fresh = true;
+    taa_.cleared = false;
     bool ok = CreatePostTarget(taa_.motion, taa_.motion_state, kMotionFormat, rt.w, rt.h, kMotionRtv);
+    ok = ok && CreatePostTarget(taa_.drawn, taa_.drawn_state, kMotionFormat, rt.w, rt.h, kDrawnMotionRtv);
     for (int i = 0; i < 2 && ok; i++) {
         ok = CreatePostTarget(taa_.history[i], taa_.history_state[i], rt.fmt, rt.w, rt.h, kTaaRtv + i);
     }
@@ -1746,13 +1769,24 @@ bool D3D12Backend::EnsureTaaTargets(const Target& rt) {
     return true;
 }
 
+// the drawn motion as a target, cleared at the view's first draw that writes it
+void D3D12Backend::BeginDrawnMotion() {
+    Transition(taa_.drawn.Get(), taa_.drawn_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    if (std::exchange(taa_.cleared, true)) return;
+    const float none[4] = {kNoMotion, kNoMotion, 0, 0};
+    cl_->ClearRenderTargetView(PostRtv(kDrawnMotionRtv), none, 0, nullptr);
+}
+
+// the motion the draws wrote, the depth reprojected where none did
 bool D3D12Backend::DrawMotion(Target& rt, Target& ds, const MotionView& view) {
     float c[kMotionConstants];
     if (!FillMotionConstants(view, c)) return false;
+    BeginDrawnMotion();
     bound_rt_ = bound_ds_ = nullptr;
     Transition(ds.res.Get(), ds.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(taa_.drawn.Get(), taa_.drawn_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     Transition(taa_.motion.Get(), taa_.motion_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    PostInputs in{{ds.res.Get()}, {kDepthViewFormat}};
+    PostInputs in{{ds.res.Get(), taa_.drawn.Get()}, {kDepthViewFormat, kMotionFormat}};
     PostTarget out{PostRtv(kMotionRtv), kMotionFormat, rt.w, rt.h};
     return DrawPostPass("motion", out, in, c, {.hlsl = kMotionHlsl});
 }
@@ -2053,8 +2087,14 @@ void D3D12Backend::FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps,
     d.RasterizerState.MultisampleEnable = k.msaa != 0;
     FillDepthStencilDesc(k, d.DepthStencilState);
     d.PrimitiveTopologyType = TopologyType(k.topo);
-    d.NumRenderTargets = k.has_rt ? 1 : 0;
+    d.NumRenderTargets = k.has_rt;
     d.RTVFormats[0] = k.has_rt ? DXGI_FORMAT(k.rtfmt) : DXGI_FORMAT_UNKNOWN;
+    if (k.has_rt == 2) {
+        // TAA's drawn motion, written whole
+        d.BlendState.IndependentBlendEnable = TRUE;
+        d.BlendState.RenderTarget[1].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        d.RTVFormats[1] = kMotionFormat;
+    }
     d.DSVFormat = k.has_ds ? DXGI_FORMAT_D24_UNORM_S8_UINT : DXGI_FORMAT_UNKNOWN;
     d.SampleDesc.Count = std::max(k.msaa, 1u);
 }
@@ -2440,7 +2480,8 @@ void D3D12Backend::BuildPipelineKey(const State& s, const Assembled& a, uint64_t
         }
     }
     k.topo = uint32_t(a.topology);
-    k.has_rt = bound_rt_ != nullptr;
+    // 2 with TAA's drawn motion beside the colour
+    k.has_rt = bound_rt_ ? (bound_motion_ ? 2 : 1) : 0;
     k.has_ds = bound_ds_ != nullptr;
     k.rtfmt = bound_rt_ ? bound_rt_->fmt : 0;
     uint32_t samples = bound_rt_ ? bound_rt_->samples : bound_ds_->samples;
@@ -2452,8 +2493,15 @@ void D3D12Backend::BuildPipelineKey(const State& s, const Assembled& a, uint64_t
 
 void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
                                    GuestSize size, DrawConstants& c) {
-    Alloc vc = Upload(sizeof(s.vsc), 256);
-    std::memcpy(vc.cpu, s.vsc.data(), sizeof(s.vsc));
+    constexpr size_t kBank = sizeof(s.vsc);
+    Alloc vc = Upload(sh.motion ? 2 * kBank + 16 : kBank, 256);
+    std::memcpy(vc.cpu, s.vsc.data(), kBank);
+    if (sh.motion) {
+        // last frame's of the draw this one matched, else its own; then whether one matched
+        std::memcpy(vc.cpu + kBank, sh.last ? sh.last : s.vsc[0].data(), kBank);
+        const float matched[4] = {sh.last ? 1.0f : 0.0f, 0, 0, 0};
+        std::memcpy(vc.cpu + 2 * kBank, matched, sizeof(matched));
+    }
     Alloc dc = Upload(sizeof(DrawConstants), 256);
     FillSurfaceConstants(s, size, c);
     FillCombinerConstants(s, c);
@@ -2567,12 +2615,19 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     // a versus level's first frame draws everything once (thousands of draws, over 64 MB): past the ring every upload
     // was a buffer of its own, seconds of creating and then freeing them
     if (CurrentFrame().used > kUploadSize - kUploadReserve) Submit(true);
+    DrawShaders sh = ClassifyShaders(s, a, count);
+    motion_want_ = taa_.open && sh.prog && WritesMotion(s);
     if (!BindTargets(s)) return;
     if (!EnterHdrForScene(s, a)) return;
 
     // vertex shader
-    DrawShaders sh = ClassifyShaders(s, a, count);
     if (sh.prog) EnsureProgramHash(s);
+    sh.motion = bound_motion_;
+    if (sh.motion) {
+        sh.last = taa_.draws.Match(MotionSignature(s, prim, start, count, indices), s.vsc[0].data());
+        taa_.motion_draws++;
+        taa_.matched += sh.last != nullptr;
+    }
     sh.vkey = VertexKey(s, a, sh);
     sh.vh = EnsureVertexShader(s, a, sh);
 
@@ -2581,6 +2636,7 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     if (!BindStageTexturesAndTargets(s, stages)) return;
     PixelKey pk = MakePixelKey(s, stages.info);
     pk.quad = sh.quad;
+    pk.motion = sh.motion;
     sh.pkey = Hash(&pk, sizeof(pk));
     sh.ph = EnsurePixelShader(pk, sh.pkey);
 

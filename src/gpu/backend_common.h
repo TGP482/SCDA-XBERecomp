@@ -108,6 +108,8 @@ struct DrawShaders {
     bool prog = false;  // a vertex program, else the fixed function pipeline
     bool quad = false;
     bool fixed_transform = false;  // fixed function on untransformed vertices: the shader reads matrices and lights
+    bool motion = false;  // TAA's variants, writing motion beside the colour
+    const float* last = nullptr;  // TAA: last frame's vertex constants of the draw this one matched
     FixedKey fk;
     uint64_t vkey = 0;
     uint64_t vh = 0;
@@ -316,6 +318,28 @@ struct MotionView {
 };
 // kTaaHlsl's motion constants; false when the view can't be reprojected
 bool FillMotionConstants(const MotionView& v, float out[kMotionConstants]);
+constexpr float kNoMotion = 32768;  // the drawn motion's clear and an unmatched draw's: the depth is reprojected there
+constexpr uint32_t kVsConstantFloats = 192 * 4;
+// a draw that writes TAA's motion: depth written, colour unblended
+bool WritesMotion(const State& s);
+// a draw of the same mesh and vertex program each frame
+uint64_t MotionSignature(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices);
+// last frame's draws that wrote motion, to match this frame's to: of the same signature, the nearest constants
+class MotionHistory {
+public:
+    void Begin();
+    // records a draw's vertex constants; last frame's it matched, null when none
+    const float* Match(uint64_t signature, const float* constants);
+
+private:
+    struct Frame {
+        std::vector<float> constants;  // kVsConstantFloats a draw
+        std::vector<bool> taken;
+        std::unordered_map<uint64_t, std::vector<uint32_t>> by_signature;
+    };
+    Frame frames_[2];
+    int now_ = 0;
+};
 
 // shaders and pipeline keys
 DrawShaders ClassifyShaders(const State& s, const Assembled& a, uint32_t count);

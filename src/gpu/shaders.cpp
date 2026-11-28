@@ -235,6 +235,52 @@ const char* kVsPrologue = R"(
     float4 oT0 = float4(0, 0, 0, 1), oT1 = float4(0, 0, 0, 1), oT2 = float4(0, 0, 0, 1), oT3 = float4(0, 0, 0, 1);
 )";
 
+// Motion variants: the vertex constants carry last frame's, of the draw this one matched, after their own. The
+// program runs again over them for last frame's position, and the pixel shader writes last frame's uv minus this one's
+// beside its colour, kNoMotion when nothing matched
+const char* kMotionVertexConstants = "cbuffer VC : register(b0) { float4 c[192]; float4 cp[192]; float4 matched; };\n";
+const char* kMotionOut = R"(    float4 mcur : TEXCOORD6;
+    float4 mprev : TEXCOORD7;
+)";
+const char* kMotionPosition = R"(    o.mcur = q;
+    precise float4 mp = prev;
+    mp.w = awayzero(mp.w);
+    o.mprev = float4((mp.x * 2 / surf.x - 1) * mp.w, (1 - mp.y * 2 / surf.y) * mp.w, 0, mp.w);
+)";
+const char* kMotionPixel = R"(float2 Motion(VOut i) {
+    if (matched.x == 0) return 32768;
+    float2 now = i.mcur.xy / i.mcur.w;
+    float2 last = i.mprev.xy / i.mprev.w;
+    return i.mprev.w > 0 ? (last - now) * float2(0.5, -0.5) : 2;
+}
+)";
+
+void Replace(std::string& s, const char* at, const std::string& with) {
+    size_t p = s.find(at);
+    if (p != std::string::npos) s.replace(p, std::strlen(at), with);
+}
+
+std::string MotionHlsl(std::string s, bool vertex) {
+    Replace(s, "cbuffer VC : register(b0) { float4 c[192]; };\n", kMotionVertexConstants);
+    Replace(s, "    float fog : TEXCOORD4;\n", std::string("    float fog : TEXCOORD4;\n") + kMotionOut);
+    if (vertex) {
+        Replace(s, "    o.pos = q;\n", std::string("    o.pos = q;\n") + kMotionPosition);
+        return s;
+    }
+    const char* main = "float4 main(VOut i, bool front : SV_IsFrontFace) : SV_Target {\n";
+    std::string with = std::string(kMotionPixel) +
+                       "float4 main(VOut i, bool front : SV_IsFrontFace, out float2 motion : SV_Target1)"
+                       " : SV_Target {\n    motion = Motion(i);\n";
+    Replace(s, main, with);
+    return s;
+}
+
+// the program's body again over last frame's constants, its position kept in prev
+std::string PreviousPosition(std::string body) {
+    for (size_t p = body.find("c["); p != std::string::npos; p = body.find("c[", p + 3)) body.replace(p, 2, "cp[");
+    return "    precise float4 prev = oPos;\n    {\n" + std::string(kVsPrologue) + body + "    prev = oPos;\n    }\n";
+}
+
 // combiners
 
 struct In {
@@ -591,30 +637,31 @@ PixelKey MakePixelKey(const State& s, const TexInfo tex[4]) {
     return k;
 }
 
-std::string VertexProgramHlsl(const std::vector<uint32_t>& prog, uint16_t regs, uint64_t decode) {
+std::string VertexProgramHlsl(const std::vector<uint32_t>& prog, uint16_t regs, uint64_t decode, bool motion) {
     std::string s = kCommon;
     s += kVsHelpers;
     s += VsInputs(regs, decode);
     s += kVsPrologue;
+    std::string body;
     for (size_t n = 0; n + 4 <= prog.size(); n += 4) {
         Tok k{&prog[n]};
         uint32_t mac = k.f(1, 21, 4), ilu = k.f(1, 25, 3);
         if (mac || ilu) {
             std::string a = Src(k, 0, regs), b = Src(k, 1, regs), c = Src(k, 2, regs);
-            s += "    {\n";
-            if (mac) s += "        precise float4 mr = " + MacExpr(mac, a, b, c) + ";\n";
-            if (ilu) s += "        precise float4 ir = " + IluExpr(ilu, c) + ";\n";
+            body += "    {\n";
+            if (mac) body += "        precise float4 mr = " + MacExpr(mac, a, b, c) + ";\n";
+            if (ilu) body += "        precise float4 ir = " + IluExpr(ilu, c) + ";\n";
             uint32_t r = k.f(3, 20, 4), omask = k.f(3, 12, 4);
             if (mac == 13) {
-                s += "        a0 = (int)floor(mr.x + 0.001);\n";
+                body += "        a0 = (int)floor(mr.x + 0.001);\n";
             } else if (mac) {
                 uint32_t m = k.f(3, 24, 4);
                 if (ilu && r == 1) m = 0;
-                if (m && r <= 12) s += F("        %s.%s = mr.%s;\n", RegDest(r).c_str(), kMask[m], kMask[m]);
+                if (m && r <= 12) body += F("        %s.%s = mr.%s;\n", RegDest(r).c_str(), kMask[m], kMask[m]);
             }
             if (ilu) {
                 uint32_t m = k.f(3, 16, 4), ir = mac ? 1 : r;
-                if (m && ir <= 12) s += F("        %s.%s = ir.%s;\n", RegDest(ir).c_str(), kMask[m], kMask[m]);
+                if (m && ir <= 12) body += F("        %s.%s = ir.%s;\n", RegDest(ir).c_str(), kMask[m], kMask[m]);
             }
             bool use_ilu = k.f(3, 2, 1) == 1;
             if (omask && k.f(3, 11, 1) && ((use_ilu && ilu) || (!use_ilu && mac && mac != 13))) {
@@ -622,15 +669,17 @@ std::string VertexProgramHlsl(const std::vector<uint32_t>& prog, uint16_t regs, 
                 const char* src = use_ilu ? "ir" : "mr";
                 if (kOut[o][0]) {
                     const char* msk = o == 5 ? kFogMask[omask] : kMask[omask];
-                    s += F("        %s.%s = %s.%s;\n", kOut[o], msk, src, msk);
+                    body += F("        %s.%s = %s.%s;\n", kOut[o], msk, src, msk);
                 }
             }
-            s += "    }\n";
+            body += "    }\n";
         }
         if (k.f(3, 0, 1)) break;
     }
+    s += body;
+    if (motion) s += PreviousPosition(body);
     s += kVsEpilogue;
-    return s;
+    return motion ? MotionHlsl(std::move(s), true) : s;
 }
 
 FixedKey MakeFixedKey(const State& s) {
@@ -850,6 +899,7 @@ std::string PixelHlsl(const PixelKey& k) {
     if (k.alphatest) body += "alphatest(outc.a);\n";
     body += "outc.rgb = saturate(outc.rgb) * hdr.x;\nreturn outc;\n}\n";
     s += body;
+    if (k.motion) return MotionHlsl(std::move(s), false);
     return k.quad ? QuadHlsl(std::move(s)) : s;
 }
 
