@@ -139,6 +139,7 @@ struct Target : TargetBase {
     ComPtr<ID3D11RenderTargetView> rtv;
     ComPtr<ID3D11DepthStencilView> dsv;
     ComPtr<ID3D11ShaderResourceView> srv;
+    ComPtr<ID3D11ShaderResourceView> stencil_srv;  // a depth target's stencil, made when ambient occlusion reads it
     // single sample copy draws read: of the target being drawn to, or a multisampled one resolved
     ComPtr<ID3D11Texture2D> fb;
     ComPtr<ID3D11ShaderResourceView> fb_srv;
@@ -204,6 +205,32 @@ struct PostInputs {
     ID3D11ShaderResourceView* srv[3];
 };
 
+// a pass of kAoHlsl or kSoftShadowHlsl: its target, viewport and scissor, blend, and what it reads at t0 to t3;
+// ms: the depth it reads is multisampled
+struct ScenePass {
+    const char* hlsl;
+    const char* entry;
+    ID3D11RenderTargetView* rtv;
+    D3D11_VIEWPORT vp;
+    D3D11_RECT scissor;
+    ID3D11BlendState* blend = nullptr;
+    ID3D11ShaderResourceView* reads[4] = {};
+    bool ms = false;
+};
+
+// what the ambient occlusion passes share: kAoHlsl's constants, the scene rectangle, whether it is GTAO
+struct AoFrame {
+    float c[20];
+    D3D11_RECT rect;
+    bool gtao;
+};
+
+// what the soft shadow passes share: kSoftShadowHlsl's constants, the scene's viewport in its pixels
+struct SoftShadowFrame {
+    float c[12];
+    D3D11_RECT rect;
+};
+
 // a draw's shaders and the input layout between them, null when one failed
 struct Program {
     ComPtr<ID3D11VertexShader> vs;
@@ -251,6 +278,9 @@ public:
     void RecordLate(uint32_t data) override;
     void Flush() override;
     void SetGamma(const uint8_t* ramp) override;
+    void Occlusion(const State& s, const float p[kOcclusionParams]) override;
+    void FilterShadows(const State& s, const float p[kShadowFilterParams]) override;
+    void ApplyShadows(const State& s) override;
 
 private:
     // Init, in order, each callee right after its caller
@@ -268,13 +298,21 @@ private:
     void SetFullViewport(uint32_t w, uint32_t h);
     void SetBlitTarget(ID3D11RenderTargetView* rtv, uint32_t w, uint32_t h);
     void WriteConstants(ID3D11Buffer* b, const void* p, size_t n);
-    const Pass* EnsurePass(uint64_t key, const char* hlsl, const char* vs_entry, const char* ps_entry);
+    const Pass* EnsurePass(uint64_t key, const char* hlsl, const char* vs_entry, const char* ps_entry,
+                           const char* defines = "");
     void BindPass(const Pass& pass, const void* constants, size_t bytes);
     void DrawFullScreen(const Pass& pass, ID3D11BlendState* blend, const void* constants, size_t bytes);
     void Blit(ID3D11ShaderResourceView* src, const float uvrect[4], const BlitOptions& o = {});
     bool DrawPostPass(const char* entry, const PostOut& out, const PostInputs& in, std::span<const float> p,
                       const PostOptions& o = {});
     bool CreatePostTexture(PostTexture& t, DXGI_FORMAT f, uint32_t w, uint32_t h);
+    bool DrawScenePass(const ScenePass& p, const float* c, size_t bytes);
+    // Occlusion, in order, each callee right after its caller
+    bool EnsureAoTargets(uint32_t w, uint32_t h);
+    void DrawOcclusionPasses(Target& rt, Target& ds, const AoFrame& f);
+    // FilterShadows, in order, each callee right after its caller
+    bool EnsureSoftShadowTargets(uint32_t w, uint32_t h);
+    bool DrawSoftShadowPasses(Target& rt, Target& ds, const SoftShadowFrame& f);
 
     // Resolve, then its steps in call order
     void Resolve(Target& t);
@@ -400,6 +438,8 @@ private:
     ComPtr<ID3D11DepthStencilState> no_depth_;
     ComPtr<ID3D11BlendState> over_blend_;
     ComPtr<ID3D11BlendState> factor_blend_;  // the blend factor over what the target holds
+    ComPtr<ID3D11BlendState> multiply_blend_;  // colour times the target's, its alpha kept
+    ComPtr<ID3D11BlendState> alpha_only_;
     ComPtr<ID3D11SamplerState> blit_samplers_[4];  // linear at slot 0, point at 1 to 3
     std::unordered_map<uint64_t, Pass> passes_;
     ComPtr<ID3D11DepthStencilState> clear_depth_[4];  // by kClearZ | kClearStencil
@@ -453,6 +493,15 @@ private:
     PostTexture smaa_[3];
     ComPtr<ID3D11ShaderResourceView> smaa_lut_[2];
     DXGI_FORMAT smaa_fmt_ = DXGI_FORMAT_UNKNOWN;
+    // ambient occlusion: the raw pass and its first blur, each with view z beside it
+    PostTexture ao_[2];
+    // Chaos Theory's soft shadows: the targets, the scene size they were made for, and what ApplyShadows writes back
+    PostTexture soft_[kSoftShadowTargets];
+    uint32_t soft_w_ = 0;
+    uint32_t soft_h_ = 0;
+    uint32_t soft_scale_ = 1;  // the copy and the mask over Chaos Theory's 256x256 and 128x128
+    uint32_t soft_rt_ = 0;     // surface data of the scene FilterShadows filtered, 0 when none is pending
+    SoftShadowFrame soft_frame_{};
 
     ComPtr<ID3D11Texture2D> lut_;
     ComPtr<ID3D11ShaderResourceView> lut_srv_;
@@ -613,6 +662,14 @@ void D3D11Backend::CreatePassStates() {
     b.SrcBlend = b.SrcBlendAlpha = D3D11_BLEND_BLEND_FACTOR;
     b.DestBlend = b.DestBlendAlpha = D3D11_BLEND_INV_BLEND_FACTOR;
     dev_->CreateBlendState(&bd, &factor_blend_);
+    // the alpha the game's blends read stays
+    b.SrcBlend = b.SrcBlendAlpha = D3D11_BLEND_ZERO;
+    b.DestBlend = D3D11_BLEND_SRC_COLOR;
+    b.DestBlendAlpha = D3D11_BLEND_ONE;
+    dev_->CreateBlendState(&bd, &multiply_blend_);
+    D3D11_BLEND_DESC alpha{};
+    alpha.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALPHA;
+    dev_->CreateBlendState(&alpha, &alpha_only_);
     D3D11_BLEND_DESC none{};
     dev_->CreateBlendState(&none, &no_colour_);
     for (int i = 0; i < 4; i++) {
@@ -682,12 +739,14 @@ void D3D11Backend::WriteConstants(ID3D11Buffer* b, const void* p, size_t n) {
 }
 
 // the pass's shaders, kept under key; null when they can't be made
-const Pass* D3D11Backend::EnsurePass(uint64_t key, const char* hlsl, const char* vs_entry, const char* ps_entry) {
+const Pass* D3D11Backend::EnsurePass(uint64_t key, const char* hlsl, const char* vs_entry, const char* ps_entry,
+                                     const char* defines) {
     auto it = passes_.find(key);
     if (it != passes_.end()) return it->second.vs ? &it->second : nullptr;
     Pass& p = passes_[key];
-    ID3DBlob* vs = shaders_.Compile(hlsl, vs_entry, "vs_5_0");
-    ID3DBlob* ps = shaders_.Compile(hlsl, ps_entry, "ps_5_0");
+    std::string text = std::string(defines) + hlsl;
+    ID3DBlob* vs = shaders_.Compile(text, vs_entry, "vs_5_0");
+    ID3DBlob* ps = shaders_.Compile(text, ps_entry, "ps_5_0");
     if (!vs || !ps) return nullptr;
     dev_->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &p.vs);
     dev_->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &p.ps);
@@ -913,6 +972,170 @@ ID3D11ShaderResourceView* D3D11Backend::Smaa(ID3D11ShaderResourceView* src, DXGI
     if (!EnsureSmaaTargets(fmt, w, h)) return nullptr;
     if (!DrawSmaaPasses(src, w, h, hlsl.c_str())) return nullptr;
     return smaa_[2].srv.Get();
+}
+
+// one pass over the scene's frame; false when its shaders can't be made
+bool D3D11Backend::DrawScenePass(const ScenePass& p, const float* c, size_t bytes) {
+    uint64_t key = Hash(p.entry, std::strlen(p.entry), Hash(&p.hlsl, sizeof(p.hlsl), p.ms));
+    const Pass* pass = EnsurePass(key, p.hlsl, "vs", p.entry, p.ms ? "#define MS 1\n" : "");
+    if (!pass) return false;
+    ctx_->OMSetRenderTargets(1, &p.rtv, nullptr);
+    bound_rt_ = bound_ds_ = nullptr;
+    ctx_->RSSetViewports(1, &p.vp);
+    ctx_->RSSetScissorRects(1, &p.scissor);
+    ctx_->PSSetShaderResources(0, 4, p.reads);
+    BindPass(*pass, c, bytes);
+    ctx_->OMSetBlendState(p.blend, nullptr, 0xFFFFFFFF);
+    ctx_->Draw(3, 0);
+    return true;
+}
+
+bool D3D11Backend::EnsureAoTargets(uint32_t w, uint32_t h) {
+    if (ao_[1].res && ao_[1].w == w && ao_[1].h == h) return true;
+    return CreatePostTexture(ao_[0], kAoFormat, w, h) && CreatePostTexture(ao_[1], kAoFormat, w, h);
+}
+
+// occlusion from ds's depth, blurred across, then blurred down and multiplied into rt
+void D3D11Backend::DrawOcclusionPasses(Target& rt, Target& ds, const AoFrame& f) {
+    if (!ds.stencil_srv) {
+        D3D11_SHADER_RESOURCE_VIEW_DESC sv{};
+        sv.Format = kAoViewFormats[2];
+        sv.ViewDimension = ds.samples > 1 ? D3D11_SRV_DIMENSION_TEXTURE2DMS : D3D11_SRV_DIMENSION_TEXTURE2D;
+        sv.Texture2D.MipLevels = 1;
+        if (FAILED(dev_->CreateShaderResourceView(ds.res.Get(), &sv, &ds.stencil_srv))) return;
+    }
+    D3D11_VIEWPORT vp{0, 0, float(rt.w), float(rt.h), 0, 1};
+    float c[20];
+    std::memcpy(c, f.c, sizeof(c));
+    ScenePass occlusion{.hlsl = kAoHlsl, .entry = f.gtao ? "gtao" : "occlusion", .rtv = ao_[0].rtv.Get(), .vp = vp,
+                        .scissor = f.rect, .reads = {ds.srv.Get(), nullptr, ds.stencil_srv.Get()},
+                        .ms = ds.samples > 1};
+    if (!DrawScenePass(occlusion, c, sizeof(c))) return;
+    // kAoHlsl's opt.zw: each pass's blur step
+    c[14] = 1;
+    ScenePass blur{.hlsl = kAoHlsl, .entry = "occlusion_blur", .rtv = ao_[1].rtv.Get(), .vp = vp, .scissor = f.rect,
+                   .reads = {nullptr, ao_[0].srv.Get()}};
+    if (!DrawScenePass(blur, c, sizeof(c))) return;
+    c[14] = 0;
+    c[15] = 1;
+    ScenePass apply{.hlsl = kAoHlsl, .entry = "occlusion_apply", .rtv = rt.rtv.Get(), .vp = vp, .scissor = f.rect,
+                    .blend = multiply_blend_.Get(), .reads = {nullptr, ao_[1].srv.Get()}};
+    DrawScenePass(apply, c, sizeof(c));
+    rt.drawn = true;
+}
+
+// p: 1 / the projection's x and y scale, its x and y centre, then view z = p[4] / (ndc depth - p[5])
+void D3D11Backend::Occlusion(const State& s, const float p[kOcclusionParams]) {
+    Target* rt = FindTarget(s.rt, false);
+    Target* ds = FindTarget(s.zs, true);
+    // the frame's own scene only, views drawn to smaller targets are left
+    if (!rt || !ds || rt->gw != guest_w_ || rt->gh != guest_h_ || ds->w != rt->w || ds->h != rt->h ||
+        ds->samples != rt->samples) {
+        return;
+    }
+    const auto& v = s.viewport;
+    float zr = v.max_z - v.min_z;
+    D3D11_RECT rect = ScaledViewportRect(v, *rt);
+    if (rect.right <= rect.left || rect.bottom <= rect.top || zr <= 0) return;
+    if (!EnsureAoTargets(rt->w, rt->h)) return;
+    LOG_FIRST(1, "d3d11: ambient occlusion %s %ux%u, %u samples, projection %.4f %.4f, view z %.6f / (depth - %.8f)",
+              p[9] ? "GTAO" : "SSAO", rt->w, rt->h, ds->samples, 1 / p[0], 1 / p[1], p[4], p[5]);
+    float rect_w = float(rect.right - rect.left);
+    float rect_h = float(rect.bottom - rect.top);
+    // kAoHlsl's proj, zp, vp, opt and fog; each pass sets its blur step in opt.zw
+    AoFrame f{.c = {p[0], p[1], p[2], p[3], p[4] * zr, v.min_z + p[5] * zr, 0, 0,
+                    float(rect.left), float(rect.top), rect_w, rect_h, kAoRadius, kAoMaxSpan * rect_h, 0, 0,
+                    p[6], p[7], p[8], 0},
+              .rect = rect,
+              .gtao = p[9] != 0};
+    DrawOcclusionPasses(*rt, *ds, f);
+}
+
+bool D3D11Backend::EnsureSoftShadowTargets(uint32_t w, uint32_t h) {
+    if (soft_[kSoftFiltered].res && soft_w_ == w && soft_h_ == h) return true;
+    soft_w_ = w;
+    soft_h_ = h;
+    soft_scale_ = std::max<uint32_t>(1, uint32_t(std::lround(float(h) / guest_h_)));
+    uint32_t copy_size = kSoftSmallSize * soft_scale_;
+    uint32_t mask_size = kSoftQuarterSize * soft_scale_;
+    const uint32_t sizes[kSoftShadowTargets][2] = {
+        {copy_size, copy_size}, {mask_size, mask_size}, {mask_size, mask_size}, {w, h}};
+    for (int i = 0; i < kSoftShadowTargets; i++) {
+        if (!CreatePostTexture(soft_[i], kSoftShadowFormats[i], sizes[i][0], sizes[i][1])) return false;
+    }
+    return true;
+}
+
+// the scene's depth and alpha to the 256x256 copy, its shadow to 128x128, the penumbra mask, the filtered shadow
+bool D3D11Backend::DrawSoftShadowPasses(Target& rt, Target& ds, const SoftShadowFrame& f) {
+    ID3D11ShaderResourceView* scene = EnsureFeedbackCopy(rt);
+    if (!scene) return false;
+    ID3D11ShaderResourceView* depth = ds.srv.Get();
+    ID3D11ShaderResourceView* copy = soft_[kSoftSmall].srv.Get();
+    bool ms = ds.samples > 1;
+    ID3D11ShaderResourceView* reads[kSoftShadowTargets][4] = {
+        {depth, scene},
+        {nullptr, nullptr, copy},
+        {nullptr, nullptr, nullptr, soft_[kSoftQuarter].srv.Get()},
+        {depth, scene, copy, soft_[kSoftPenumbra].srv.Get()}};
+    const char* entries[kSoftShadowTargets] = {"shadow_small", "shadow_quarter", "shadow_penumbra", "shadow_filter"};
+    float c[12];
+    std::memcpy(c, f.c, sizeof(c));
+    for (int i = 0; i < kSoftShadowTargets; i++) {
+        const PostTexture& out = soft_[i];
+        D3D11_RECT whole{0, 0, LONG(out.w), LONG(out.h)};
+        ScenePass pass{.hlsl = kSoftShadowHlsl, .entry = entries[i], .rtv = out.rtv.Get(),
+                       .vp = {0, 0, float(out.w), float(out.h), 0, 1},
+                       .scissor = i == kSoftFiltered ? f.rect : whole, .ms = ms && reads[i][0]};
+        std::memcpy(pass.reads, reads[i], sizeof(pass.reads));
+        if (!DrawScenePass(pass, c, sizeof(c))) return false;
+    }
+    return true;
+}
+
+// p: view z = p[0] / (ndc depth - p[1])
+void D3D11Backend::FilterShadows(const State& s, const float p[kShadowFilterParams]) {
+    soft_rt_ = 0;
+    Target* rt = FindTarget(s.rt, false);
+    Target* ds = FindTarget(s.zs, true);
+    // the frame's own scene only
+    if (!rt || !ds || rt->gw != guest_w_ || rt->gh != guest_h_ || ds->w != rt->w || ds->h != rt->h ||
+        ds->samples != rt->samples) {
+        return;
+    }
+    const auto& v = s.viewport;
+    float zr = v.max_z - v.min_z;
+    D3D11_RECT rect = ScaledViewportRect(v, *rt);
+    if (rect.right <= rect.left || rect.bottom <= rect.top || zr <= 0) return;
+    if (!EnsureSoftShadowTargets(rt->w, rt->h)) return;
+    float rect_w = float(rect.right - rect.left);
+    float rect_h = float(rect.bottom - rect.top);
+    float copy_size = float(kSoftSmallSize * soft_scale_);
+    float mask_size = float(kSoftQuarterSize * soft_scale_);
+    // kSoftShadowHlsl's zp, vp and sz
+    SoftShadowFrame f{.c = {p[0] * zr, v.min_z + p[1] * zr, 0, 0, float(rect.left), float(rect.top), rect_w, rect_h,
+                            copy_size, mask_size, 0, 0},
+                      .rect = rect};
+    LOG_FIRST(1, "d3d11: soft shadows %ux%u, %u samples, view z %.6f / (depth - %.8f)", rt->w, rt->h, ds->samples,
+              p[0], p[1]);
+    if (!DrawSoftShadowPasses(*rt, *ds, f)) return;
+    soft_rt_ = s.rt.data;
+    soft_frame_ = f;
+}
+
+// the filtered shadow over the alpha of the scene FilterShadows read, inside its viewport
+void D3D11Backend::ApplyShadows(const State& s) {
+    Target* rt = FindTarget(s.rt, false);
+    bool pending = rt && soft_rt_ && s.rt.data == soft_rt_ && rt->w == soft_w_ && rt->h == soft_h_;
+    soft_rt_ = 0;
+    if (!pending) return;
+    float c[12];
+    std::memcpy(c, soft_frame_.c, sizeof(c));
+    ScenePass apply{.hlsl = kSoftShadowHlsl, .entry = "shadow_apply", .rtv = rt->rtv.Get(),
+                    .vp = {0, 0, float(rt->w), float(rt->h), 0, 1}, .scissor = soft_frame_.rect,
+                    .blend = alpha_only_.Get(), .reads = {nullptr, soft_[kSoftFiltered].srv.Get()}};
+    DrawScenePass(apply, c, sizeof(c));
+    rt->drawn = true;
 }
 
 // the surface's target at its size, null when there is none
