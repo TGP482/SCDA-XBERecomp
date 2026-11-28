@@ -16,6 +16,8 @@
 #include <cstdio>
 #include <cstring>
 #include <mutex>
+#include <span>
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -28,6 +30,8 @@
 #include "core/log.h"
 #include "gpu/backend_common.h"
 #include "gpu/pipeline_cache.h"
+#include "gpu/smaa_shader.h"
+#include "gpu/smaa_textures.h"
 #include "gpu/texturedumper.h"
 #include "kernel/kernel.h"
 #include "kernel/memory.h"
@@ -181,6 +185,25 @@ struct Pass {
     ComPtr<ID3D11PixelShader> ps;
 };
 
+// a post pass's own target: its texture, both views and its size
+struct PostTexture {
+    ComPtr<ID3D11Texture2D> res;
+    ComPtr<ID3D11RenderTargetView> rtv;
+    ComPtr<ID3D11ShaderResourceView> srv;
+    uint32_t w = 0;
+    uint32_t h = 0;
+};
+
+// where a post pass draws, and what it reads at t0 to t2
+struct PostOut {
+    ID3D11RenderTargetView* rtv;
+    uint32_t w;
+    uint32_t h;
+};
+struct PostInputs {
+    ID3D11ShaderResourceView* srv[3];
+};
+
 // a draw's shaders and the input layout between them, null when one failed
 struct Program {
     ComPtr<ID3D11VertexShader> vs;
@@ -238,6 +261,7 @@ private:
     void CreatePassStates();
     void LoadSettings();
     void LatchFeatureSettings(const app::Settings& set);
+    void DetectHdr();
     void ReleasePackTextures();
 
     // passes over whole targets
@@ -248,11 +272,27 @@ private:
     void BindPass(const Pass& pass, const void* constants, size_t bytes);
     void DrawFullScreen(const Pass& pass, ID3D11BlendState* blend, const void* constants, size_t bytes);
     void Blit(ID3D11ShaderResourceView* src, const float uvrect[4], const BlitOptions& o = {});
+    bool DrawPostPass(const char* entry, const PostOut& out, const PostInputs& in, std::span<const float> p,
+                      const PostOptions& o = {});
+    bool CreatePostTexture(PostTexture& t, DXGI_FORMAT f, uint32_t w, uint32_t h);
+
+    // Resolve, then its steps in call order
+    void Resolve(Target& t);
+    bool EnsureBloomTargets(uint32_t bw, uint32_t bh);
+    bool EnsureExposureTarget();
+    float UpdateExposureBlend(float adaptation_time);
+    void DrawBloom(const PostInputs& in, const Target& t, uint32_t bw, uint32_t bh);
+    void EnterHdr(Target& t);
+    // Smaa, then its steps in call order
+    ID3D11ShaderResourceView* Smaa(ID3D11ShaderResourceView* src, DXGI_FORMAT fmt, uint32_t w, uint32_t h);
+    bool EnsureSmaaLookups();
+    bool EnsureSmaaTargets(DXGI_FORMAT fmt, uint32_t w, uint32_t h);
+    bool DrawSmaaPasses(ID3D11ShaderResourceView* src, uint32_t w, uint32_t h, const char* hlsl);
 
     // targets
     Target* FindTarget(const Surface& s, bool depth);
     Target* EnsureTarget(const Surface& s, bool depth);
-    bool CreateTargetResource(Target& t, bool shadow);
+    bool CreateTargetResource(Target& t, bool shadow, bool blur);
     bool CreateTargetViews(Target& t);
     uint32_t Samples(uint32_t want);
     void UploadTarget(Target& t, const Surface& s);
@@ -263,6 +303,7 @@ private:
 
     // Draw, in call order, each callee right after its caller
     bool BindTargets(const State& s);
+    bool EnterHdrForScene(const State& s, const Assembled& a);
     uint64_t EnsureVertexShader(const State& s, const Assembled& a, const DrawShaders& sh);
     bool BindStageTexturesAndTargets(const State& s, DrawTextures& stages);
     ID3D11ShaderResourceView* BindTexture(const State& s, int stage, DrawTextures& stages);
@@ -312,9 +353,12 @@ private:
 
     // Present, in call order, each callee right after its caller
     void ResizeSwap();
+    bool ResizeBackBuffers(uint32_t w, uint32_t h, DXGI_FORMAT fmt, DXGI_COLOR_SPACE_TYPE space);
     void UploadGammaRamp(uint32_t brightness, uint32_t contrast);
     void DrawFrame(Target* t, bool pillarbox);
     ID3D11ShaderResourceView* PrepareShownFrame(Target* t);
+    bool EnsureOutTargets();
+    void DrawHdrFrame(ID3D11ShaderResourceView* r, bool pillarbox);
     void BlitFrame(ID3D11ShaderResourceView* r, bool pillarbox);
     void RenderUi();
     void PollLate();
@@ -355,6 +399,7 @@ private:
     ComPtr<ID3D11RasterizerState> pass_raster_;
     ComPtr<ID3D11DepthStencilState> no_depth_;
     ComPtr<ID3D11BlendState> over_blend_;
+    ComPtr<ID3D11BlendState> factor_blend_;  // the blend factor over what the target holds
     ComPtr<ID3D11SamplerState> blit_samplers_[4];  // linear at slot 0, point at 1 to 3
     std::unordered_map<uint64_t, Pass> passes_;
     ComPtr<ID3D11DepthStencilState> clear_depth_[4];  // by kClearZ | kClearStencil
@@ -387,6 +432,27 @@ private:
     uint32_t shadow_res_ = 0;  // app::Settings::shadow_resolution the targets were made for
     uint32_t msaa_ = 1;      // samples in use
     uint32_t msaa_set_ = 0;  // app::Settings::msaa they came from
+    // shader model 3.0 features, from the settings at each present
+    bool sm3_ = false;
+    bool hdr_ = false;
+    bool tone_ = false;
+    // HDR10 output: the window's display, the output asked and in use, the frame and panel targets it draws first
+    HMONITOR hdr_mon_ = nullptr;
+    bool hdr_display_ = false;
+    bool hdr_want_ = false;
+    bool hdr_out_ = false;
+    float paper_nits_ = kDefaultPaperNits;
+    float peak_nits_ = kDefaultPeakNits;
+    PostTexture out_[2];
+    // resolve: quarter size bloom pair, the exposure pixel kept across frames
+    PostTexture bloom_[2];
+    PostTexture expo_;
+    bool expo_fresh_ = true;
+    std::chrono::steady_clock::time_point expo_t_ = std::chrono::steady_clock::now();
+    // SMAA: edges, blend weights and the blended frame, at the frame's size; its two lookups
+    PostTexture smaa_[3];
+    ComPtr<ID3D11ShaderResourceView> smaa_lut_[2];
+    DXGI_FORMAT smaa_fmt_ = DXGI_FORMAT_UNKNOWN;
 
     ComPtr<ID3D11Texture2D> lut_;
     ComPtr<ID3D11ShaderResourceView> lut_srv_;
@@ -544,6 +610,9 @@ void D3D11Backend::CreatePassStates() {
     b.BlendOp = b.BlendOpAlpha = D3D11_BLEND_OP_ADD;
     b.RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
     dev_->CreateBlendState(&bd, &over_blend_);
+    b.SrcBlend = b.SrcBlendAlpha = D3D11_BLEND_BLEND_FACTOR;
+    b.DestBlend = b.DestBlendAlpha = D3D11_BLEND_INV_BLEND_FACTOR;
+    dev_->CreateBlendState(&bd, &factor_blend_);
     D3D11_BLEND_DESC none{};
     dev_->CreateBlendState(&none, &no_colour_);
     for (int i = 0; i < 4; i++) {
@@ -571,13 +640,16 @@ void D3D11Backend::LoadSettings() {
     scale_ = app::RenderScale(guest_h_);
     shadow_res_ = app::Get().shadow_resolution;
     const app::Settings& set = app::Get();
+    sm3_ = set.shader_model >= 3;
+    hdr_ = sm3_ && set.hdr_rendering;
     LatchFeatureSettings(set);
     msaa_set_ = set.msaa;
     msaa_ = Samples(msaa_set_);
 }
 
-// async shaders and the texture pack from the settings
+// tone mapping, async shaders and the texture pack from the settings; sm3_ is set before
 void D3D11Backend::LatchFeatureSettings(const app::Settings& set) {
+    tone_ = sm3_ && set.tone_mapping;
     async_ = set.async_shaders;
     if (texturedumper::Update()) ReleasePackTextures();
 }
@@ -667,6 +739,182 @@ void D3D11Backend::Blit(ID3D11ShaderResourceView* src, const float uvrect[4], co
     DrawFullScreen(*pass, o.over ? over_blend_.Get() : nullptr, c, sizeof(c));
 }
 
+// a full screen pass of o.hlsl into out, reading in at t0 to t2 and p at b1; false when its shaders can't be made
+bool D3D11Backend::DrawPostPass(const char* entry, const PostOut& out, const PostInputs& in, std::span<const float> p,
+                                const PostOptions& o) {
+    uint64_t key = Hash(entry, std::strlen(entry), Hash(o.vs_entry, std::strlen(o.vs_entry)));
+    const Pass* pass = EnsurePass(key, o.hlsl, o.vs_entry, entry);
+    if (!pass) return false;
+    ctx_->OMSetRenderTargets(1, &out.rtv, nullptr);
+    bound_rt_ = bound_ds_ = nullptr;
+    SetFullViewport(out.w, out.h);
+    ctx_->PSSetShaderResources(0, 3, in.srv);
+    BindPass(*pass, p.data(), p.size_bytes());
+    if (o.blend >= 0) {
+        float f[4] = {o.blend, o.blend, o.blend, o.blend};
+        ctx_->OMSetBlendState(factor_blend_.Get(), f, 0xFFFFFFFF);
+    }
+    ctx_->Draw(3, 0);
+    return true;
+}
+
+// a post pass target with both views; the one it replaces goes
+bool D3D11Backend::CreatePostTexture(PostTexture& t, DXGI_FORMAT f, uint32_t w, uint32_t h) {
+    t = {};
+    D3D11_TEXTURE2D_DESC td = Texture2DDesc(f, w, h);
+    td.BindFlags |= D3D11_BIND_RENDER_TARGET;
+    if (FAILED(dev_->CreateTexture2D(&td, nullptr, &t.res)) ||
+        FAILED(dev_->CreateRenderTargetView(t.res.Get(), nullptr, &t.rtv)) ||
+        FAILED(dev_->CreateShaderResourceView(t.res.Get(), nullptr, &t.srv))) {
+        t = {};
+        return false;
+    }
+    t.w = w;
+    t.h = h;
+    return true;
+}
+
+bool D3D11Backend::EnsureBloomTargets(uint32_t bw, uint32_t bh) {
+    if (bloom_[0].res && bloom_[0].w == bw && bloom_[0].h == bh) return true;
+    return CreatePostTexture(bloom_[0], kBloomFormat, bw, bh) && CreatePostTexture(bloom_[1], kBloomFormat, bw, bh);
+}
+
+bool D3D11Backend::EnsureExposureTarget() {
+    if (expo_.res) return true;
+    if (!CreatePostTexture(expo_, kExposureFormat, 1, 1)) return false;
+    expo_fresh_ = true;
+    return true;
+}
+
+// how far this frame's exposure moves towards the scene's, as a blend factor
+float D3D11Backend::UpdateExposureBlend(float adaptation_time) {
+    auto now = std::chrono::steady_clock::now();
+    float dt = std::max(std::chrono::duration<float>(now - expo_t_).count(), 0.0f);
+    expo_t_ = now;
+    float a = expo_fresh_ ? 0.0f : std::min(dt / adaptation_time, 1.0f);
+    expo_fresh_ = false;
+    return a;
+}
+
+// bright parts of in's source into bloom_[0], blurred across then down
+void D3D11Backend::DrawBloom(const PostInputs& in, const Target& t, uint32_t bw, uint32_t bh) {
+    float pb[8] = {kHeadroom, 0, 0, 0, 1.0f / t.w, 1.0f / t.h};
+    DrawPostPass("bright", {bloom_[0].rtv.Get(), bw, bh}, in, pb);
+    for (int pass = 0; pass < 2; pass++) {
+        int from = pass;
+        int to = 1 - pass;
+        PostInputs b{{bloom_[from].srv.Get(), nullptr, nullptr}};
+        float pp[8] = {0, 0, 0, 0, pass ? 0 : 1.0f / bw, pass ? 1.0f / bh : 0};
+        DrawPostPass("blur", {bloom_[to].rtv.Get(), bw, bh}, b, pp);
+    }
+}
+
+// the frame is read: exposure, bloom and tone mapping take the target back to 0..1
+void D3D11Backend::Resolve(Target& t) {
+    t.hdr = false;
+    ID3D11ShaderResourceView* fb = EnsureFeedbackCopy(t);
+    if (!fb) return;
+    uint32_t bw = std::max(1u, t.w / kBloomShrink);
+    uint32_t bh = std::max(1u, t.h / kBloomShrink);
+    if (!EnsureBloomTargets(bw, bh)) return;
+    if (!EnsureExposureTarget()) return;
+    const ToneMapPreset& tm = CurrentToneMap(tone_);
+    // also keeps NaN in new memory out of the blend
+    if (expo_fresh_) {
+        float initial[4] = {tm.initial_scale, tm.initial_scale, tm.initial_scale, tm.initial_scale};
+        ctx_->ClearRenderTargetView(expo_.rtv.Get(), initial);
+    }
+    float a = UpdateExposureBlend(tm.adaptation_time);
+    PostInputs in{{fb, nullptr, nullptr}};
+    float pe[12] = {kHeadroom, tm.glow_strength, tm.glow_start / 255, tm.brightness_max,
+                    tm.brightness_min, tm.dark_end, tm.normal_start, tm.normal_end,
+                    tm.bright_start, tm.dark_scale, tm.normal_scale, tm.bright_scale};
+    DrawPostPass("exposure", {expo_.rtv.Get(), 1, 1}, in, pe, {.blend = a});
+    in.srv[2] = expo_.srv.Get();
+    DrawBloom(in, t, bw, bh);
+    in.srv[1] = bloom_[0].srv.Get();
+    float pt[8] = {kHeadroom, kBloomStrength};
+    DrawPostPass("tone", {t.rtv.Get(), t.w, t.h}, in, pt);
+}
+
+// the first 3D draw of a frame: what the target holds goes over the headroom
+void D3D11Backend::EnterHdr(Target& t) {
+    t.hdr_frame = presents_;
+    ID3D11ShaderResourceView* fb = EnsureFeedbackCopy(t);
+    if (!fb) return;
+    SetBlitTarget(t.rtv.Get(), t.w, t.h);
+    float uv[4] = {0, 0, 1, 1};
+    Blit(fb, uv, {.alpha = true, .mul = 1 / kHeadroom, .rtv = t.fmt, .samples = t.samples});
+    t.hdr = true;
+}
+
+bool D3D11Backend::EnsureSmaaLookups() {
+    // smaa_textures.h: area 160 x 560 in two channels, search 64 x 16 in one
+    constexpr SmaaLookup area{DXGI_FORMAT_R8G8_UNORM, 160, 560, 2, kSmaaArea};
+    constexpr SmaaLookup search{DXGI_FORMAT_R8_UNORM, 64, 16, 1, kSmaaSearch};
+    static_assert(sizeof(kSmaaArea) == area.w * area.h * area.bpp);
+    static_assert(sizeof(kSmaaSearch) == search.w * search.h * search.bpp);
+    if (smaa_lut_[1]) return true;
+    const SmaaLookup* lookups[2] = {&area, &search};
+    for (int i = 0; i < 2; i++) {
+        const SmaaLookup& l = *lookups[i];
+        D3D11_TEXTURE2D_DESC td = Texture2DDesc(l.fmt, l.w, l.h);
+        td.Usage = D3D11_USAGE_IMMUTABLE;
+        D3D11_SUBRESOURCE_DATA init{l.data, l.w * l.bpp, 0};
+        ComPtr<ID3D11Texture2D> tex;
+        if (FAILED(dev_->CreateTexture2D(&td, &init, &tex)) ||
+            FAILED(dev_->CreateShaderResourceView(tex.Get(), nullptr, &smaa_lut_[i]))) {
+            smaa_lut_[0].Reset();
+            smaa_lut_[1].Reset();
+            return false;
+        }
+    }
+    return true;
+}
+
+bool D3D11Backend::EnsureSmaaTargets(DXGI_FORMAT fmt, uint32_t w, uint32_t h) {
+    if (smaa_[2].res && smaa_[2].w == w && smaa_[2].h == h && smaa_fmt_ == fmt) return true;
+    const DXGI_FORMAT f[3] = {kSmaaEdgeFormat, kSmaaWeightFormat, fmt};
+    for (int i = 0; i < 3; i++) {
+        if (!CreatePostTexture(smaa_[i], f[i], w, h)) {
+            for (auto& t : smaa_) t = {};
+            return false;
+        }
+    }
+    smaa_fmt_ = fmt;
+    LOGI("d3d11: SMAA %ux%u", w, h);
+    return true;
+}
+
+// edges, blend weights, then the blend of src into smaa_[2]
+bool D3D11Backend::DrawSmaaPasses(ID3D11ShaderResourceView* src, uint32_t w, uint32_t h, const char* hlsl) {
+    // edge detection discards where there is no edge, so the edges start clear each frame
+    const float clear[4] = {};
+    float p[8] = {1.0f / w, 1.0f / h, float(w), float(h)};
+    ctx_->ClearRenderTargetView(smaa_[0].rtv.Get(), clear);
+    PostInputs edges{{src, nullptr, nullptr}};
+    if (!DrawPostPass("smaa_edges", {smaa_[0].rtv.Get(), w, h}, edges, p, {.hlsl = hlsl, .vs_entry = "vs_edges"})) {
+        return false;
+    }
+    ctx_->ClearRenderTargetView(smaa_[1].rtv.Get(), clear);
+    PostInputs weights{{smaa_[0].srv.Get(), smaa_lut_[0].Get(), smaa_lut_[1].Get()}};
+    PostOut weights_out{smaa_[1].rtv.Get(), w, h};
+    if (!DrawPostPass("smaa_weights", weights_out, weights, p, {.hlsl = hlsl, .vs_entry = "vs_weights"})) {
+        return false;
+    }
+    PostInputs blend{{src, smaa_[1].srv.Get(), nullptr}};
+    return DrawPostPass("smaa_blend", {smaa_[2].rtv.Get(), w, h}, blend, p, {.hlsl = hlsl, .vs_entry = "vs_blend"});
+}
+
+// the frame as it is shown: SMAA's blend of src, null when it can't run
+ID3D11ShaderResourceView* D3D11Backend::Smaa(ID3D11ShaderResourceView* src, DXGI_FORMAT fmt, uint32_t w, uint32_t h) {
+    static const std::string hlsl = std::string(kSmaaConfig) + kSmaaHlsl + kSmaaPasses;
+    if (!EnsureSmaaLookups()) return nullptr;
+    if (!EnsureSmaaTargets(fmt, w, h)) return nullptr;
+    if (!DrawSmaaPasses(src, w, h, hlsl.c_str())) return nullptr;
+    return smaa_[2].srv.Get();
+}
+
 // the surface's target at its size, null when there is none
 Target* D3D11Backend::FindTarget(const Surface& s, bool depth) {
     if (!s.header) return nullptr;
@@ -684,8 +932,11 @@ Target* D3D11Backend::FindTarget(const Surface& s, bool depth) {
 // the surface's target, made again at its size when that changed
 Target* D3D11Backend::EnsureTarget(const Surface& s, bool depth) {
     if (!s.header) return nullptr;
+    const ShadowTargets& sh = g_shadow;
     bool shadow = IsShadowSurface(s, depth);
     if (shadow && !depth) return nullptr;
+    // the edge blur reads the scene: it follows the screen, unless the console's shadows are asked for
+    bool blur = sh.blur_hi && !depth && shadow_res_ != kConsoleShadows && s.data >= sh.blur_lo && s.data < sh.blur_hi;
     uint32_t data = mem::VirtualFromPhysical(s.data);
     uint64_t key = TargetKey(data, depth);
     uint32_t gw;
@@ -701,7 +952,7 @@ Target* D3D11Backend::EnsureTarget(const Surface& s, bool depth) {
     t.depth = depth;
     t.gw = gw;
     t.gh = gh;
-    if (!CreateTargetResource(t, shadow) || !CreateTargetViews(t)) return nullptr;
+    if (!CreateTargetResource(t, shadow, blur) || !CreateTargetViews(t)) return nullptr;
     t.data = data;
     t.bytes = depth ? gw * gh * 4 : GuestPitch(gw) * gh;
     t.epoch = DirtyEpoch(data);
@@ -711,7 +962,7 @@ Target* D3D11Backend::EnsureTarget(const Surface& s, bool depth) {
 }
 
 // the host texture of a new target, at render scale or the shadow resolution
-bool D3D11Backend::CreateTargetResource(Target& t, bool shadow) {
+bool D3D11Backend::CreateTargetResource(Target& t, bool shadow, bool blur) {
     float sc = shadow && shadow_res_ ? float(shadow_res_) / t.gw : scale_;
     t.w = std::max(1u, uint32_t(std::lround(t.gw * sc)));
     t.h = std::max(1u, uint32_t(std::lround(t.gh * sc)));
@@ -725,7 +976,8 @@ bool D3D11Backend::CreateTargetResource(Target& t, bool shadow) {
     if (t.depth) {
         td.BindFlags |= D3D11_BIND_DEPTH_STENCIL;
     } else {
-        t.fmt = kBgra;
+        // the back buffer sized colour targets: the scene and the game's copies of it
+        t.fmt = hdr_ && !blur && screen ? kHdrFormat : kBgra;
         td.Format = t.fmt;
         td.BindFlags |= D3D11_BIND_RENDER_TARGET;
     }
@@ -797,7 +1049,8 @@ void D3D11Backend::UploadTarget(Target& t, const Surface& s) {
     if (!tex) return;
     SetBlitTarget(t.rtv.Get(), t.w, t.h);
     float uv[4] = {0, 0, 1, 1};
-    Blit(tex.Get(), uv, {.alpha = true, .rtv = t.fmt, .over = over, .samples = t.samples});
+    float mul = t.hdr ? 1 / kHeadroom : 1;
+    Blit(tex.Get(), uv, {.alpha = true, .mul = mul, .rtv = t.fmt, .over = over, .samples = t.samples});
     t.epoch = DirtyEpoch(t.data);
     t.sig = MemSig(t.data, t.bytes);
 }
@@ -840,6 +1093,19 @@ bool D3D11Backend::BindTargets(const State& s) {
         ctx_->OMSetRenderTargets(rt ? 1 : 0, rt ? &rtv : nullptr, ds ? ds->dsv.Get() : nullptr);
         bound_rt_ = rt;
         bound_ds_ = ds;
+    }
+    return true;
+}
+
+// HDR starts at a frame's first 3D draw into the HDR scene target; screen space quads never start it: a loading
+// screen's fade redraws over the last tone mapped picture every frame
+bool D3D11Backend::EnterHdrForScene(const State& s, const Assembled& a) {
+    bool scene_target = bound_rt_ && bound_ds_ && bound_rt_->fmt == kHdrFormat;
+    bool not_started = scene_target && !bound_rt_->hdr && bound_rt_->hdr_frame != presents_;
+    bool depth_written_3d = !a.pretransformed && s.rs[kRsZEnable] && SimpleState(s, kMZWriteEnable);
+    if (not_started && depth_written_3d) {
+        EnterHdr(*bound_rt_);
+        if (!BindTargets(s)) return false;
     }
     return true;
 }
@@ -900,6 +1166,7 @@ ID3D11ShaderResourceView* D3D11Backend::BindTargetTexture(const State& s, int st
         stages.wide[stage] = k;
         info.flags |= kTexWide;
     }
+    if (t.hdr) info.flags |= kTexHdr;
     // the console reads the pixels it is about to overwrite: give the draw a copy
     if (feedback) return EnsureFeedbackCopy(t);
     if (t.depth) info.shadow = ShadowDepthKind(d.format);
@@ -935,6 +1202,7 @@ ID3D11ShaderResourceView* D3D11Backend::BindGuestTexture(int stage, const Textur
     const Tex& drawn = tx.swap ? *tx.swap : tx;
     stages.levels[stage] = drawn.levels;
     if (fi.depth) info.shadow = ShadowDepthKind(d.format);
+    if (tx.norm && d.cube && hdr_) info.flags |= kTexNormCube;
     return drawn.srv.Get();
 }
 
@@ -1348,6 +1616,7 @@ void D3D11Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     Assembled& a = asm_;
     if (!Assemble(s, prim, start, count, indices, a)) return;
     if (!BindTargets(s)) return;
+    if (!EnterHdrForScene(s, a)) return;
 
     // vertex shader
     DrawShaders sh = ClassifyShaders(s, a, count);
@@ -1409,6 +1678,7 @@ void D3D11Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
     } else {
         float col[4];
         Color(c.color, col);
+        for (int i = 0; t.hdr && i < 3; i++) col[i] /= kHeadroom;
         ctx_->ClearRenderTargetView(t.rtv.Get(), col);
     }
     t.drawn = true;
@@ -1421,6 +1691,7 @@ void D3D11Backend::ClearRects(Target& t, const ClearArgs& c, const std::vector<R
     if (!pass) return;
     float k[8] = {};
     Color(c.color, k);
+    for (int i = 0; t.hdr && i < 3; i++) k[i] /= kHeadroom;
     k[4] = std::clamp(c.z, 0.0f, 1.0f);
     if (t.depth) {
         ctx_->OMSetRenderTargets(0, nullptr, t.dsv.Get());
@@ -1529,6 +1800,7 @@ void D3D11Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, 
         }
         return;
     }
+    if (src_t->hdr) Resolve(*src_t);
     Target* dst_t = EnsureTarget(dst, false);
     if (!dst_t || src_t == dst_t) return;
     Readable src_r = ReadableResource(*src_t);
@@ -1542,24 +1814,53 @@ void D3D11Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, 
     CopyByRegion(*src_t, src_r.res, *dst_t, l);
 }
 
+// the output the window's display has: a factory made before Windows HDR was switched no longer tells
+void D3D11Backend::DetectHdr() {
+    HMONITOR mon = MonitorFromWindow(static_cast<HWND>(app::Window()), MONITOR_DEFAULTTONEAREST);
+    if (mon == hdr_mon_ && factory_->IsCurrent()) return;
+    hdr_mon_ = mon;
+    ComPtr<IDXGIFactory4> fresh;
+    if (!factory_->IsCurrent() && SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&fresh)))) factory_ = fresh;
+    DXGI_OUTPUT_DESC1 desc{};
+    bool found = FindOutput(factory_.Get(), mon, desc);
+    hdr_display_ = found && desc.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020;
+    peak_nits_ = found && desc.MaxLuminance > 0 ? desc.MaxLuminance : kDefaultPeakNits;
+    paper_nits_ = SdrWhiteNits(mon);
+    app::g_hdr_display = hdr_display_;
+    LOGR("Display HDR: %s, peak %.0f nits, SDR white %.0f nits", hdr_display_ ? "on" : "off", peak_nits_,
+         paper_nits_);
+}
+
 void D3D11Backend::ResizeSwap() {
     HWND hwnd = static_cast<HWND>(app::Window());
     RECT rc;
     GetClientRect(hwnd, &rc);
     uint32_t w = std::max<LONG>(rc.right - rc.left, 1);
     uint32_t h = std::max<LONG>(rc.bottom - rc.top, 1);
-    if (w == bb_w_ && h == bb_h_) return;
+    bool hdr = hdr_display_ && app::Get().hdr_output;
+    if (w == bb_w_ && h == bb_h_ && hdr == hdr_want_) return;
     // the context lets go of the back buffer first
     ctx_->OMSetRenderTargets(0, nullptr, nullptr);
     bound_rt_ = bound_ds_ = nullptr;
     bb_rtv_.Reset();
     ctx_->Flush();
-    UINT flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
-    if (FAILED(swap_->ResizeBuffers(kSwapBuffers, w, h, kBgra, flags))) LOGE("d3d11: back buffers not resized");
-    swap_->SetColorSpace1(DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+    hdr_want_ = hdr;
+    hdr_out_ = hdr && ResizeBackBuffers(w, h, kHdr10Format, DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020);
+    if (!hdr_out_) ResizeBackBuffers(w, h, kBgra, DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709);
+    if (hdr && !hdr_out_) LOGR("Display HDR: the swap chain can't show HDR10, SDR it is");
     CreateBackBufferView();
     bb_w_ = w;
     bb_h_ = h;
+}
+
+// false when the swap chain can't present in that colour space
+bool D3D11Backend::ResizeBackBuffers(uint32_t w, uint32_t h, DXGI_FORMAT fmt, DXGI_COLOR_SPACE_TYPE space) {
+    UINT flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    if (FAILED(swap_->ResizeBuffers(kSwapBuffers, w, h, fmt, flags))) return false;
+    UINT support = 0;
+    swap_->CheckColorSpaceSupport(space, &support);
+    if (!(support & DXGI_SWAP_CHAIN_COLOR_SPACE_SUPPORT_FLAG_PRESENT)) return false;
+    return SUCCEEDED(swap_->SetColorSpace1(space));
 }
 
 void D3D11Backend::UploadGammaRamp(uint32_t brightness, uint32_t contrast) {
@@ -1570,8 +1871,14 @@ void D3D11Backend::UploadGammaRamp(uint32_t brightness, uint32_t contrast) {
     ctx_->UpdateSubresource(lut_.Get(), 0, nullptr, ramp, kRampBytes, 0);
 }
 
-// what the frame shows: the target made readable
-ID3D11ShaderResourceView* D3D11Backend::PrepareShownFrame(Target* t) { return t ? ReadableResource(*t).srv : nullptr; }
+// what the frame shows: the target made readable, SMAA's blend of it when that is on
+ID3D11ShaderResourceView* D3D11Backend::PrepareShownFrame(Target* t) {
+    ID3D11ShaderResourceView* r = t ? ReadableResource(*t).srv : nullptr;
+    if (r && app::Get().smaa) {
+        if (ID3D11ShaderResourceView* aa = Smaa(r, t->fmt, t->w, t->h)) r = aa;
+    }
+    return r;
+}
 
 void D3D11Backend::BlitFrame(ID3D11ShaderResourceView* r, bool pillarbox) {
     float aspect = app::Aspect();
@@ -1602,6 +1909,11 @@ void D3D11Backend::RenderUi() {
 
 void D3D11Backend::DrawFrame(Target* t, bool pillarbox) {
     ID3D11ShaderResourceView* r = PrepareShownFrame(t);
+    // without its targets an HDR10 back buffer stays black
+    if (hdr_out_) {
+        if (EnsureOutTargets()) DrawHdrFrame(r, pillarbox);
+        return;
+    }
     float black[4] = {0, 0, 0, 1};
     ctx_->ClearRenderTargetView(bb_rtv_.Get(), black);
     ID3D11RenderTargetView* bb = bb_rtv_.Get();
@@ -1609,6 +1921,29 @@ void D3D11Backend::DrawFrame(Target* t, bool pillarbox) {
     bound_rt_ = bound_ds_ = nullptr;
     if (t) BlitFrame(r, pillarbox);
     RenderUi();
+}
+
+bool D3D11Backend::EnsureOutTargets() {
+    if (out_[0].res && out_[1].res && out_[0].w == bb_w_ && out_[0].h == bb_h_) return true;
+    return CreatePostTexture(out_[0], kHdrFormat, bb_w_, bb_h_) && CreatePostTexture(out_[1], kBgra, bb_w_, bb_h_);
+}
+
+// the frame and the panel each into a target of their own, then both into the back buffer as HDR10; the panel
+// stays at SDR white
+void D3D11Backend::DrawHdrFrame(ID3D11ShaderResourceView* r, bool pillarbox) {
+    float clear[4] = {0, 0, 0, 0};
+    ctx_->ClearRenderTargetView(out_[0].rtv.Get(), clear);
+    ctx_->ClearRenderTargetView(out_[1].rtv.Get(), clear);
+    ID3D11RenderTargetView* frame = out_[0].rtv.Get();
+    ctx_->OMSetRenderTargets(1, &frame, nullptr);
+    bound_rt_ = bound_ds_ = nullptr;
+    if (r) BlitFrame(r, pillarbox);
+    ID3D11RenderTargetView* panel = out_[1].rtv.Get();
+    ctx_->OMSetRenderTargets(1, &panel, nullptr);
+    RenderUi();
+    PostInputs in{{out_[0].srv.Get(), out_[1].srv.Get(), nullptr}};
+    float p[8] = {paper_nits_, peak_nits_, 0, 0};
+    DrawPostPass("hdr10", {bb_rtv_.Get(), bb_w_, bb_h_}, in, p, {.hlsl = kHdrHlsl});
 }
 
 void D3D11Backend::ReleaseOldTextures() {
@@ -1638,9 +1973,11 @@ void D3D11Backend::CountFps() {
 }
 
 void D3D11Backend::Present(const Surface& front, bool pillarbox) {
+    DetectHdr();
     ResizeSwap();
     Target* t = EnsureTarget(front, false);
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
+    if (t && t->hdr) Resolve(*t);
     if (const app::Settings& s = app::Get(); (s.brightness << 8 | s.contrast) != ramp_set_)
         UploadGammaRamp(s.brightness, s.contrast);
 
@@ -1671,14 +2008,18 @@ void D3D11Backend::ApplySettings() {
     float want = app::RenderScale(guest_h_);
     const app::Settings& set = app::Get();
     uint32_t shadows = set.shadow_resolution;
+    sm3_ = set.shader_model >= 3;
     LatchFeatureSettings(set);
+    bool hdr = sm3_ && set.hdr_rendering;
     uint32_t msaa = msaa_;
     if (set.msaa != msaa_set_) {
         msaa_set_ = set.msaa;
         msaa = Samples(msaa_set_);
     }
-    if (std::fabs(want - scale_) > 1e-4f || shadows != shadow_res_ || msaa != msaa_) {
+    if (std::fabs(want - scale_) > 1e-4f || shadows != shadow_res_ || hdr != hdr_ || msaa != msaa_) {
+        hdr_ = hdr;
         msaa_ = msaa;
+        expo_fresh_ = true;
         ctx_->OMSetRenderTargets(0, nullptr, nullptr);
         targets_.clear();
         scale_ = want;
@@ -1687,8 +2028,9 @@ void D3D11Backend::ApplySettings() {
     }
 }
 
-// the target made readable, then shrunk with o when it is not guest sized BGRA; res null on failure
+// the target resolved and made readable, then shrunk with o when it is not guest sized BGRA; res null on failure
 D3D11Backend::CopySource D3D11Backend::PrepareCopySource(Target& t, const ShrinkOptions& o) {
+    if (t.hdr) Resolve(t);
     Readable r = ReadableResource(t);
     CopySource out{r.res, nullptr};
     if (!r.res) return out;
