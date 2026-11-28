@@ -13,6 +13,8 @@ namespace gpu::cache {
 
 // shadercache\ beside the exe; root: a hash of the root signature every pipeline is made with
 void Open(ID3D12Device* dev, uint64_t root);
+// the compiled shaders alone, which Open opens too: what Direct3D 11 keeps
+void OpenShaderFiles();
 
 // compiled bytecode by source hash; check, a second hash of the source, turns a key collision into a miss
 Microsoft::WRL::ComPtr<ID3DBlob> FindShader(uint64_t key, uint64_t check);

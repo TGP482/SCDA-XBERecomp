@@ -99,6 +99,7 @@ void Load() {
     s.colour_blind = std::min(t["colour_blind"].value_or(s.colour_blind), 3u);
     s.vsync = t["vsync"].value_or(s.vsync);
     s.hdr_output = t["hdr_output"].value_or(s.hdr_output);
+    s.direct3d = t["direct3d"].value_or(s.direct3d) == 11 ? 11u : 12u;
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     s.msaa = t["msaa"].value_or(s.msaa);
     s.smaa = t["smaa"].value_or(s.smaa);
@@ -186,6 +187,7 @@ toml::table Table() {
                   {"colour_blind", int64_t(s.colour_blind)},
                   {"vsync", s.vsync},
                   {"hdr_output", s.hdr_output},
+                  {"direct3d", int64_t(s.direct3d)},
                   {"anisotropic_filtering", int64_t(s.aniso)},
                   {"msaa", int64_t(s.msaa)},
                   {"smaa", s.smaa},

@@ -259,6 +259,10 @@ struct DrawnRect {
 // a drawn copy's taps round down a ratio a hair over a whole number
 constexpr float kTapsSlack = 1e-3f;
 
+// the renderers; CreateBackend makes the one the settings name
+std::unique_ptr<Backend> CreateD3D11Backend();
+std::unique_ptr<Backend> CreateD3D12Backend();
+
 // HDR10 output
 bool FindOutput(IDXGIFactory4* factory, HMONITOR mon, DXGI_OUTPUT_DESC1& desc);
 float SdrWhiteNits(HMONITOR mon);

@@ -45,6 +45,7 @@ struct Settings {
     uint32_t colour_blind = 0;       // 0 off, 1 protanopia, 2 deuteranopia, 3 tritanopia
     bool vsync = true;
     bool hdr_output = true;          // HDR10 on a display with Windows HDR on
+    uint32_t direct3d = 12;          // the renderer, 11 or 12
     uint32_t aniso = 0;              // 0 as the game asks
     uint32_t msaa = 0;               // samples a pixel of the scene, 0 off
     bool smaa = false;               // over the finished frame, HUD included; combines with msaa

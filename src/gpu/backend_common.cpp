@@ -7,6 +7,7 @@
 #include <cstring>
 #include <cwchar>
 
+#include "app/app.h"
 #include "core/log.h"
 #include "gpu/pipeline_cache.h"
 #include "kernel/kernel.h"
@@ -37,7 +38,7 @@ ComPtr<ID3DBlob> CompileHlsl(const std::string& src, const std::string& entry, c
     HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, entry.c_str(), profile.c_str(),
                             D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &err);
     if (FAILED(hr)) {
-        LOGE("d3d12: %s compile failed: %s", profile.c_str(),
+        LOGE("shaders: %s compile failed: %s", profile.c_str(),
              err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
         LOGE("%s", src.c_str());
         return nullptr;
@@ -614,6 +615,10 @@ std::array<float, 9> ColourBlindMatrix(uint32_t mode) {
         }
     }
     return m;
+}
+
+std::unique_ptr<Backend> CreateBackend() {
+    return app::Get().direct3d == 11 ? CreateD3D11Backend() : CreateD3D12Backend();
 }
 
 uint32_t CmpFunc(uint32_t v) {

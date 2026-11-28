@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cwchar>
 #include <unordered_map>
 
 #include "app/app.h"
@@ -237,10 +238,12 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
         if (!g_backend->Init(w, h)) {
             LOGE("d3d: renderer init failed");
             // no owner window, as this runs on the title's thread and the window may already be fullscreen over the box
-            MessageBoxW(nullptr,
-                        L"Direct3D 12 could not be started. Make sure your graphics card supports it and its driver "
-                        L"is up to date.",
-                        L"Splinter Cell: Double Agent", MB_ICONERROR | MB_TOPMOST);
+            wchar_t text[160];
+            std::swprintf(text, std::size(text),
+                          L"Direct3D %u could not be started. "
+                          L"Make sure your graphics card supports it and its driver is up to date.",
+                          app::Get().direct3d);
+            MessageBoxW(nullptr, text, L"Splinter Cell: Double Agent", MB_ICONERROR | MB_TOPMOST);
             Shutdown(1);
         }
         g_backend = gpu::CreateThreadedBackend(std::move(g_backend));

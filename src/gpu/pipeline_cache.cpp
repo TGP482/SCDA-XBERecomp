@@ -304,15 +304,20 @@ void Run() {
 
 }  // namespace
 
+void OpenShaderFiles() {
+    auto dir = app::ExeDir() / "shadercache";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    OpenShaders(dir / "shaders.bin");
+    OpenBase(dir / "base_shaders.bin");
+}
+
 void Open(ID3D12Device* dev, uint64_t root) {
     wchar_t exe[MAX_PATH];
     GetModuleFileNameW(nullptr, exe, MAX_PATH);
     auto dir = app::ExeDir() / "shadercache";
-    std::error_code ec;
-    std::filesystem::create_directories(dir, ec);
     L().root = root;
-    OpenShaders(dir / "shaders.bin");
-    OpenBase(dir / "base_shaders.bin");
+    OpenShaderFiles();
     // per executable: offline and versus write theirs whole
     std::wstring stem = std::filesystem::path(exe).stem().wstring();
     OpenLibrary(dev, dir / (stem + L"_pipelines.bin"));

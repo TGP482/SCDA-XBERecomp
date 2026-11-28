@@ -3222,6 +3222,6 @@ void D3D12Backend::SetGamma(const uint8_t*) {}
 
 }  // namespace
 
-std::unique_ptr<Backend> CreateBackend() { return std::make_unique<D3D12Backend>(); }
+std::unique_ptr<Backend> CreateD3D12Backend() { return std::make_unique<D3D12Backend>(); }
 
 }  // namespace gpu
