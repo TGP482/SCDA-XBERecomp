@@ -105,6 +105,7 @@ void Load() {
     s.taa = t["taa"].value_or(s.taa);
     s.fsr = t["fsr"].value_or(s.fsr);
     if (s.fsr) s.taa = false;
+    s.frame_generation = std::min(t["frame_generation"].value_or(s.frame_generation), 3u);
     if (s.taa || s.fsr) s.msaa = 0;
     s.smaa = t["smaa"].value_or(s.smaa);
     s.shadow_resolution = std::min(t["shadow_resolution"].value_or(s.shadow_resolution), 8192u);
@@ -196,6 +197,7 @@ toml::table Table() {
                   {"msaa", int64_t(s.msaa)},
                   {"taa", s.taa},
                   {"fsr", s.fsr},
+                  {"frame_generation", int64_t(s.frame_generation)},
                   {"smaa", s.smaa},
                   {"shadow_resolution", int64_t(s.shadow_resolution)},
                   {"shadow_distance", int64_t(s.shadow_distance)},

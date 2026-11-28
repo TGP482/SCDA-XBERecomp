@@ -318,6 +318,8 @@ struct MotionView {
 };
 // kTaaHlsl's motion constants; false when the view can't be reprojected
 bool FillMotionConstants(const MotionView& v, float out[kMotionConstants]);
+// the view's camera to world, rows of 4: its right, up and forward axes, then its position
+bool CameraToWorld(const SceneView& v, float out[16]);
 constexpr float kNoMotion = 32768;  // the drawn motion's clear and an unmatched draw's: the depth is reprojected there
 constexpr uint32_t kVsConstantFloats = 192 * 4;
 // a draw that writes TAA's motion: depth written, colour unblended

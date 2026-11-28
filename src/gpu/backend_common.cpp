@@ -921,6 +921,14 @@ bool FillMotionConstants(const MotionView& v, float out[kMotionConstants]) {
     return true;
 }
 
+bool CameraToWorld(const SceneView& v, float out[16]) {
+    // world to screen is world to camera times camera to screen
+    float screen_to_world[16];
+    if (!Invert(v.world_to_screen, screen_to_world)) return false;
+    Multiply(v.camera_to_screen, screen_to_world, out);
+    return true;
+}
+
 bool WritesMotion(const State& s) {
     bool depth = s.rs[kRsZEnable] && SimpleState(s, kMZWriteEnable);
     // the console's colour enables are one per byte, A R G B

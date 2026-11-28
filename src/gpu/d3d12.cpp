@@ -66,7 +66,8 @@ constexpr uint32_t kSamplerCount = 2048;
 constexpr uint32_t kRtvCount = 1024;
 constexpr uint32_t kDsvCount = 256;
 // post pass views after the back buffers': bloom pair, exposure, ambient occlusion pair, SMAA's three, HDR10
-// output's frame and panel, the soft shadow targets, TAA's motion, history pair and the motion its draws wrote
+// output's frame and panel, the soft shadow targets, TAA's motion, history pair and the motion its draws wrote,
+// frame generation's two back buffers without the HUD and a multisampled view's depth as one sample
 constexpr uint32_t kBloomRtv = 0;
 constexpr uint32_t kExposureRtv = 2;
 constexpr uint32_t kAoRtv = 3;
@@ -76,7 +77,9 @@ constexpr uint32_t kSoftShadowRtv = 10;
 constexpr uint32_t kMotionRtv = 14;
 constexpr uint32_t kTaaRtv = 15;
 constexpr uint32_t kDrawnMotionRtv = 17;
-constexpr uint32_t kPostRtvs = 18;
+constexpr uint32_t kHudlessRtv = 18;
+constexpr uint32_t kDepthOneRtv = 20;
+constexpr uint32_t kPostRtvs = 21;
 D3D12_BLEND Blend(uint32_t v, bool alpha) {
     switch (v) {
         case 0: return D3D12_BLEND_ZERO;
@@ -386,6 +389,17 @@ private:
     bool EnsureUpscaled(uint32_t w, uint32_t h);
     void UpscaleDepth(Target& ds, Target& out);
     bool Sharpen(const SharpenInputs& in, Target& out);
+    // frame generation: its swap chain made or dropped with the setting, then once a frame its inputs, the frame
+    // without the HUD and its configuration before the present
+    bool GenerationWanted() const { return kStory && app::Get().frame_generation && fsr::FrameGeneration(); }
+    void RecreateSwapChain();
+    bool EnsureDepthOne(uint32_t w, uint32_t h);
+    void PrepareGeneration(Target& rt, Target& ds, bool reset);
+    fsr::Frame FsrFrame(Target& rt, bool reset) const;
+    void ConfigureGeneration(bool enabled, uint32_t render_w, uint32_t render_h);
+    void HudBegin(const State& s) override;
+    bool EnsureHudless();
+    void DrawHudless(Target* t, ID3D12Resource* r, bool pillarbox);
     // FSR: the render scale of every target but the view's, and of the view's
     bool Fsr() const { return kStory && app::Get().fsr && fsr::Upscaling(); }
     float BaseScale() const;
@@ -451,9 +465,10 @@ private:
     void UploadGammaRamp(uint32_t brightness, uint32_t contrast);
     void DrawFrame(Target* t, bool pillarbox, uint32_t bi);
     ID3D12Resource* PrepareShownFrame(Target* t);
-    void DrawSdrFrame(Target* t, ID3D12Resource* r, bool pillarbox, D3D12_CPU_DESCRIPTOR_HANDLE bb);
+    // ui: the F10 panel over it, which the frame without the HUD leaves out
+    void DrawSdrFrame(Target* t, ID3D12Resource* r, bool pillarbox, D3D12_CPU_DESCRIPTOR_HANDLE bb, bool ui = true);
     bool EnsureOutTargets();
-    void DrawHdrFrame(Target* t, ID3D12Resource* r, bool pillarbox, D3D12_CPU_DESCRIPTOR_HANDLE bb);
+    void DrawHdrFrame(Target* t, ID3D12Resource* r, bool pillarbox, D3D12_CPU_DESCRIPTOR_HANDLE bb, bool ui = true);
     void BlitFrame(const Target& t, ID3D12Resource* r, bool pillarbox, DXGI_FORMAT rtv = kBgra);
     void RenderUi();
     void ReleaseOldTextures();
@@ -529,7 +544,7 @@ private:
     ComPtr<IDXGIFactory4> factory_;
     ComPtr<ID3D12Device> dev_;
     ComPtr<ID3D12CommandQueue> queue_;
-    ComPtr<IDXGISwapChain3> swap_;
+    ComPtr<IDXGISwapChain4> swap_;
     ComPtr<ID3D12Resource> bb_[kFrames];
     ComPtr<ID3D12Fence> fence_;
     HANDLE event_ = nullptr;
@@ -610,6 +625,7 @@ private:
     // pixels; motion, the history pair and the motion the draws wrote at the scene's size and format
     struct Taa {
         bool open = false;
+        bool jittered = false;  // for TAA or FSR, not frame generation alone
         SceneView view{};
         bool cleared = false;  // the drawn motion, this view
         MotionHistory draws;
@@ -634,6 +650,28 @@ private:
     bool motion_want_ = false;   // the draw writes motion when its target is the view's
     // FSR: the view is open and drawn at scene_scale_, upscaled into its output
     bool upscaling_ = false;
+    // frame generation: its swap chain in use, the setting it was made for, the present last configured
+    bool generation_swap_ = false;
+    bool generation_wanted_ = false;
+    uint64_t configured_ = ~0ull;
+    uint32_t frame_rect_[4] = {};  // x, y, width and height of the frame in the back buffer
+    ComPtr<ID3D12Resource> depth_one_;
+    D3D12_RESOURCE_STATES depth_one_state_ = {};
+    uint32_t depth_one_w_ = 0;
+    uint32_t depth_one_h_ = 0;
+    // the view's output as its post effects left it, then a back buffer of it each present
+    struct Hudless {
+        ComPtr<ID3D12Resource> frame;
+        D3D12_RESOURCE_STATES frame_state = {};
+        uint64_t kept = ~0ull;
+        bool hdr = false;  // over the HDR headroom, unlike the shown frame
+        ComPtr<ID3D12Resource> out[2];
+        D3D12_RESOURCE_STATES out_state[2] = {};
+        uint32_t w = 0;
+        uint32_t h = 0;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        uint64_t used = ~0ull;
+    } hudless_;
     float scene_scale_ = 1.0f;
     ComPtr<ID3D12Resource> upscaled_;
     D3D12_RESOURCE_STATES upscaled_state_ = {};
@@ -726,6 +764,7 @@ D3D12Backend::~D3D12Backend() {
     cache::DropJobs();
     if (!ready_) return;
     Flush();
+    if (generation_swap_) fsr::DestroySwapChain(swap_.Get());
     fsr::Shutdown();
     {
         std::lock_guard lock(app::UiLock());
@@ -779,13 +818,19 @@ bool D3D12Backend::CreateSwapChain(HWND hwnd) {
     sd.BufferCount = kFrames;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     sd.Flags = tearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    IDXGISwapChain4* generated = nullptr;
+    generation_wanted_ = GenerationWanted();
+    generation_swap_ = generation_wanted_ && fsr::CreateSwapChain(factory_.Get(), queue_.Get(), hwnd, sd, &generated);
     ComPtr<IDXGISwapChain1> sc1;
-    if (FAILED(factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd, &sd, nullptr, nullptr, &sc1))) {
+    if (generation_swap_) {
+        swap_.Attach(generated);
+    } else if (SUCCEEDED(factory_->CreateSwapChainForHwnd(queue_.Get(), hwnd, &sd, nullptr, nullptr, &sc1))) {
+        sc1.As(&swap_);
+    } else {
         LOGE("d3d12: no swap chain");
         return false;
     }
     factory_->MakeWindowAssociation(hwnd, DXGI_MWA_NO_ALT_ENTER);
-    sc1.As(&swap_);
     return true;
 }
 
@@ -1323,11 +1368,13 @@ bool D3D12Backend::DrawPostPass(const char* entry, const PostTarget& out, const 
     uint32_t slot = AllocSrvSlots(4);
     for (int i = 0; i < 4; i++) {
         D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
-        sv.Format = i < 3 && in.res[i] ? in.fmt[i] : kBgra;
+        ID3D12Resource* r = i < 3 ? in.res[i] : nullptr;
+        sv.Format = r ? in.fmt[i] : kBgra;
         sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         sv.Texture2D.MipLevels = 1;
-        dev_->CreateShaderResourceView(i < 3 ? in.res[i] : nullptr, &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
+        if (r && r->GetDesc().SampleDesc.Count > 1) sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
+        dev_->CreateShaderResourceView(r, &sv, Cpu(srv_heap_.Get(), slot + i, srv_inc_));
     }
     Alloc cb = Upload(256, 256);
     std::memcpy(cb.cpu, p.data(), p.size_bytes());
@@ -1748,9 +1795,12 @@ void LogTaa(const char* what) {
 void D3D12Backend::SceneBegin(const SceneView& v) {
     taa_.view = v;
     upscaling_ = Fsr();
+    // TAA and FSR jitter the view; frame generation alone draws it as the game does
+    taa_.jittered = upscaling_ || app::Get().taa;
     // eight phases for each output pixel a view pixel covers
     float ratio = upscaling_ ? scale_ / scene_scale_ : 1.0f;
     TaaJitter(taa_.phase++, uint32_t(std::ceil(kTaaPhases * ratio * ratio)), taa_.jitter);
+    if (!taa_.jittered) taa_.jitter[0] = taa_.jitter[1] = 0;
     taa_.draws.Begin();
     taa_.cleared = false;
     taa_.motion_draws = 0;
@@ -1759,15 +1809,16 @@ void D3D12Backend::SceneBegin(const SceneView& v) {
 }
 
 // the view's motion, then its colour resolved over the history and sharpened back into the scene, or with FSR
-// upscaled into the output
+// upscaled into the output; frame generation takes the depth and motion
 void D3D12Backend::SceneEnd(const State& s) {
     if (!std::exchange(taa_.open, false)) return;
     Target* rt = FindTarget(s.rt, false);
     Target* ds = FindTarget(s.zs, true);
     bool upscale = std::exchange(upscaling_, false);
     bool scene = rt && ds && rt->gw == guest_w_ && rt->gh == guest_h_ && ds->w == rt->w && ds->h == rt->h;
-    if (!scene || rt->samples > 1 || ds->samples > 1) {
-        LogTaa("the view drew no single sample back buffer sized scene");
+    // TAA and FSR draw without MSAA, frame generation alone reads a multisampled view's first sample
+    if (!scene || (taa_.jittered && (rt->samples > 1 || ds->samples > 1))) {
+        LogTaa("the view drew no back buffer sized scene");
         return;
     }
     if (!EnsureTaaTargets(*rt)) return;
@@ -1789,22 +1840,17 @@ void D3D12Backend::SceneEnd(const State& s) {
     std::memcpy(taa_.last, now, sizeof(taa_.last));
     taa_.last_present = presents_;
     bool motion = DrawMotion(*rt, *ds, view);
-    bool ok = upscale ? UpscaleScene(s, *rt, *ds, reset || !motion) : motion && ResolveTaa(*rt, reset);
+    bool ok = motion;
+    if (upscale) ok = UpscaleScene(s, *rt, *ds, reset || !motion);
+    else if (taa_.jittered) ok = motion && ResolveTaa(*rt, reset);
     taa_.fresh = !ok;
     char what[96];
     if (!ok) std::snprintf(what, sizeof(what), "not resolved, the view can't be reprojected or a pass failed");
     else if (upscale) std::snprintf(what, sizeof(what), "FSR upscaling %ux%u", rt->w, rt->h);
-    else std::snprintf(what, sizeof(what), "resolving %ux%u", rt->w, rt->h);
+    else if (taa_.jittered) std::snprintf(what, sizeof(what), "resolving %ux%u", rt->w, rt->h);
+    else std::snprintf(what, sizeof(what), "motion for frame generation, %ux%u", rt->w, rt->h);
     LogTaa(what);
-    if (!ok || upscale) return;
-    // CAS from the history into the scene; on failure the history is copied in unsharpened
-    ID3D12Resource* history = taa_.history[taa_.now].Get();
-    D3D12_RESOURCE_STATES& state = taa_.history_state[taa_.now];
-    Transition(history, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    if (Sharpen({history, rt->fmt, history, rt->fmt, {}}, *rt)) return;
-    Transition(history, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-    Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_COPY_DEST);
-    cl_->CopyResource(rt->res.Get(), history);
+    if (generation_swap_ && motion) PrepareGeneration(*rt, *ds, reset);
 }
 
 // made again when the scene's size or format changes
@@ -1838,6 +1884,7 @@ void D3D12Backend::BeginDrawnMotion() {
 
 // the motion the draws wrote, the depth reprojected where none did
 bool D3D12Backend::DrawMotion(Target& rt, Target& ds, const MotionView& view) {
+    static const std::string ms_hlsl = std::string("#define MS 1\n") + kMotionHlsl;
     float c[kMotionConstants];
     if (!FillMotionConstants(view, c)) return false;
     BeginDrawnMotion();
@@ -1847,10 +1894,17 @@ bool D3D12Backend::DrawMotion(Target& rt, Target& ds, const MotionView& view) {
     Transition(taa_.motion.Get(), taa_.motion_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
     PostInputs in{{ds.res.Get(), taa_.drawn.Get()}, {kDepthViewFormat, kMotionFormat}};
     PostTarget out{PostRtv(kMotionRtv), kMotionFormat, rt.w, rt.h};
-    return DrawPostPass("motion", out, in, c, {.hlsl = kMotionHlsl});
+    bool ms = ds.samples > 1;
+    if (!ms) return DrawPostPass("motion", out, in, c, {.hlsl = kMotionHlsl});
+    if (!DrawPostPass("motion_ms", out, in, c, {.hlsl = ms_hlsl.c_str()})) return false;
+    // frame generation reads its first sample of the depth
+    if (!EnsureDepthOne(rt.w, rt.h)) return false;
+    Transition(depth_one_.Get(), depth_one_state_, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    PostTarget one{PostRtv(kDepthOneRtv), DXGI_FORMAT_R32_FLOAT, rt.w, rt.h};
+    return DrawPostPass("depth_one", one, in, c, {.hlsl = ms_hlsl.c_str()});
 }
 
-// this frame's history from the scene over last frame's
+// this frame's history from the scene over last frame's, sharpened back into the scene
 bool D3D12Backend::ResolveTaa(Target& rt, bool reset) {
     uint32_t prev = taa_.now;
     uint32_t now = prev ^ 1;
@@ -1863,7 +1917,33 @@ bool D3D12Backend::ResolveTaa(Target& rt, bool reset) {
     const float p[4] = {taa_.jitter[0] / float(rt.w), taa_.jitter[1] / float(rt.h), reset ? 1.0f : 0.0f, 0};
     if (!DrawPostPass("taa", out, in, p, {.hlsl = kTaaHlsl})) return false;
     taa_.now = now;
+    // CAS from the history into the scene; on failure the history is copied in unsharpened
+    ID3D12Resource* history = taa_.history[now].Get();
+    D3D12_RESOURCE_STATES& state = taa_.history_state[now];
+    Transition(history, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (Sharpen({history, rt.fmt, history, rt.fmt, {}}, rt)) return true;
+    Transition(history, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_COPY_DEST);
+    cl_->CopyResource(rt.res.Get(), history);
     return true;
+}
+
+// the view as FSR and frame generation take it: the scene's colour and motion, the camera, the jitter
+fsr::Frame D3D12Backend::FsrFrame(Target& rt, bool reset) const {
+    const float* p = taa_.view.camera_to_screen;
+    // a D3D projection: depth = m10 + m14 / z, so 0 at the near plane and 1 at the far one, infinite at m10 = 1
+    constexpr float kFarthest = 1e7f;
+    fsr::Frame f;
+    f.color = {rt.res.Get(), 0, rt.w, rt.h};
+    f.motion = {taa_.motion.Get(), 0, rt.w, rt.h};
+    f.near_plane = p[10] ? -p[14] / p[10] : 0;
+    f.far_plane = p[10] < 1 ? p[14] / (1 - p[10]) : kFarthest;
+    f.fov_y = 2 * std::atan(1 / p[5]);
+    f.jitter[0] = taa_.jitter[0];
+    f.jitter[1] = taa_.jitter[1];
+    f.reset = reset;
+    f.index = presents_;
+    return f;
 }
 
 // FSR
@@ -1928,20 +2008,9 @@ bool D3D12Backend::UpscaleScene(const State& s, Target& rt, Target& ds, bool res
     Target* out = EnsureTarget(s.rt, false);
     Target* out_ds = EnsureTarget(s.zs, true);
     if (!out || !out_ds || !EnsureUpscaled(out->w, out->h)) return false;
-    const float* p = taa_.view.camera_to_screen;
-    // a D3D projection: depth = m10 + m14 / z, so 0 at the near plane and 1 at the far one, infinite at m10 = 1
-    constexpr float kFarthest = 1e7f;
-    fsr::Frame f;
-    f.color = {rt.res.Get(), 0, rt.w, rt.h};
+    fsr::Frame f = FsrFrame(rt, reset);
     f.depth = {ds.res.Get(), 0, ds.w, ds.h};
-    f.motion = {taa_.motion.Get(), 0, rt.w, rt.h};
     f.output = {upscaled_.Get(), 0, out->w, out->h};
-    f.near_plane = p[10] ? -p[14] / p[10] : 0;
-    f.far_plane = p[10] < 1 ? p[14] / (1 - p[10]) : kFarthest;
-    f.fov_y = 2 * std::atan(1 / p[5]);
-    f.jitter[0] = taa_.jitter[0];
-    f.jitter[1] = taa_.jitter[1];
-    f.reset = reset;
     Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     Transition(ds.res.Get(), ds.state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
     Transition(taa_.motion.Get(), taa_.motion_state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
@@ -2019,6 +2088,149 @@ bool D3D12Backend::Sharpen(const SharpenInputs& in, Target& out) {
     if (!DrawPostPass("cas", target, views, p, {.hlsl = hlsl.c_str()})) return false;
     out.drawn = true;
     return true;
+}
+
+// Frame generation
+
+// its swap chain made or dropped as the setting changes
+void D3D12Backend::RecreateSwapChain() {
+    Flush();
+    for (auto& f : frames_) {
+        if (f.fence) WaitFence(f.fence);
+    }
+    for (auto& b : bb_) b.Reset();
+    if (generation_swap_) fsr::DestroySwapChain(swap_.Get());
+    generation_swap_ = false;
+    swap_.Reset();
+    if (!CreateSwapChain(static_cast<HWND>(app::Window()))) return;
+    // ResizeSwap makes the back buffers, their views and colour space again
+    bb_w_ = 0;
+    hdr_want_ = false;
+    LOGR("FSR: frame generation's swap chain %s", generation_swap_ ? "in use" : "dropped");
+}
+
+bool D3D12Backend::EnsureDepthOne(uint32_t w, uint32_t h) {
+    if (depth_one_ && depth_one_w_ == w && depth_one_h_ == h) return true;
+    depth_one_w_ = 0;
+    if (!CreatePostTarget(depth_one_, depth_one_state_, DXGI_FORMAT_R32_FLOAT, w, h, kDepthOneRtv)) return false;
+    depth_one_w_ = w;
+    depth_one_h_ = h;
+    return true;
+}
+
+// the view's depth and motion handed to frame generation, never over the F10 panel
+void D3D12Backend::PrepareGeneration(Target& rt, Target& ds, bool reset) {
+    ConfigureGeneration(!app::MenuOpen(), rt.w, rt.h);
+    float to_world[16];
+    if (!CameraToWorld(taa_.view, to_world)) return;
+    bool ms = ds.samples > 1;
+    ID3D12Resource* depth = ms ? depth_one_.Get() : ds.res.Get();
+    D3D12_RESOURCE_STATES& depth_state = ms ? depth_one_state_ : ds.state;
+    fsr::Frame f = FsrFrame(rt, reset);
+    f.depth = {depth, uint32_t(ms ? DXGI_FORMAT_R32_FLOAT : 0), rt.w, rt.h};
+    for (int i = 0; i < 3; i++) {
+        f.camera_right[i] = to_world[i];
+        f.camera_up[i] = to_world[4 + i];
+        f.camera_forward[i] = to_world[8 + i];
+        f.camera_position[i] = to_world[12 + i];
+    }
+    Transition(depth, depth_state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    Transition(taa_.motion.Get(), taa_.motion_state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    fsr::Prepare(cl_.Get(), f);
+    Begin();  // FSR's passes left their heaps and root signature bound
+}
+
+// once a frame before its present through frame generation's swap chain
+void D3D12Backend::ConfigureGeneration(bool enabled, uint32_t render_w, uint32_t render_h) {
+    configured_ = presents_;
+    fsr::Generation g;
+    g.swap = swap_.Get();
+    g.index = presents_;
+    g.enabled = enabled;
+    g.frames = app::Get().frame_generation;
+    g.render_w = render_w;
+    g.render_h = render_h;
+    std::copy(std::begin(frame_rect_), std::end(frame_rect_), g.rect);
+    g.w = bb_w_;
+    g.h = bb_h_;
+    g.format = hdr_out_ ? kHdr10Format : kBgra;
+    g.hdr = hdr_out_;
+    if (enabled && EnsureHudless()) {
+        g.hudless = hudless_.out[presents_ % 2].Get();
+        hudless_.used = presents_;
+    }
+    fsr::Configure(g);
+}
+
+// the view's output as its post effects left it, before the HUD draws over it
+void D3D12Backend::HudBegin(const State& s) {
+    if (!generation_swap_) return;
+    Target* rt = FindTarget(s.rt, false);
+    if (!rt || rt->gw != guest_w_ || rt->gh != guest_h_) return;
+    D3D12_RESOURCE_DESC d = rt->res->GetDesc();
+    // a multisampled frame is resolved into one sample
+    bool resolve = d.SampleDesc.Count > 1;
+    d.SampleDesc = {1, 0};
+    d.Alignment = 0;
+    d.Flags = D3D12_RESOURCE_FLAG_NONE;
+    D3D12_RESOURCE_DESC have{};
+    if (hudless_.frame) have = hudless_.frame->GetDesc();
+    if (have.Width != d.Width || have.Height != d.Height || have.Format != d.Format) {
+        if (hudless_.frame) CurrentFrame().garbage.push_back(hudless_.frame);
+        hudless_.frame.Reset();
+        D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+        hudless_.frame_state = D3D12_RESOURCE_STATE_COPY_DEST;
+        if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &d, hudless_.frame_state, nullptr,
+                                                 IID_PPV_ARGS(&hudless_.frame)))) {
+            LOGE("d3d12: no frame without the HUD");
+            return;
+        }
+    }
+    if (resolve) {
+        Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_RESOLVE_SOURCE);
+        Transition(hudless_.frame.Get(), hudless_.frame_state, D3D12_RESOURCE_STATE_RESOLVE_DEST);
+        cl_->ResolveSubresource(hudless_.frame.Get(), 0, rt->res.Get(), 0, rt->fmt);
+    } else {
+        Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Transition(hudless_.frame.Get(), hudless_.frame_state, D3D12_RESOURCE_STATE_COPY_DEST);
+        cl_->CopyResource(hudless_.frame.Get(), rt->res.Get());
+    }
+    bound_rt_ = bound_ds_ = nullptr;
+    hudless_.hdr = rt->hdr;
+    hudless_.kept = presents_;
+}
+
+// the back buffer's size and format, made again when they change
+bool D3D12Backend::EnsureHudless() {
+    DXGI_FORMAT format = hdr_out_ ? kHdr10Format : kBgra;
+    if (hudless_.out[0] && hudless_.w == bb_w_ && hudless_.h == bb_h_ && hudless_.format == format) return true;
+    hudless_.w = 0;
+    for (int i = 0; i < 2; i++) {
+        if (!CreatePostTarget(hudless_.out[i], hudless_.out_state[i], format, bb_w_, bb_h_, kHudlessRtv + i)) {
+            LOGE("d3d12: no %ux%u back buffer without the HUD", bb_w_, bb_h_);
+            return false;
+        }
+    }
+    hudless_.w = bb_w_;
+    hudless_.h = bb_h_;
+    hudless_.format = format;
+    return true;
+}
+
+// the frame kept before the HUD as the back buffer shows it, else the shown frame itself
+void D3D12Backend::DrawHudless(Target* t, ID3D12Resource* r, bool pillarbox) {
+    uint32_t i = presents_ % 2;
+    // a frame still over the HDR headroom has no tone mapping to match the shown one
+    bool kept = t && hudless_.kept == presents_ && !hudless_.hdr;
+    if (kept) {
+        Transition(hudless_.frame.Get(), hudless_.frame_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        r = hudless_.frame.Get();
+    }
+    Transition(hudless_.out[i].Get(), hudless_.out_state[i], D3D12_RESOURCE_STATE_RENDER_TARGET);
+    D3D12_CPU_DESCRIPTOR_HANDLE rh = PostRtv(kHudlessRtv + i);
+    if (!hdr_out_) DrawSdrFrame(t, r, pillarbox, rh, false);
+    else if (EnsureOutTargets()) DrawHdrFrame(t, r, pillarbox, rh, false);
+    Transition(hudless_.out[i].Get(), hudless_.out_state[i], D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
 }
 
 bool D3D12Backend::EnsureAoTargets(uint32_t w, uint32_t h) {
@@ -3120,6 +3332,8 @@ void D3D12Backend::BlitFrame(const Target& t, ID3D12Resource* r, bool pillarbox,
     if (pillarbox) vw = vh * 4.0f / 3.0f;
     float uv[4] = {0, 0, 1, 1};
     D3D12_VIEWPORT vp{(w - vw) / 2, (h - vh) / 2, vw, vh, 0, 1};
+    const uint32_t rect[4] = {uint32_t(vp.TopLeftX), uint32_t(vp.TopLeftY), uint32_t(vw), uint32_t(vh)};
+    std::copy(std::begin(rect), std::end(rect), frame_rect_);
     D3D12_RECT scissor{0, 0, LONG(bb_w_), LONG(bb_h_)};
     cl_->RSSetViewports(1, &vp);
     cl_->RSSetScissorRects(1, &scissor);
@@ -3138,6 +3352,7 @@ void D3D12Backend::RenderUi() {
     ID3D12DescriptorHeap* uh[] = {ui_heap_.Get()};
     cl_->SetDescriptorHeaps(1, uh);
     ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), cl_.Get());
+    Begin();  // ImGui left its heap and root signature bound
 }
 
 void D3D12Backend::DrawFrame(Target* t, bool pillarbox, uint32_t bi) {
@@ -3149,15 +3364,17 @@ void D3D12Backend::DrawFrame(Target* t, bool pillarbox, uint32_t bi) {
     if (!hdr_out_) DrawSdrFrame(t, r, pillarbox, rh);
     else if (EnsureOutTargets()) DrawHdrFrame(t, r, pillarbox, rh);
     Transition(bb_[bi].Get(), bs, D3D12_RESOURCE_STATE_PRESENT);
+    if (generation_swap_ && hudless_.used == presents_) DrawHudless(t, r, pillarbox);
 }
 
-void D3D12Backend::DrawSdrFrame(Target* t, ID3D12Resource* r, bool pillarbox, D3D12_CPU_DESCRIPTOR_HANDLE bb) {
+void D3D12Backend::DrawSdrFrame(Target* t, ID3D12Resource* r, bool pillarbox, D3D12_CPU_DESCRIPTOR_HANDLE bb,
+                                bool ui) {
     float black[4] = {0, 0, 0, 1};
     cl_->ClearRenderTargetView(bb, black, 0, nullptr);
     cl_->OMSetRenderTargets(1, &bb, FALSE, nullptr);
     bound_rt_ = bound_ds_ = nullptr;
     if (t) BlitFrame(*t, r, pillarbox);
-    RenderUi();
+    if (ui) RenderUi();
 }
 
 bool D3D12Backend::EnsureOutTargets() {
@@ -3170,7 +3387,8 @@ bool D3D12Backend::EnsureOutTargets() {
 
 // the frame and the panel each into a target of their own, then both into the back buffer as HDR10; the panel
 // stays at SDR white
-void D3D12Backend::DrawHdrFrame(Target* t, ID3D12Resource* r, bool pillarbox, D3D12_CPU_DESCRIPTOR_HANDLE bb) {
+void D3D12Backend::DrawHdrFrame(Target* t, ID3D12Resource* r, bool pillarbox, D3D12_CPU_DESCRIPTOR_HANDLE bb,
+                                bool ui) {
     D3D12_CPU_DESCRIPTOR_HANDLE frame = PostRtv(kOutRtv);
     D3D12_CPU_DESCRIPTOR_HANDLE panel = PostRtv(kOutRtv + 1);
     float clear[4] = {0, 0, 0, 0};
@@ -3181,8 +3399,7 @@ void D3D12Backend::DrawHdrFrame(Target* t, ID3D12Resource* r, bool pillarbox, D3
     bound_rt_ = bound_ds_ = nullptr;
     if (t) BlitFrame(*t, r, pillarbox, kHdrFormat);
     cl_->OMSetRenderTargets(1, &panel, FALSE, nullptr);
-    RenderUi();
-    Begin();  // RenderUi left ImGui's heap and root signature bound
+    if (ui) RenderUi();
     for (int i = 0; i < 2; i++) Transition(out_[i].Get(), out_state_[i], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
     PostInputs in{{out_[0].Get(), out_[1].Get(), nullptr}, {kHdrFormat, kBgra, kBgra}};
     float p[8] = {paper_nits_, peak_nits_, 0, 0};
@@ -3234,6 +3451,7 @@ void D3D12Backend::Present(const Surface& front, bool pillarbox) {
         StartCapture(cap_);
     }
     DetectHdr();
+    if (GenerationWanted() != generation_wanted_) RecreateSwapChain();
     ResizeSwap();
     Target* t = EnsureTarget(front, false);
     if (t && LatchCpuWrite(*t)) UploadTarget(*t, front);
@@ -3251,6 +3469,7 @@ void D3D12Backend::Present(const Surface& front, bool pillarbox) {
     if (!hold) DrawFrame(t, pillarbox, bi);
     Submit(false);
     present_fence_[presents_ % (kFrames + 1)].store(fence_value_);
+    if (generation_swap_ && configured_ != presents_) ConfigureGeneration(false, 0, 0);
     if (!hold) {
         bool vsync = app::Get().vsync;
         swap_->Present(vsync ? 1 : 0, !vsync && tearing_ ? DXGI_PRESENT_ALLOW_TEARING : 0);

@@ -50,6 +50,7 @@ struct Settings {
     uint32_t msaa = 0;               // samples a pixel of the scene, 0 off
     bool taa = false;                // temporal anti aliasing in place of MSAA, over the view before its post effects
     bool fsr = false;                // AMD FSR 3 in place of MSAA, the view drawn at the render resolution and upscaled
+    uint32_t frame_generation = 0;   // AMD FSR frames generated between each two rendered, 0 off to 3 (4X)
     bool smaa = false;               // over the finished frame, HUD included; combines with msaa
     uint32_t shadow_resolution = 512;  // shadow map edge, 0 follows the render scale; 512 is the console's, edge blur included
     uint32_t shadow_distance = 1;    // lights and their shadows turn off this many times further away, 1 to 8

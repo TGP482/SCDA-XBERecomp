@@ -7,6 +7,7 @@
 #include <string_view>
 
 #include "app/app.h"
+#include "gpu/fsr.h"
 #include "kernel/memory.h"
 #include "xdk/hle.h"
 
@@ -75,7 +76,11 @@ void app::DrawFps(X86Context& ctx) {
     uint32_t screen = R32(kScreen);
     if (!screen) return;
     char text[32];
-    std::snprintf(text, sizeof text, "FPS: %.1f", double(g_fps.load()));
+    float fps = g_fps.load();
+    // frame generation's rate beside the rendered one
+    uint32_t n = fsr::Generated();
+    if (n) std::snprintf(text, sizeof text, "FPS: %.1f, FG %.1f", double(fps), fps * (n + 1.0));
+    else std::snprintf(text, sizeof text, "FPS: %.1f", double(fps));
     Text(ctx, text, kLeft + kMargin, int16_t(R16(screen + kPageHeight)) - kMargin - kSize, kSize, 0xFFFFFFFFu, true, false);
 }
 

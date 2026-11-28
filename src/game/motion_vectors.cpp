@@ -1,6 +1,6 @@
-// TAA and FSR mark the frame's view: DrawLevel begins it with the view's matrices, and its post effect block ends it
-// at that block's first call, before the vision filters, eye adaptation and glow. A level drawn without the block (hit
-// tests aside) ends where DrawLevel returns.
+// TAA, FSR and frame generation mark the frame's view: DrawLevel begins it with the view's matrices, and its post
+// effect block ends it at that block's first call, before the vision filters, eye adaptation and glow. A level drawn
+// without the block (hit tests aside) ends where DrawLevel returns, which is also where its HUD begins.
 #include "app/app.h"
 #include "xdk/d3d8.h"
 #include "xdk/hle.h"
@@ -32,13 +32,17 @@ void EndScene() {
 X86_EXTERN_FUNC(__imp__sub_002B11B0);
 X86_FUNC(sub_002B11B0) {
     uint32_t node = R32(ctx.esp + 4);
-    bool view = (app::Get().taa || app::Get().fsr) && !R32(ctx.esp + 0xC) && node == game::FrameView();
+    const app::Settings& s = app::Get();
+    bool temporal = s.taa || s.fsr || s.frame_generation;
+    bool view = temporal && !R32(ctx.esp + 0xC) && node == game::FrameView();
     if (view) {
         g_open = true;
         d3d::SceneBegin(&G<float>(node + kWorldToScreen), &G<float>(node + kCameraToScreen));
     }
     __imp__sub_002B11B0(ctx, base);
-    if (view) EndScene();
+    if (!view) return;
+    EndScene();
+    d3d::HudBegin();
 }
 
 // the render interface's +0x1D0 check, thiscall

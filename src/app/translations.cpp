@@ -54,6 +54,7 @@ constexpr Entry kEntries[] = {
     {"TONE MAPPING", {u"Assignation des teintes", u"Tone Mapping", u"Tone mapping", u"Mapeado por tonos"}},
     {"AMBIENT OCCLUSION", {u"Occlusion ambiante", u"Ambient Occlusion", u"Occlusione ambientale", u"Oclusión ambiental"}},
     {"ANTI ALIASING", {u"Anticrénelage", u"Kantenglättung", u"Antialiasing", u"Antialiasing"}},
+    {"FRAME GENERATION", {u"Génération d'images", u"Frame-Generierung", u"Generazione dei frame", u"Generación de fotogramas"}},
     {"ANISOTROPIC FILTERING", {u"Filtrage anisotropique", u"Anisotropische Filterung", u"Filtro anisotropico", u"Filtro anisotrópico"}},
     {"SHADOW RESOLUTION", {u"Résolution des ombres", u"Schattenauflösung", u"Risoluzione delle ombre", u"Resolución de sombras"}},
     {"SHADOW DISTANCE", {u"Distance des ombres", u"Schattendistanz", u"Distanza delle ombre", u"Distancia de sombras"}},
@@ -268,7 +269,7 @@ std::string app::TitleCase(std::string_view text) {
     constexpr std::string_view kSmall[] = {"AND", "OR", "OF", "TO", "A"};
     constexpr std::string_view kKeep[] = {"FPS", "FMV", "EEV", "EMF", "LMB", "RMB", "MMB", "IP", "OPSAT", "ESC", "HDR",
                                           "MSAA", "SMAA", "TAA", "SSAO", "GTAO", "HUD", "LB", "RB", "LT", "RT", "LS",
-                                          "RS", "PNG", "DDS", "FSR3", "AA"};
+                                          "RS", "PNG", "DDS", "FSR3", "AA", "FG"};
     std::string out;
     size_t i = 0;
     while (i < text.size()) {

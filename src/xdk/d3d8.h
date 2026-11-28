@@ -21,5 +21,7 @@ void ViewScale(float xy);
 // CameraToScreen, rows of 4
 void SceneBegin(const float* world_to_screen, const float* camera_to_screen);
 void SceneEnd();
+// the view's post effects done, before its HUD
+void HudBegin();
 
 }  // namespace d3d

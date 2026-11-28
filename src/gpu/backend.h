@@ -59,6 +59,8 @@ public:
     // resolves them into the scene before the post effects
     virtual void SceneBegin(const SceneView&) {}
     virtual void SceneEnd(const State&) {}
+    // the view's post effects done, before the HUD draws over it: frame generation keeps the frame
+    virtual void HudBegin(const State&) {}
 
     // the XDK's fences and busy checks against the render thread; a backend that draws at once is never behind
     virtual uint32_t Fence() { return ++fence_; }

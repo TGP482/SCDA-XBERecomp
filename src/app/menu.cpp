@@ -318,7 +318,7 @@ enum RowId {
     kSniperSensitivity, kFmvScale, kColourBlind, kAimHorizontal, kAimVertical, kInvertMouseX, kInvertPadX, kInvertPadY,
     kSensitivityVertical, kPadDeadZone, kPadHorizontal, kPadVertical, kPadAimHorizontal, kPadAimVertical,
     kVibration, kGyroAiming, kGyroSensitivity, kGyroAxis, kGyroButton, kGyroButtonMode, kGyroRecenter, kGyroCalibrate,
-    kTextureReplacement, kTextureDumping, kDumpFormat, kRenderer
+    kTextureReplacement, kTextureDumping, kDumpFormat, kRenderer, kFrameGeneration
 };
 
 using rows::Kind;
@@ -328,11 +328,12 @@ constexpr bool kVersus = std::string_view(IMAGE_XBE) == "sc4_adv.xbe";
 
 bool IsGyroRow(int id) { return id >= kGyroAiming && id <= kGyroCalibrate; }
 
-// versus has no SM3 renderer or shadow options of story, nor co-op rows and gyro aiming
+// versus has no SM3 renderer or shadow options of story, nor co-op rows, gyro aiming and frame generation
 bool VersusHides(int id) {
     if (!kVersus) return false;
     return id == kShaderModel || id == kHdr || id == kToneMapping || id == kShadowResolution ||
-           id == kShadowDistance || id == kShadowFilter || id == kTickRate || id == kInputDelay || IsGyroRow(id);
+           id == kShadowDistance || id == kShadowFilter || id == kTickRate || id == kInputDelay || IsGyroRow(id) ||
+           id == kFrameGeneration;
 }
 
 constexpr Row kSettingsRows[] = {
@@ -357,6 +358,7 @@ constexpr Row kSettingsRows[] = {
     {Kind::Value, kToneMapping, "TONE MAPPING"},
     {Kind::Value, kAmbientOcclusion, "AMBIENT OCCLUSION"},
     {Kind::Value, kAntiAliasing, "ANTI ALIASING"},
+    {Kind::Value, kFrameGeneration, "FRAME GENERATION"},
     {Kind::Value, kSmaa, "SMAA"},
     {Kind::Value, kAniso, "ANISOTROPIC FILTERING"},
     {Kind::Value, kShadowResolution, "SHADOW RESOLUTION"},
@@ -639,6 +641,14 @@ bool StepGraphicsRow(int id, int step, Settings& s, char (&text)[64]) {
         case kAntiAliasing:
             StepAntiAliasing(s, step, text);
             return true;
+        case kFrameGeneration: {
+            constexpr const char* kNames[] = {"OFF", "2X", "3X", "4X"};
+            uint32_t frames = std::min(s.frame_generation, fsr::kMaxGenerated);
+            if (step) frames = uint32_t(StepIndex(int(frames), step, int(std::size(kNames))));
+            s.frame_generation = frames;
+            std::snprintf(text, sizeof(text), "%s%s", kNames[frames], fsr::StatusNote(fsr::GenerationStatus()));
+            return true;
+        }
         case kAmbientOcclusion:
             std::snprintf(text, sizeof(text), "%s", kAoNames[StepTable(kAoValues, s.ambient_occlusion, step)]);
             return true;

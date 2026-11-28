@@ -216,6 +216,11 @@ void SceneEnd() {
     if (g_backend) g_backend->SceneEnd(g_state);
 }
 
+void HudBegin() {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (g_backend) g_backend->HudBegin(g_state);
+}
+
 }  // namespace d3d
 
 using namespace d3d;

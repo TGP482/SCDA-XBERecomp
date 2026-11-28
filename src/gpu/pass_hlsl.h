@@ -411,7 +411,15 @@ cbuffer P : register(b1) {
     float4 ndc;
     float4 zuv;
 };
+// MS: a multisampled view's, read at its first sample
+#ifdef MS
+Texture2DMS<float> depth : register(t0);
+float Depth(int2 p) { return depth.Load(p, 0); }
+#define motion motion_ms
+#else
 Texture2D<float> depth : register(t0);
+float Depth(int2 p) { return depth.Load(int3(p, 0)); }
+#endif
 Texture2D<float2> drawn : register(t1);
 float4 vs(uint id : SV_VertexID) : SV_Position {
     float2 t = float2((id << 1) & 2, id & 2);
@@ -422,11 +430,14 @@ float2 motion(float4 pos : SV_Position) : SV_Target {
     float2 m = drawn.Load(int3(pos.xy, 0));
     if (m.x < 16384) return m;
     float2 n = pos.xy * ndc.xy + ndc.zw;
-    float z = (depth.Load(int3(pos.xy, 0)) - zuv.x) * zuv.y;
+    float z = (Depth(int2(pos.xy)) - zuv.x) * zuv.y;
     float4 last = mul(float4(n, z, 1), reproject);
     if (last.w <= 0) return 2;
     return clamp((last.xy / last.w - n) * zuv.zw, -2, 2);
 }
+#ifdef MS
+float depth_one(float4 pos : SV_Position) : SV_Target { return Depth(int2(pos.xy)); }
+#endif
 )";
 
 // TAA: the scene blended into its history where its motion carries it back, the history clipped to the scene around

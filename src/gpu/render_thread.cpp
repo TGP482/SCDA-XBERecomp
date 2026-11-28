@@ -43,7 +43,7 @@ enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Co
 
 enum class Op : uint8_t {
     State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, Occlusion, FilterShadows, ApplyShadows,
-    SceneBegin, SceneEnd
+    SceneBegin, SceneEnd, HudBegin
 };
 
 struct Cmd {
@@ -259,6 +259,12 @@ public:
         Use(s.rt.header);
         Use(s.zs.header);
         Written(s.rt);
+    }
+
+    void HudBegin(const State& s) override {
+        SendState(s);
+        cur_->cmds.push_back(Cmd{Op::HudBegin});
+        Use(s.rt.header);
     }
 
     uint32_t Fence() override { return uint32_t(cur_->id); }
@@ -511,6 +517,7 @@ private:
                 break;
             }
             case Op::SceneEnd: inner_->SceneEnd(state_); break;
+            case Op::HudBegin: inner_->HudBegin(state_); break;
         }
     }
 
