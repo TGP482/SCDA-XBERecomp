@@ -36,6 +36,7 @@
 #include "app/app.h"
 #include "core/log.h"
 #include "gpu/backend.h"
+#include "gpu/backend_common.h"
 #include "gpu/pipeline_cache.h"
 #include "gpu/shaders.h"
 #include "gpu/smaa_shader.h"
@@ -68,387 +69,6 @@ constexpr uint32_t kSmaaRtv = 5;
 constexpr uint32_t kOutRtv = 8;
 constexpr uint32_t kSoftShadowRtv = 10;
 constexpr uint32_t kPostRtvs = 14;
-// Chaos Theory's soft shadows' targets
-enum SoftShadowTarget { kSoftSmall, kSoftQuarter, kSoftPenumbra, kSoftFiltered, kSoftShadowTargets };
-constexpr uint32_t kConsoleShadows = 512;  // the shadow resolution setting that keeps the console's look
-constexpr DXGI_FORMAT kBgra = DXGI_FORMAT_B8G8R8A8_UNORM;
-// Shader model 3.0 HDR: the scene target holds colour over kHeadroom so lights add past 1 while alpha, which the
-// game's blends use as a factor, keeps its 0..1 clamp; tone mapping brings it back when the frame is read
-constexpr DXGI_FORMAT kHdrFormat = DXGI_FORMAT_R16G16B16A16_UNORM;
-constexpr float kHeadroom = 8.0f;
-// HDR10 output: back buffers in PQ over BT.2020; SDR white and peak in nits when Windows can't tell
-constexpr DXGI_FORMAT kHdr10Format = DXGI_FORMAT_R10G10B10A2_UNORM;
-constexpr float kDefaultPaperNits = 200.0f;
-constexpr float kDefaultPeakNits = 1000.0f;
-constexpr float kSdrWhiteUnit = 0.08f;  // Windows' SDR white level: 1000 is 80 nits
-// longest a frame missing draws still on the build threads keeps the last whole frame on screen instead
-constexpr auto kHoldMax = std::chrono::milliseconds(50);
-
-const char* kBlitHlsl = R"(
-cbuffer B : register(b1) { float4 uvrect; float4 opts; float4 colour[3]; };
-Texture2D img : register(t0);
-Texture2D lut : register(t1);
-SamplerState ls : register(s0);
-SamplerState ps : register(s1);
-struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
-O vs(uint id : SV_VertexID) {
-    O o;
-    float2 t = float2((id << 1) & 2, id & 2);
-    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
-    o.uv = uvrect.xy + t * uvrect.zw;
-    return o;
-}
-float4 psmain(O i) : SV_Target {
-    float4 c = 0;
-    int n = max((int)opts.z, 1);
-    float2 px = fwidth(i.uv);
-    for (int y = 0; y < n; y++)
-        for (int x = 0; x < n; x++) c += img.SampleLevel(ls, i.uv + px * ((float2(x, y) + 0.5) / n - 0.5), 0);
-    c /= n * n;
-    c.rgb *= opts.w;
-    if (opts.x > 0) c.rgb = float3(lut.Sample(ps, float2(c.r, 0.5)).r, lut.Sample(ps, float2(c.g, 0.5)).g, lut.Sample(ps, float2(c.b, 0.5)).b);
-    // colour[0].w: the rows hold a colour matrix, applied to linear colour
-    if (colour[0].w > 0) {
-        float3x3 m = float3x3(colour[0].xyz, colour[1].xyz, colour[2].xyz);
-        c.rgb = pow(saturate(mul(m, pow(saturate(c.rgb), 2.2))), 1 / 2.2);
-    }
-    return float4(c.rgb, opts.y > 0 ? c.a : 1);
-}
-)";
-
-// the HDR resolve: exposure, bloom of what passes white, tone mapping
-const char* kPostHlsl = R"(
-cbuffer P : register(b1) { float4 p0; float4 p1; float4 p2; };
-Texture2D src : register(t0);
-Texture2D bloom : register(t1);
-Texture2D<float> expo : register(t2);
-SamplerState ls : register(s0);
-struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
-O vs(uint id : SV_VertexID) {
-    O o;
-    float2 t = float2((id << 1) & 2, id & 2);
-    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
-    o.uv = t;
-    return o;
-}
-static const float3 kLum = float3(0.3, 0.59, 0.11);
-// Chaos Theory's eye adaptation, the scale the scene goes to. p0: headroom, glow strength, glow start, brightness
-// max; p1: brightness min, dark end, normal start, normal end; p2: bright start, dark, normal and bright scale
-float exposure(O i) : SV_Target {
-    float s = 0;
-    for (int y = 0; y < 18; y++)
-        for (int x = 0; x < 32; x++) {
-            float3 c = src.SampleLevel(ls, (float2(x, y) + 0.5) / float2(32, 18), 0).rgb * p0.x;
-            float lit = dot(min(c, 1) + max(c - 1 - p0.z, 0) * p0.y, kLum);
-            s += log2(clamp(p0.w - lit, p1.x, p0.w));
-        }
-    float l = p0.w - exp2(s / 576);
-    if (l >= p1.w) return lerp(p2.z, p2.w, saturate((l - p1.w) / (p2.x - p1.w)));
-    return lerp(p2.y, p2.z, saturate((l - p1.y) / (p1.z - p1.y)));
-}
-// p1: source texel; a quarter size copy of what passes 1
-float4 bright(O i) : SV_Target {
-    float3 c = 0;
-    for (int k = 0; k < 4; k++) c += src.SampleLevel(ls, i.uv + p1.xy * float2(k & 1 ? 1 : -1, k & 2 ? 1 : -1), 0).rgb;
-    return float4(max(c * 0.25 * p0.x - 1, 0), 1);
-}
-// p1: step; 9 gaussian taps in 5 bilinear reads
-float4 blur(O i) : SV_Target {
-    float3 c = src.SampleLevel(ls, i.uv, 0).rgb * 0.227027;
-    c += (src.SampleLevel(ls, i.uv + p1.xy * 1.384615, 0).rgb + src.SampleLevel(ls, i.uv - p1.xy * 1.384615, 0).rgb) * 0.316216;
-    c += (src.SampleLevel(ls, i.uv + p1.xy * 3.230769, 0).rgb + src.SampleLevel(ls, i.uv - p1.xy * 3.230769, 0).rgb) * 0.070270;
-    return float4(c, 1);
-}
-// p0: headroom, bloom strength; scene and glow times the exposure scale, clipped as Chaos Theory's
-float4 tone(O i) : SV_Target {
-    float4 s = src.Load(int3(i.p.xy, 0));
-    float3 c = s.rgb * p0.x + bloom.SampleLevel(ls, i.uv, 0).rgb * p0.y;
-    return float4(saturate(c * expo.Load(int3(0, 0, 0))), s.a);
-}
-)";
-
-// HDR10 output: the frame with the panel over it, its highlights stretched towards the display's peak
-const char* kHdrHlsl = R"(
-cbuffer P : register(b1) { float4 p0; float4 p1; };
-Texture2D frame : register(t0);
-Texture2D ui : register(t1);
-struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
-O vs(uint id : SV_VertexID) {
-    O o;
-    float2 t = float2((id << 1) & 2, id & 2);
-    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
-    o.uv = t;
-    return o;
-}
-static const float3 kLum = float3(0.2126, 0.7152, 0.0722);
-static const float3x3 k709To2020 = {0.6274, 0.3293, 0.0433, 0.0691, 0.9195, 0.0114, 0.0164, 0.0880, 0.8956};
-// gamma 2.2 as SDR monitors show it; sRGB's linear toe lifts the darks
-float3 to_linear(float3 c) {
-    return pow(c, 2.2);
-}
-// inverse Reinhard on luminance so hues keep: the brighter, the more it gains, white reaches most
-float3 expand(float3 c, float most) {
-    return c / (1 - dot(c, kLum) * (1 - 1 / most));
-}
-float3 pq(float3 nits) {
-    float3 y = pow(saturate(nits / 10000), 0.1593017578125);
-    return pow((0.8359375 + 18.8515625 * y) / (1 + 18.6875 * y), 78.84375);
-}
-// p0: SDR white nits, peak nits
-float4 hdr10(O i) : SV_Target {
-    int3 px = int3(i.p.xy, 0);
-    float3 f = min(expand(to_linear(frame.Load(px).rgb), max(p0.y / p0.x, 1)) * p0.x, p0.y);
-    float4 u = ui.Load(px);
-    float3 panel = to_linear(u.a > 0 ? u.rgb / u.a : 0) * p0.x;
-    return float4(pq(mul(k709To2020, lerp(f, panel, u.a))), 1);
-}
-)";
-
-// the output showing monitor mon, false when no adapter has it
-bool FindOutput(IDXGIFactory4* factory, HMONITOR mon, DXGI_OUTPUT_DESC1& desc) {
-    ComPtr<IDXGIAdapter1> adapter;
-    for (UINT a = 0; factory->EnumAdapters1(a, &adapter) != DXGI_ERROR_NOT_FOUND; a++) {
-        ComPtr<IDXGIOutput> output;
-        for (UINT o = 0; adapter->EnumOutputs(o, &output) != DXGI_ERROR_NOT_FOUND; o++) {
-            ComPtr<IDXGIOutput6> output6;
-            if (FAILED(output.As(&output6)) || FAILED(output6->GetDesc1(&desc))) continue;
-            if (desc.Monitor == mon) return true;
-        }
-    }
-    return false;
-}
-
-// Windows' SDR content brightness on monitor mon, in nits
-float SdrWhiteNits(HMONITOR mon) {
-    MONITORINFOEXW info{};
-    info.cbSize = sizeof(info);
-    UINT32 path_count = 0;
-    UINT32 mode_count = 0;
-    if (!GetMonitorInfoW(mon, &info)) return kDefaultPaperNits;
-    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) != ERROR_SUCCESS) {
-        return kDefaultPaperNits;
-    }
-    std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
-    std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
-    LONG queried = QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count, modes.data(),
-                                      nullptr);
-    if (queried != ERROR_SUCCESS) return kDefaultPaperNits;
-    for (UINT32 i = 0; i < path_count; i++) {
-        DISPLAYCONFIG_SOURCE_DEVICE_NAME source{};
-        source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
-        source.header.size = sizeof(source);
-        source.header.adapterId = paths[i].sourceInfo.adapterId;
-        source.header.id = paths[i].sourceInfo.id;
-        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS) continue;
-        if (std::wcscmp(source.viewGdiDeviceName, info.szDevice) != 0) continue;
-        DISPLAYCONFIG_SDR_WHITE_LEVEL white{};
-        white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
-        white.header.size = sizeof(white);
-        white.header.adapterId = paths[i].targetInfo.adapterId;
-        white.header.id = paths[i].targetInfo.id;
-        if (DisplayConfigGetDeviceInfo(&white.header) != ERROR_SUCCESS) break;
-        return float(white.SDRWhiteLevel) * kSdrWhiteUnit;
-    }
-    return kDefaultPaperNits;
-}
-
-const char* kSmaaConfig = R"(
-cbuffer P : register(b1) { float4 metrics; };
-#define SMAA_RT_METRICS metrics
-#define SMAA_CUSTOM_SL
-#define SMAA_THRESHOLD 0.05
-#define SMAA_MAX_SEARCH_STEPS 16
-#define SMAA_MAX_SEARCH_STEPS_DIAG 8
-#define SMAA_CORNER_ROUNDING 25
-SamplerState LinearSampler : register(s0);
-SamplerState PointSampler : register(s1);
-#define SMAATexture2D(tex) Texture2D tex
-#define SMAATexturePass2D(tex) tex
-#define SMAASampleLevelZero(tex, coord) tex.SampleLevel(LinearSampler, coord, 0)
-#define SMAASampleLevelZeroPoint(tex, coord) tex.SampleLevel(PointSampler, coord, 0)
-#define SMAASampleLevelZeroOffset(tex, coord, offset) tex.SampleLevel(LinearSampler, coord, 0, offset)
-#define SMAASample(tex, coord) tex.Sample(LinearSampler, coord)
-#define SMAASamplePoint(tex, coord) tex.Sample(PointSampler, coord)
-#define SMAASampleOffset(tex, coord, offset) tex.Sample(LinearSampler, coord, offset)
-#define SMAAGather(tex, coord) tex.Gather(LinearSampler, coord, 0)
-#define SMAA_FLATTEN [flatten]
-#define SMAA_BRANCH [branch]
-)";
-
-// after kSmaaHlsl: edges from the frame's luma, blend weights from edges, area and search, then the frame blended
-const char* kSmaaPasses = R"(
-Texture2D tex0 : register(t0);
-Texture2D tex1 : register(t1);
-Texture2D tex2 : register(t2);
-struct SmaaEdgeV { float4 p : SV_Position; float2 uv : TEXCOORD0; float4 o[3] : TEXCOORD1; };
-struct SmaaWeightV { float4 p : SV_Position; float2 uv : TEXCOORD0; float2 pix : TEXCOORD1; float4 o[3] : TEXCOORD2; };
-struct SmaaBlendV { float4 p : SV_Position; float2 uv : TEXCOORD0; float4 o : TEXCOORD1; };
-float4 corner(uint id, out float2 uv) {
-    uv = float2((id << 1) & 2, id & 2);
-    return float4(uv * float2(2, -2) + float2(-1, 1), 0, 1);
-}
-SmaaEdgeV vs_edges(uint id : SV_VertexID) {
-    SmaaEdgeV o;
-    o.p = corner(id, o.uv);
-    SMAAEdgeDetectionVS(o.uv, o.o);
-    return o;
-}
-SmaaWeightV vs_weights(uint id : SV_VertexID) {
-    SmaaWeightV o;
-    o.p = corner(id, o.uv);
-    SMAABlendingWeightCalculationVS(o.uv, o.pix, o.o);
-    return o;
-}
-SmaaBlendV vs_blend(uint id : SV_VertexID) {
-    SmaaBlendV o;
-    o.p = corner(id, o.uv);
-    SMAANeighborhoodBlendingVS(o.uv, o.o);
-    return o;
-}
-float4 smaa_edges(SmaaEdgeV i) : SV_Target { return float4(SMAALumaEdgeDetectionPS(i.uv, i.o, tex0), 0, 0); }
-float4 smaa_weights(SmaaWeightV i) : SV_Target { return SMAABlendingWeightCalculationPS(i.uv, i.pix, i.o, tex0, tex1, tex2, 0); }
-float4 smaa_blend(SmaaBlendV i) : SV_Target { return SMAANeighborhoodBlendingPS(i.uv, i.o, tex0, tex1); }
-)";
-
-// from the scene's depth: occlusion pass, then a blur across and one down that multiplies it into the colour
-// stencil bit 0 is the world, the sky is drawn where it is clear and counts as the far plane
-const char* kAoHlsl = R"(
-cbuffer A : register(b1) { float4 proj; float4 zp; float4 vp; float4 opt; float4 fog; };
-#ifdef MS
-Texture2DMS<float> depth : register(t0);
-Texture2DMS<uint2> stencil : register(t2);
-float Raw(int2 p) { return stencil.Load(p, 0).g & 1 ? depth.Load(p, 0) : 1; }
-#else
-Texture2D<float> depth : register(t0);
-Texture2D<uint2> stencil : register(t2);
-float Raw(int2 p) { return stencil.Load(int3(p, 0)).g & 1 ? depth.Load(int3(p, 0)) : 1; }
-#endif
-Texture2D<float2> ao : register(t1);
-float4 vs(uint id : SV_VertexID) : SV_Position { return float4(float2((id << 1) & 2, id & 2) * float2(2, -2) + float2(-1, 1), 0, 1); }
-// view space position of a pixel. proj: 1 / scale xy, centre xy; zp: z = x / (depth - y); vp: viewport in pixels
-float3 View(float2 px) {
-    int2 p = clamp(int2(px), int2(vp.xy), int2(vp.xy + vp.zw) - 1);
-    float z = zp.x / (Raw(p) - zp.y);
-    float2 ndc = (p + 0.5 - vp.xy) / vp.zw * float2(2, -2) + float2(-1, 1);
-    return float3((ndc - proj.zw) * proj.xy * z, z);
-}
-static const float kDither[16] = {0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5};
-// normal from the nearer neighbour each way: no bend over depth edges
-float3 Normal(float2 px, float3 c) {
-    float3 l = View(px - float2(1, 0)), r = View(px + float2(1, 0));
-    float3 u = View(px - float2(0, 1)), d = View(px + float2(0, 1));
-    float3 dx = abs(r.z - c.z) < abs(c.z - l.z) ? r - c : c - l;
-    float3 dy = abs(d.z - c.z) < abs(c.z - u.z) ? d - c : c - u;
-    return normalize(cross(dx, dy));
-}
-// opt: world radius, most pixels it may span; out: occlusion, view z
-float2 occlusion(float4 pos : SV_Position) : SV_Target {
-    float3 c = View(pos.xy);
-    float2 rad = opt.x * 0.5 * vp.zw / (proj.xy * c.z);
-    float span = max(rad.x, rad.y);
-    if (span < 1) return float2(1, c.z);
-    float3 n = Normal(pos.xy, c);
-    float k = min(1, opt.y / span), R = opt.x * k;
-    int2 cell = int2(pos.xy) & 3;
-    float turn = kDither[cell.y * 4 + cell.x] * (6.2831853 / 16), a = 0;
-    for (int i = 0; i < 16; i++) {
-        float f = (i + 0.5) / 16, t = i * 2.3999632 + turn;
-        float3 v = (View(pos.xy + float2(cos(t), sin(t)) * rad * (k * f)) - c) / R;
-        float vv = dot(v, v), w = max(1 - vv, 0);
-        a += w * w * w * max((dot(v, n) - 0.05) / (vv + 0.01), 0);
-    }
-    return float2(max(1 - a * 0.25, 0), c.z);
-}
-static const float kHalfPi = 1.5707963;
-// GTAO (Jimenez 2016) at XeGTAO's high preset: 3 slices, 3 steps a side, squared step spread, falloff over the outer
-// 61.5% of the radius, power 2.2. Per slice the highest horizon each side, the visible arc between integrated against
-// the normal projected into the slice
-float2 gtao(float4 pos : SV_Position) : SV_Target {
-    float3 c = View(pos.xy);
-    float2 rad = opt.x * 0.5 * vp.zw / (proj.xy * c.z);
-    float span = max(rad.x, rad.y);
-    if (span < 1) return float2(1, c.z);
-    float3 n = Normal(pos.xy, c);
-    float3 v = normalize(-c);
-    float k = min(1, opt.y / span), R = opt.x * k;
-    int2 cell = int2(pos.xy) & 3;
-    float slice_noise = kDither[cell.y * 4 + cell.x] / 16;
-    float step_noise = kDither[cell.x * 4 + cell.y] / 16;
-    float vis = 0;
-    for (int s = 0; s < 3; s++) {
-        float phi = (s + slice_noise) * (kHalfPi * 2 / 3);
-        float3 dir = float3(cos(phi), sin(phi), 0);
-        // in pixels; screen y runs down, view y up
-        float2 omega = float2(dir.x, -dir.y) * rad * k;
-        float3 ortho = dir - dot(dir, v) * v;
-        float3 axis = normalize(cross(ortho, v));
-        float3 pn = n - axis * dot(n, axis);
-        float pn_len = max(length(pn), 1e-4);
-        float cos_n = saturate(dot(pn, v) / pn_len);
-        float an = sign(dot(ortho, pn)) * acos(cos_n);
-        // x: the +omega side, y: the -omega side; lowest is flat along the slice's tangent
-        float2 low = float2(cos(an + kHalfPi), cos(an - kHalfPi));
-        float2 hc = low;
-        for (int j = 0; j < 3; j++) {
-            float f = (j + step_noise) / 3;
-            // at least 1.3 pixels out, off the centre pixel
-            float2 off = omega * (f * f + 1.3 / length(omega));
-            float3 d0 = View(pos.xy + off) - c;
-            float3 d1 = View(pos.xy - off) - c;
-            float2 len = max(float2(length(d0), length(d1)), 1e-4);
-            float2 w = saturate((R - len) / (R * 0.615));
-            float2 sc = float2(dot(d0, v), dot(d1, v)) / len;
-            hc = max(hc, lerp(low, sc, w));
-        }
-        float h0 = an + clamp(-acos(hc.y) - an, -kHalfPi, kHalfPi);
-        float h1 = an + clamp(acos(hc.x) - an, -kHalfPi, kHalfPi);
-        float sin_n = sin(an);
-        float arc0 = (cos_n + 2 * h0 * sin_n - cos(2 * h0 - an)) / 4;
-        float arc1 = (cos_n + 2 * h1 * sin_n - cos(2 * h1 - an)) / 4;
-        vis += pn_len * (arc0 + arc1);
-    }
-    return float2(pow(saturate(vis / 3), 2.2), c.z);
-}
-// opt.zw: step; 5 taps average the 4 pixel dither, depth edges left out
-float Smooth(float2 pos, out float z) {
-    int2 p = int2(pos), lo = int2(vp.xy), hi = int2(vp.xy + vp.zw) - 1;
-    z = ao.Load(int3(p, 0)).y;
-    float sum = 0, n = 0;
-    for (int i = -2; i <= 2; i++) {
-        float2 s = ao.Load(int3(clamp(p + i * int2(opt.zw), lo, hi), 0));
-        float w = (abs(i) == 2 ? 0.5 : 1) * saturate(2 - abs(s.y - z) / (z * 0.02));
-        sum += s.x * w;
-        n += w;
-    }
-    return sum / n;
-}
-float2 occlusion_blur(float4 pos : SV_Position) : SV_Target {
-    float z, a = Smooth(pos.xy, z);
-    return float2(a, z);
-}
-// fog: the game's, already blended over the scene, fades the occlusion out as it thickens
-float4 occlusion_apply(float4 pos : SV_Position) : SV_Target {
-    float z, a = Smooth(pos.xy, z);
-    float fogged = fog.z * saturate(fog.x * z + fog.y);
-    return float4(lerp(a, 1, fogged).xxx, 1);
-}
-)";
-
-float Bits(uint32_t v) {
-    float f;
-    std::memcpy(&f, &v, 4);
-    return f;
-}
-
-void Color(uint32_t argb, float* o) {
-    o[0] = ((argb >> 16) & 255) / 255.0f;
-    o[1] = ((argb >> 8) & 255) / 255.0f;
-    o[2] = (argb & 255) / 255.0f;
-    o[3] = (argb >> 24) / 255.0f;
-}
-
-constexpr uint32_t kBlendDestColor = 0x306;  // D3DBLEND_DESTCOLOR
-
 D3D12_BLEND Blend(uint32_t v, bool alpha) {
     switch (v) {
         case 0: return D3D12_BLEND_ZERO;
@@ -478,10 +98,7 @@ D3D12_BLEND_OP BlendOp(uint32_t v) {
     }
 }
 
-D3D12_COMPARISON_FUNC Cmp(uint32_t v) {
-    uint32_t n = v >= 0x200 && v <= 0x207 ? v - 0x200 : 7;
-    return D3D12_COMPARISON_FUNC(n + 1);
-}
+D3D12_COMPARISON_FUNC Cmp(uint32_t v) { return D3D12_COMPARISON_FUNC(CmpFunc(v)); }
 
 D3D12_STENCIL_OP StencilOp(uint32_t v) {
     switch (v) {
@@ -504,25 +121,6 @@ D3D12_TEXTURE_ADDRESS_MODE Address(uint32_t v) {
         default: return D3D12_TEXTURE_ADDRESS_MODE_WRAP;
     }
 }
-
-DXGI_FORMAT HostFormat(Host h) {
-    switch (h) {
-        case Host::BC1: return DXGI_FORMAT_BC1_UNORM;
-        case Host::BC2: return DXGI_FORMAT_BC2_UNORM;
-        case Host::BC3: return DXGI_FORMAT_BC3_UNORM;
-        case Host::R32F: return DXGI_FORMAT_R32_FLOAT;
-        default: return DXGI_FORMAT_B8G8R8A8_UNORM;
-    }
-}
-
-constexpr uint32_t kFmtD16 = 0x2C;     // D3DFMT_D16
-constexpr uint32_t kFmtLinD16 = 0x30;  // D3DFMT_LIN_D16
-
-// TexInfo::shadow of a depth texture
-uint8_t ShadowDepthKind(uint32_t format) { return format == kFmtD16 || format == kFmtLinD16 ? 2 : 1; }
-
-// bytes per row of a 32 bit surface in guest memory, rounded to 64
-uint32_t GuestPitch(uint32_t width) { return (width * 4 + 63) & ~63u; }
 
 // rows of a texture upload start D3D12_TEXTURE_DATA_PITCH_ALIGNMENT apart
 uint32_t UploadPitch(uint32_t row_bytes) { return (row_bytes + 255) & ~255u; }
@@ -552,68 +150,14 @@ D3D12_RESOURCE_DESC Texture2DDesc(DXGI_FORMAT fmt, uint64_t w, uint32_t h) {
     return td;
 }
 
-struct Target {
+struct Target : TargetBase {
     ComPtr<ID3D12Resource> res;
-    bool depth = false;
-    uint32_t gw = 0;
-    uint32_t gh = 0;
-    uint32_t w = 0;
-    uint32_t h = 0;
     uint32_t view = 0;
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
-    uint32_t data = 0;
-    uint32_t bytes = 0;
-    uint64_t epoch = 0;  // last lock seen
-    uint64_t sig = 0;    // guest memory as last matched
-    bool drawn = false;           // the GPU wrote it since the last readback
-    std::vector<uint8_t> read;    // what Sync left in guest memory
     // single sample copy draws read: of the target being drawn to, or a multisampled one resolved
     ComPtr<ID3D12Resource> fb;
     D3D12_RESOURCE_STATES fb_state = D3D12_RESOURCE_STATE_COPY_DEST;
-    uint32_t samples = 1;         // above 1 on the back buffer sized targets under MSAA
-    DXGI_FORMAT fmt = kBgra;
-    bool hdr = false;              // colour held over kHeadroom until resolved
-    uint64_t hdr_frame = ~0ull;    // the present count it last went HDR, once a frame
 };
-
-// MemSig hashes a surface up to kSigWholeMax bytes whole, a bigger one as evenly spaced samples
-constexpr uint32_t kSigWholeMax = 65536;
-constexpr uint32_t kSigSamples = 64;
-constexpr uint32_t kSigSampleBytes = 64;
-
-uint64_t MemSig(uint32_t data, uint32_t total) {
-    const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(data));
-    uint64_t sig = Hash(&total, sizeof(total));
-    if (total <= kSigWholeMax) return Hash(p, total, sig);
-    for (uint32_t i = 0; i < kSigSamples; i++) {
-        const uint8_t* sample = p + uint64_t(total - kSigSampleBytes) * i / (kSigSamples - 1);
-        sig = Hash(sample, kSigSampleBytes, sig);
-    }
-    return sig;
-}
-
-// MemSig samples a big surface and misses small writes (XFONT text): after a Sync every byte is compared
-bool Changed(const Target& t) {
-    if (t.drawn || t.read.empty()) return false;
-    uint32_t row = t.gw * 4;
-    uint32_t pitch = GuestPitch(t.gw);
-    const uint8_t* p = static_cast<const uint8_t*>(kernel::HostPtr(t.data));
-    for (uint32_t y = 0; y < t.gh; y++) {
-        if (std::memcmp(p + size_t(y) * pitch, &t.read[size_t(y) * row], row)) return true;
-    }
-    return false;
-}
-
-// a lock alone proves nothing, reads lock too: only changed bytes mean the CPU wrote it
-bool LatchCpuWrite(Target& t) {
-    uint64_t e = DirtyEpoch(t.data);
-    if (e <= t.epoch) return false;
-    t.epoch = e;
-    uint64_t sig = MemSig(t.data, t.bytes);
-    if (sig == t.sig && !Changed(t)) return false;
-    t.sig = sig;
-    return true;
-}
 
 struct Tex {
     ComPtr<ID3D12Resource> res;
@@ -628,40 +172,6 @@ struct Tex {
     uint32_t pack_gen = 0;      // texturedumper::Generation the key was taken at, 0 after new bytes
 };
 
-struct PsoKey {
-    uint64_t vs;
-    uint64_t ps;
-    uint32_t regs;
-    uint32_t topo;
-    uint32_t has_rt;
-    uint32_t has_ds;
-    uint32_t elements[16];  // per register: DXGI format, buffer << 8, offset << 16
-    uint32_t blend;
-    uint32_t src;
-    uint32_t dst;
-    uint32_t op;
-    uint32_t wmask;
-    uint32_t zen;
-    uint32_t zwrite;
-    uint32_t zfunc;
-    uint32_t sten;
-    uint32_t sfunc;
-    uint32_t smask;
-    uint32_t swmask;
-    uint32_t sfail;
-    uint32_t szfail;
-    uint32_t spass;
-    uint32_t cull;
-    uint32_t ccw;
-    uint32_t fill;
-    int32_t zbias;
-    float zslope;
-    uint32_t rtfmt;
-    // sample count, 0 without: the bytes the key's padding held, so pipelines cached before it still match
-    uint32_t msaa;
-};
-static_assert(sizeof(PsoKey) == 184);
-
 // a pipeline as the key file keeps it: the key and its shaders' source checks, which find their bytecode on disk
 struct WarmKey {
     PsoKey key;
@@ -669,18 +179,6 @@ struct WarmKey {
     uint64_t ps_check;
 };
 static_assert(sizeof(WarmKey) == 200);
-
-// Blit's settings past the source and its rectangle
-struct BlitOptions {
-    bool gamma = false;       // through the gamma lookup
-    bool alpha = false;       // the source's alpha, else 1
-    uint32_t taps = 1;        // n x n box filter per pixel
-    float mul = 1;            // colour scale
-    DXGI_FORMAT rtv = kBgra;  // the target's format
-    bool over = false;        // premultiplied over the target, which keeps its alpha
-    uint32_t samples = 1;     // the target's sample count
-    const float* colour = nullptr;  // 3x3 colour matrix by rows, nullptr leaves colours alone
-};
 
 // a full screen pass's target
 struct PostTarget {
@@ -697,13 +195,6 @@ struct PostInputs {
     DXGI_FORMAT fmt[3];
 };
 
-// DrawPostPass's settings past its target, inputs and constants
-struct PostOptions {
-    float blend = -1;  // blend factor over the target, below 0 the pass overwrites it
-    const char* hlsl = kPostHlsl;
-    const char* vs_entry = "vs";
-};
-
 // Shrink's settings past the source and the size
 struct ShrinkOptions {
     uint32_t taps = 1;
@@ -714,30 +205,9 @@ struct ShrinkOptions {
 };
 
 // a draw's four texture stages: BindStageTexturesAndTargets fills them, the constants, views and samplers read them
-struct DrawTextures {
-    TexInfo info[4];
+struct DrawTextures : StageInfo {
     D3D12_SHADER_RESOURCE_VIEW_DESC sv[4];
     ID3D12Resource* res[4];
-    bool rt[4] = {};     // stage samples a render target
-    float wide[4] = {};  // host texels per console texel of a target read into a smaller one, 0 otherwise
-};
-
-// a draw's shaders: what they are made from, their cache keys and the hashes Register returned
-struct DrawShaders {
-    bool prog = false;  // a vertex program, else the fixed function pipeline
-    bool quad = false;
-    bool fixed_transform = false;  // fixed function on untransformed vertices: the shader reads matrices and lights
-    FixedKey fk;
-    uint64_t vkey = 0;
-    uint64_t vh = 0;
-    uint64_t pkey = 0;
-    uint64_t ph = 0;
-};
-
-// the render target's console size in pixels, or the depth buffer's without one
-struct GuestSize {
-    uint32_t w;
-    uint32_t h;
 };
 
 class D3D12Backend final : public Backend {
@@ -821,13 +291,6 @@ private:
     float UpdateExposureBlend(float adaptation_time);
     void DrawBloom(const PostInputs& in, const Target& t, uint32_t bw, uint32_t bh);
     // Smaa, then its steps in call order, each callee right after its caller
-    struct SmaaLookup {
-        DXGI_FORMAT fmt;
-        uint32_t w;
-        uint32_t h;
-        uint32_t bpp;  // bytes per texel
-        const uint8_t* data;
-    };
     ID3D12Resource* Smaa(ID3D12Resource* src, DXGI_FORMAT fmt, uint32_t w, uint32_t h);
     bool EnsureSmaaLookups();
     bool CreateLookupTexture(ComPtr<ID3D12Resource>& r, const SmaaLookup& l);
@@ -903,7 +366,6 @@ private:
     void CreatePackTexture(Tex& r, const texturedumper::Image& img);
     uint64_t EnsurePixelShader(const PixelKey& pk, uint64_t pkey);
     void BuildPipelineKey(const State& s, const Assembled& a, uint64_t vh, uint64_t ph, PsoKey& k);
-    void KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k);
     ID3D12PipelineState* EnsurePipeline(const PsoKey& k, bool wait = false);
     void TakeBuilt();
     void DeliverBuilt(uint64_t h, ComPtr<ID3D12PipelineState> pso);
@@ -915,9 +377,6 @@ private:
     void FillPipelineDesc(const PsoKey& k, ID3DBlob* vs, ID3DBlob* ps, D3D12_GRAPHICS_PIPELINE_STATE_DESC& d) const;
     void UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
                          GuestSize size, DrawConstants& c);
-    void FillHdrConstants(const PsoKey& k, DrawConstants& c);
-    void FillTextureConstants(const State& s, const DrawTextures& stages, DrawConstants& c);
-    void FillTexelConstants(int i, const TextureDesc& d, const DrawTextures& stages, DrawConstants& c);
     void CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
                      const DrawTextures& stages);
     void CaptureTextures(const State& s, const DrawTextures& stages);
@@ -931,11 +390,6 @@ private:
     void SetBlendFactorStencilRef(const State& s);
     void DrawGeometry(const Assembled& a);
     void UploadVertexBuffers(const Assembled& a);
-    // shaders by source hash: Register keeps the source, EnsureShaderCode finds the bytecode on disk or compiles it;
-    // with compile false it only looks, and sets pending where the compiler is needed
-    uint64_t Register(std::string src, const char* entry, const char* profile);
-    ID3DBlob* EnsureShaderCode(uint64_t hash, bool compile, bool& pending);
-    ID3DBlob* Compile(const std::string& src, const char* entry, const char* profile);
     ID3D12PipelineState* EnsureBlitPipeline(DXGI_FORMAT rtv, bool over, uint32_t samples);
     D3D12_GRAPHICS_PIPELINE_STATE_DESC FullScreenPipelineDesc(ID3DBlob* vs, ID3DBlob* ps, DXGI_FORMAT rtv,
                                                               uint32_t samples) const;
@@ -1057,17 +511,7 @@ private:
     std::vector<uint32_t> free_rtv_;
     std::vector<uint32_t> free_dsv_;
     ComPtr<ID3D12RootSignature> root_;
-    struct Source {
-        std::string text;
-        std::string entry;
-        std::string profile;
-        ComPtr<ID3DBlob> code;
-        uint64_t check = 0;  // the second source hash the disk cache keeps
-        uint8_t state = 0;   // 0 source only, 1 compiling, 2 done (no code: it failed)
-    };
-    std::unordered_map<uint64_t, Source> shaders_;  // build threads too, under shader_lock_
-    std::mutex shader_lock_;
-    std::condition_variable shader_done_;
+    ShaderStore shaders_;
     std::unordered_map<uint64_t, uint64_t> shader_src_;  // vertex and pixel program keys to source hash
     std::unordered_map<uint64_t, ComPtr<ID3D12PipelineState>> psos_;
     // async shaders: a pipeline that needs a compiler is built on the build threads, its draws skipped until it is back
@@ -1516,15 +960,6 @@ bool D3D12Backend::CreateTargetView(Target& t) {
     return true;
 }
 
-// targets_ key of a surface's colour or depth target
-uint64_t TargetKey(uint32_t data, bool depth) { return uint64_t(data) << 1 | (depth ? 1 : 0); }
-
-// the shadow map's depth surface, or with depth false its colour surface
-bool IsShadowSurface(const Surface& s, bool depth) {
-    const ShadowTargets& sh = g_shadow;
-    return sh.blur_hi && s.data == (depth ? sh.map : sh.color);
-}
-
 D3D12Backend::TargetSlot D3D12Backend::FindTargetSlot(const Surface& s, bool depth) {
     TargetSlot slot;
     slot.data = mem::VirtualFromPhysical(s.data);
@@ -1607,24 +1042,6 @@ bool D3D12Backend::BindTargets(const State& s) {
         bound_ds_ = ds;
     }
     return true;
-}
-
-// the pixels the CPU changed since the last Sync, opaque, the rest 0; t.read takes them
-std::vector<uint8_t> LatchCpuChanges(Target& t) {
-    std::vector<uint8_t> px(t.read.size(), 0);
-    uint32_t guest_pitch = GuestPitch(t.gw);
-    const uint8_t* guest = static_cast<const uint8_t*>(kernel::HostPtr(t.data));
-    for (uint32_t y = 0; y < t.gh; y++) {
-        for (uint32_t x = 0; x < t.gw; x++) {
-            const uint8_t* c = guest + size_t(y) * guest_pitch + x * 4;
-            size_t i = (size_t(y) * t.gw + x) * 4;
-            if (!std::memcmp(c, &t.read[i], 4)) continue;
-            std::memcpy(&t.read[i], c, 4);
-            std::memcpy(&px[i], c, 3);
-            px[i + 3] = 255;
-        }
-    }
-    return px;
 }
 
 // BGRA pixels into a new w x h texture, left as a shader resource
@@ -1739,79 +1156,6 @@ void D3D12Backend::Blit(ID3D12Resource* src, DXGI_FORMAT fmt, const float uvrect
     DrawFullScreen(EnsureBlitPipeline(o.rtv, o.over, o.samples), cb.gpu, slot, si);
 }
 
-constexpr uint64_t kSourceCheck = 0x5CDA0002C0FFEE11ull;  // seed of the second source hash the disk cache keeps
-
-ComPtr<ID3DBlob> CompileHlsl(const std::string& src, const std::string& entry, const std::string& profile,
-                             uint64_t hash) {
-    ComPtr<ID3DBlob> code;
-    ComPtr<ID3DBlob> err;
-    HRESULT hr = D3DCompile(src.data(), src.size(), nullptr, nullptr, nullptr, entry.c_str(), profile.c_str(),
-                            D3DCOMPILE_OPTIMIZATION_LEVEL1, 0, &code, &err);
-    if (FAILED(hr)) {
-        LOGE("d3d12: %s compile failed: %s", profile.c_str(),
-             err ? static_cast<const char*>(err->GetBufferPointer()) : "?");
-        LOGE("%s", src.c_str());
-        return nullptr;
-    }
-    cache::AddShader(hash, Hash(src.data(), src.size(), kSourceCheck), code.Get());
-    return code;
-}
-
-uint64_t D3D12Backend::Register(std::string src, const char* entry, const char* profile) {
-    // one source can hold several entry points
-    uint64_t profile_seed = Hash(profile, std::strlen(profile));
-    uint64_t entry_seed = Hash(entry, std::strlen(entry), profile_seed);
-    uint64_t hash = Hash(src.data(), src.size(), entry_seed);
-    std::lock_guard lock(shader_lock_);
-    auto [it, fresh] = shaders_.try_emplace(hash);
-    if (fresh) {
-        it->second.check = Hash(src.data(), src.size(), kSourceCheck);
-        it->second.text = std::move(src);
-        it->second.entry = entry;
-        it->second.profile = profile;
-    }
-    return hash;
-}
-
-ID3DBlob* D3D12Backend::EnsureShaderCode(uint64_t hash, bool compile, bool& pending) {
-    std::unique_lock lock(shader_lock_);
-    Source& s = shaders_[hash];
-    if (s.state == 0) {
-        s.code = cache::FindShader(hash, s.check);
-        if (s.code) {
-            s.state = 2;
-            s.text = {};
-        }
-    }
-    while (s.state == 1) {
-        if (!compile) {
-            pending = true;
-            return nullptr;
-        }
-        shader_done_.wait(lock);
-    }
-    if (s.state == 2) return s.code.Get();
-    if (!compile) {
-        pending = true;
-        return nullptr;
-    }
-    s.state = 1;
-    std::string text = std::move(s.text);
-    lock.unlock();
-    ComPtr<ID3DBlob> code = CompileHlsl(text, s.entry, s.profile, hash);
-    lock.lock();
-    s.code = std::move(code);
-    s.state = 2;
-    shader_done_.notify_all();
-    return s.code.Get();
-}
-
-ID3DBlob* D3D12Backend::Compile(const std::string& src, const char* entry, const char* profile) {
-    uint64_t hash = Register(src, entry, profile);
-    bool pending = false;
-    return EnsureShaderCode(hash, true, pending);
-}
-
 // a full screen pass's pipeline: solid, no culling, one target, writing all channels; callers set the blend
 D3D12_GRAPHICS_PIPELINE_STATE_DESC D3D12Backend::FullScreenPipelineDesc(ID3DBlob* vs, ID3DBlob* ps, DXGI_FORMAT rtv,
                                                                         uint32_t samples) const {
@@ -1835,8 +1179,8 @@ ID3D12PipelineState* D3D12Backend::EnsureBlitPipeline(DXGI_FORMAT rtv, bool over
     uint64_t key = uint64_t(rtv) | uint64_t(over) << 32 | uint64_t(samples) << 40;
     auto& pso = blit_psos_[key];
     if (pso) return pso.Get();
-    ID3DBlob* vs = Compile(kBlitHlsl, "vs", "vs_5_0");
-    ID3DBlob* ps = Compile(kBlitHlsl, "psmain", "ps_5_0");
+    ID3DBlob* vs = shaders_.Compile(kBlitHlsl, "vs", "vs_5_0");
+    ID3DBlob* ps = shaders_.Compile(kBlitHlsl, "psmain", "ps_5_0");
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, rtv, samples);
     if (over) {
         auto& blend = d.BlendState.RenderTarget[0];
@@ -1859,8 +1203,8 @@ ID3D12PipelineState* D3D12Backend::EnsurePostPipeline(const char* entry, const P
     uint64_t key = Hash(entry, std::strlen(entry), seed);
     auto& pso = blit_psos_[key];
     if (pso) return pso.Get();
-    ID3DBlob* vs = Compile(o.hlsl, o.vs_entry, "vs_5_0");
-    ID3DBlob* ps = Compile(o.hlsl, entry, "ps_5_0");
+    ID3DBlob* vs = shaders_.Compile(o.hlsl, o.vs_entry, "vs_5_0");
+    ID3DBlob* ps = shaders_.Compile(o.hlsl, entry, "ps_5_0");
     if (!vs || !ps) return nullptr;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, out.fmt, out.samples);
     if (o.blend >= 0) {
@@ -1945,40 +1289,6 @@ void D3D12Backend::EnterHdr(Target& t) {
     float uv[4] = {0, 0, 1, 1};
     Blit(fb, t.fmt, uv, {.alpha = true, .mul = 1 / kHeadroom, .rtv = t.fmt, .samples = t.samples});
     t.hdr = true;
-}
-
-// HDR resolve: bloom at a quarter of the target, exposure adapting as Chaos Theory's tone mapping
-constexpr uint32_t kBloomShrink = 4;
-constexpr DXGI_FORMAT kBloomFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
-constexpr DXGI_FORMAT kExposureFormat = DXGI_FORMAT_R16_FLOAT;
-constexpr float kBloomStrength = 0.6f;
-
-// a level's Tonemapping settings, glow start out of 255
-struct ToneMapPreset {
-    float adaptation_time;
-    float glow_strength;
-    float glow_start;
-    float dark_scale;
-    float normal_scale;
-    float bright_scale;
-    float dark_end;
-    float normal_start;
-    float normal_end;
-    float bright_start;
-    float brightness_max;
-    float brightness_min;
-    float initial_scale;
-};
-// Double Agent's levels: Tonemapping and Tonemapping_NV
-constexpr ToneMapPreset kToneMap = {0.75f, 256, 16, 1.5f, 1.0f, 0.5f, 0.05f, 0.2f, 0.6f, 1.2f, 16, 0.01f, 1.5f};
-constexpr ToneMapPreset kToneMapNv = {0.8f, 256, 16, 1.0f, 0.6f, 0.4f, 0.0f, 0.05f, 0.2f, 0.35f, 16, 0.01f, 2.4f};
-// tone mapping off: every scale 1
-constexpr ToneMapPreset kNoToneMap = {0.75f, 256, 16, 1, 1, 1, 0.05f, 0.2f, 0.6f, 1.2f, 16, 0.01f, 1};
-
-// the preset tone mapping follows this frame
-const ToneMapPreset& CurrentToneMap(bool tone) {
-    if (!tone) return kNoToneMap;
-    return g_night_vision ? kToneMapNv : kToneMap;
 }
 
 D3D12_CPU_DESCRIPTOR_HANDLE D3D12Backend::PostRtv(uint32_t i) {
@@ -2081,10 +1391,6 @@ void D3D12Backend::Resolve(Target& t) {
     DrawPostPass("tone", {Cpu(rtv_heap_.Get(), t.view, rtv_inc_), t.fmt, t.w, t.h, t.samples}, in, pt);
 }
 
-// SMAA's own targets: edges, then blend weights, then the blended frame in the frame's format
-constexpr DXGI_FORMAT kSmaaEdgeFormat = DXGI_FORMAT_R8G8_UNORM;
-constexpr DXGI_FORMAT kSmaaWeightFormat = DXGI_FORMAT_R8G8B8A8_UNORM;
-
 // a lookup texture filled from l's data, left in the pixel shader resource state
 bool D3D12Backend::CreateLookupTexture(ComPtr<ID3D12Resource>& r, const SmaaLookup& l) {
     D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
@@ -2176,127 +1482,6 @@ ID3D12Resource* D3D12Backend::Smaa(ID3D12Resource* src, DXGI_FORMAT fmt, uint32_
     if (!DrawSmaaPasses(src, fmt, w, h, hlsl.c_str())) return nullptr;
     return smaa_[2].Get();
 }
-
-// ambient occlusion's target format, and the formats its passes read at t0 to t3: depth, the pass before, stencil,
-// then a fourth slot no pass reads
-constexpr DXGI_FORMAT kAoFormat = DXGI_FORMAT_R16G16_FLOAT;
-constexpr DXGI_FORMAT kAoViewFormats[4] = {DXGI_FORMAT_R24_UNORM_X8_TYPELESS, kAoFormat,
-                                           DXGI_FORMAT_X24_TYPELESS_G8_UINT, kBgra};
-constexpr float kAoMaxSpan = 0.15f;  // most pixels the radius may span, as a share of the viewport height
-constexpr float kAoRadius = 80.0f;   // world units, the engine's are cm
-
-// the viewport in the target's pixels, clamped to it
-D3D12_RECT ScaledViewportRect(const Viewport& v, const Target& rt) {
-    float sc = float(rt.w) / rt.gw;
-    return {std::clamp<LONG>(LONG(v.x * sc), 0, rt.w), std::clamp<LONG>(LONG(v.y * sc), 0, rt.h),
-            std::clamp<LONG>(LONG((v.x + v.w) * sc), 0, rt.w), std::clamp<LONG>(LONG((v.y + v.h) * sc), 0, rt.h)};
-}
-
-// Chaos Theory's shader model 3 soft shadows, over the shadow the scene's alpha holds: a 256x256 copy of view depth
-// and shadow, a 128x128 mask of the penumbra, the masked pixels filtered by a depth aware disk of 8 taps, then the
-// result written back over the alpha. The tuning is a Chaos Theory level's SM3Shadows. Both grow with the render
-// scale while every footprint stays in Chaos Theory's 256x256 texels, so the softness stays the same
-const char* kSoftShadowHlsl = R"(
-cbuffer F : register(b1) { float4 zp; float4 vp; float4 sz; };
-#ifdef MS
-Texture2DMS<float> depth : register(t0);
-float RawDepth(int2 p) { return depth.Load(p, 0); }
-#else
-Texture2D<float> depth : register(t0);
-float RawDepth(int2 p) { return depth.Load(int3(p, 0)); }
-#endif
-Texture2D scene : register(t1);    // or for the last pass the filtered shadow
-Texture2D small : register(t2);    // 256x256: view depth over kDepthRadius, shadow
-Texture2D quarter : register(t3);  // 128x128: shadow, or the penumbra mask
-SamplerState bilinear : register(s0);
-static const float kDepthRadius = 0.02;
-static const float kDiskRadius = 3.2;  // 256x256 texels
-static const float kDiskDepthScale = 0.6;
-static const float kDiskDepthBias = -0.4;
-static const float kBlendDepthScale = 1.2;
-static const float kBlendDepthBias = -0.3;
-static const float kNearOffset = 0.1;
-static const float kCentreWeight = 0.001;
-static const float kPenumbraLow = 0.000784;
-static const float kPenumbraHigh = 0.99922;
-static const float2 kDisk[8] = {{0, 0}, {0.527837, -0.085868}, {-0.040088, 0.536087}, {-0.670445, -0.179949},
-                                {-0.419418, -0.616039}, {0.440453, -0.639399}, {-0.757088, 0.349334},
-                                {0.574619, 0.685879}};
-static const float2 kCorners[4] = {{-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
-static const float kDiskWeight[8] = {1, 0.7140148, 0.7110037, 0.5181218, 0.4445845, 0.3971701, 0.3047835, 0.1993830};
-float4 vs(uint id : SV_VertexID) : SV_Position { return float4(float2((id << 1) & 2, id & 2) * float2(2, -2) + float2(-1, 1), 0, 1); }
-// zp: view z = zp.x / (depth - zp.y); vp: the scene's viewport in pixels; sz: the copy's and the mask's size
-int2 Inside(int2 p) { return clamp(p, int2(vp.xy), int2(vp.xy + vp.zw) - 1); }
-// view z from 0.1 to 1000 units as 0..1, clamped as Chaos Theory's 8 bit copy held it
-float ViewDepth(int2 p) {
-    float z = zp.x / (RawDepth(Inside(p)) - zp.y);
-    return saturate(z * 0.0010001 - 0.00010001);
-}
-float2 DepthShadow(int2 p) { return float2(ViewDepth(p), scene.Load(int3(Inside(p), 0)).a); }
-// depth and shadow between pixel centres
-float2 Bilinear(float2 at) {
-    float2 f = at - 0.5;
-    int2 i = int2(floor(f));
-    float2 t = f - i;
-    float2 top = lerp(DepthShadow(i), DepthShadow(i + int2(1, 0)), t.x);
-    float2 bottom = lerp(DepthShadow(i + int2(0, 1)), DepthShadow(i + int2(1, 1)), t.x);
-    return lerp(top, bottom, t.y);
-}
-// the copy: four bilinear reads off each diagonal, a pixel apart at 640x480
-float4 shadow_small(float4 pos : SV_Position) : SV_Target {
-    float2 at = vp.xy + pos.xy / sz.x * vp.zw;
-    float2 tap = 0.4 / 256 * vp.zw;
-    float2 sum = 0;
-    [unroll] for (int i = 0; i < 4; i++) sum += Bilinear(at + kCorners[i] * tap);
-    float2 mean = sum * 0.25;
-    return float4(mean.x / kDepthRadius, mean.y, 0, 0);
-}
-// the mask's shadow: 2x2 texels of a 256x256 copy
-float4 shadow_quarter(float4 pos : SV_Position) : SV_Target {
-    float s = 0;
-    [unroll] for (int i = 0; i < 4; i++) s += small.SampleLevel(bilinear, pos.xy / sz.y + kCorners[i] * 0.5 / 256, 0).y;
-    return s * 0.25;
-}
-// the mask: 1 where the 3x3 tent of 128x128 texels around the pixel is partly in shadow
-float4 shadow_penumbra(float4 pos : SV_Position) : SV_Target {
-    float s = 0;
-    [unroll] for (int i = 0; i < 4; i++) s += quarter.SampleLevel(bilinear, pos.xy / sz.y + kCorners[i] * 0.5 / 128, 0).x;
-    s *= 0.25;
-    return s >= kPenumbraLow && s < kPenumbraHigh ? 1 : 0;
-}
-// the penumbra: the disk scaled and blended in by nearness, each tap weighed down by its depth difference
-float4 shadow_filter(float4 pos : SV_Position) : SV_Target {
-    int2 p = int2(pos.xy);
-    float2 uv = (pos.xy - vp.xy) / vp.zw;
-    float lit = scene.Load(int3(p, 0)).a;
-    int2 cell = min(int2(uv * sz.y), int(sz.y) - 1);
-    if (quarter.Load(int3(cell, 0)).x <= 0.5) return lit * small.SampleLevel(bilinear, uv, 0).y;
-    float d = ViewDepth(p);
-    float nearness = 1 / (d + kNearOffset);
-    float radius = saturate(nearness * kDiskDepthScale + kDiskDepthBias) * kDiskRadius / 256;
-    float blend = saturate(nearness * kBlendDepthScale + kBlendDepthBias);
-    float own = d / kDepthRadius;
-    float sum = lit * kCentreWeight;
-    float weights = kCentreWeight;
-    [unroll] for (int i = 0; i < 8; i++) {
-        float2 tap = small.SampleLevel(bilinear, uv + kDisk[i] * radius, 0).xy;
-        float apart = tap.x - own;
-        float w = saturate(kDiskWeight[i] - apart * apart);
-        sum += tap.y * w;
-        weights += w;
-    }
-    return lerp(lit, sum / weights, blend);
-}
-float4 shadow_apply(float4 pos : SV_Position) : SV_Target { return float4(0, 0, 0, scene.Load(int3(pos.xy, 0)).x); }
-)";
-
-// the soft shadow targets, in SoftShadowTarget order: the copy and the mask times the render scale, rounded, then the
-// filtered one at the scene's size
-constexpr uint32_t kSoftSmallSize = 256;
-constexpr uint32_t kSoftQuarterSize = 128;
-constexpr DXGI_FORMAT kDepthViewFormat = DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
-constexpr DXGI_FORMAT kSoftShadowFormats[kSoftShadowTargets] = {DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_R16_FLOAT,
-                                                                DXGI_FORMAT_R16_FLOAT, DXGI_FORMAT_R16_FLOAT};
 
 // p: view z = p[0] / (ndc depth - p[1])
 void D3D12Backend::FilterShadows(const State& s, const float p[kShadowFilterParams]) {
@@ -2404,8 +1589,8 @@ ID3D12PipelineState* D3D12Backend::EnsureSoftShadowPipeline(const SoftShadowPass
     auto& pso = blit_psos_[key];
     if (pso) return pso.Get();
     std::string text = std::string(ms ? "#define MS 1\n" : "") + kSoftShadowHlsl;
-    ID3DBlob* vs = Compile(text, "vs", "vs_5_0");
-    ID3DBlob* ps = Compile(text, pass.entry, "ps_5_0");
+    ID3DBlob* vs = shaders_.Compile(text, "vs", "vs_5_0");
+    ID3DBlob* ps = shaders_.Compile(text, pass.entry, "ps_5_0");
     if (!vs || !ps) return nullptr;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, pass.out, pass.samples);
     // onto the scene: its colour stays
@@ -2469,8 +1654,8 @@ ID3D12PipelineState* D3D12Backend::EnsureAoPipeline(const AoPass& pass, bool ms)
     auto& pso = blit_psos_[key];
     if (pso) return pso.Get();
     std::string text = std::string(ms ? "#define MS 1\n" : "") + kAoHlsl;
-    ID3DBlob* vs = Compile(text, "vs", "vs_5_0");
-    ID3DBlob* ps = Compile(text, pass.entry, "ps_5_0");
+    ID3DBlob* vs = shaders_.Compile(text, "vs", "vs_5_0");
+    ID3DBlob* ps = shaders_.Compile(text, pass.entry, "ps_5_0");
     if (!vs || !ps) return nullptr;
     D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, pass.out, pass.samples);
     if (pass.multiply) {
@@ -2585,11 +1770,8 @@ void D3D12Backend::DeliverBuilt(uint64_t h, ComPtr<ID3D12PipelineState> pso) {
 
 void D3D12Backend::RememberPipeline(const PsoKey& k) {
     WarmKey w{k, 0, 0};
-    {
-        std::lock_guard lock(shader_lock_);
-        w.vs_check = shaders_[k.vs].check;
-        w.ps_check = shaders_[k.ps].check;
-    }
+    w.vs_check = shaders_.Check(k.vs);
+    w.ps_check = shaders_.Check(k.ps);
     cache::AddPipelineKey(&w, sizeof(w));
 }
 
@@ -2636,8 +1818,8 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, bool wait) {
         return nullptr;
     }
     bool pending = false;
-    ID3DBlob* vs = EnsureShaderCode(k.vs, !async, pending);
-    ID3DBlob* ps = EnsureShaderCode(k.ps, !async, pending);
+    ID3DBlob* vs = shaders_.EnsureCode(k.vs, !async, pending);
+    ID3DBlob* ps = shaders_.EnsureCode(k.ps, !async, pending);
     ComPtr<ID3D12PipelineState> pso;
     if (!pending && vs && ps) pso = CreatePipeline(k, h, vs, ps, !async, pending);
     if (pending) {
@@ -2646,8 +1828,8 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, bool wait) {
         // ahead of the warm up: this one is missing from the frame now
         cache::Post([this, k, h] {
             bool unused = false;
-            ID3DBlob* vs = EnsureShaderCode(k.vs, true, unused);
-            ID3DBlob* ps = EnsureShaderCode(k.ps, true, unused);
+            ID3DBlob* vs = shaders_.EnsureCode(k.vs, true, unused);
+            ID3DBlob* ps = shaders_.EnsureCode(k.ps, true, unused);
             ComPtr<ID3D12PipelineState> pso;
             if (vs && ps) pso = CreatePipeline(k, h, vs, ps, true, unused);
             if (pso) RememberPipeline(k);
@@ -2678,9 +1860,6 @@ D3D12_PRIMITIVE_TOPOLOGY_TYPE TopologyType(uint32_t topo) {
         default: return D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
     }
 }
-
-constexpr uint32_t kFillWireframe = 0x1B01;  // D3DFILL_WIREFRAME
-constexpr uint32_t kCullCw = 0x900;          // D3DCULL_CW
 
 void FillDepthStencilDesc(const PsoKey& k, D3D12_DEPTH_STENCIL_DESC& ds) {
     ds.DepthEnable = k.zen;
@@ -2760,14 +1939,6 @@ ComPtr<ID3D12PipelineState> D3D12Backend::CreatePipeline(const PsoKey& k, uint64
     return pso;
 }
 
-TexKind TextureKind(const TextureDesc& d) {
-    if (d.cube) return kTexCube;
-    if (d.depth > 1) return kTex3D;
-    return kTex2D;
-}
-
-constexpr float kUpscaledMin = 1.01f;  // host texels per console texel past rounding: the target is upscaled
-
 ID3D12Resource* D3D12Backend::BindTargetTexture(const State& s, int stage, const TextureDesc& d, Target& t,
                                                 DrawTextures& stages) {
     TexInfo& info = stages.info[stage];
@@ -2835,18 +2006,6 @@ bool D3D12Backend::CreateTexture(Tex& tx, const TextureDesc& d, const FormatInfo
     return true;
 }
 
-void UpdateNormCube(Tex& tx, const TextureDesc& d, const FormatInfo& fi, uint32_t f, const std::vector<uint8_t>& px,
-                   uint32_t pitch) {
-    // a normalization cube: each face's centre points along its axis, 255 or 0 there, 128 across
-    if (!f) tx.norm = fi.host == Host::BGRA8 && d.width >= 8 && px.size() >= size_t(d.width / 2 + 1) * pitch;
-    const uint8_t* c = tx.norm ? &px[size_t(d.width / 2) * pitch + d.width / 2 * 4] : nullptr;
-    for (uint32_t ch = 0; c && ch < 3; ch++) {
-        int want = 128;
-        if (ch == f / 2) want = f & 1 ? 0 : 255;
-        tx.norm &= std::abs(c[2 - ch] - want) <= 16;
-    }
-}
-
 void CopyLevelRows(uint8_t* out, const D3D12_PLACED_SUBRESOURCE_FOOTPRINT& fp, UINT rows, UINT64 row_size,
                    const std::vector<uint8_t>& px, uint32_t pitch) {
     uint32_t slices = fp.Footprint.Depth;
@@ -2891,7 +2050,7 @@ void D3D12Backend::UploadTexture(Tex& tx, const TextureDesc& d, const FormatInfo
         for (uint32_t l = 0; l < tx.levels; l++) {
             uint32_t pitch;
             DecodeLevel(d, l, f, p, nullptr, px, pitch);
-            if (d.cube && !l) UpdateNormCube(tx, d, fi, f, px, pitch);
+            if (d.cube && !l) UpdateNormCube(tx.norm, d, fi, f, px, pitch);
             UploadTextureLevel(tx, f, l, px, pitch);
         }
     }
@@ -3015,12 +2174,6 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
     return BindGuestTexture(stage, d, fi, stages);
 }
 
-// D3DTEXTUREFILTERTYPE and D3DTEXTUREADDRESS values the samplers test
-constexpr uint32_t kTexfLinear = 2;
-constexpr uint32_t kTexfAnisotropic = 3;
-constexpr uint32_t kTaddressWrap = 1;
-constexpr uint32_t kTaddressClamp = 3;
-
 D3D12_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stages, bool clamp, uint32_t aniso) {
     D3D12_SAMPLER_DESC sd = {};
     const auto& t = s.tss[size_t(i)];
@@ -3077,11 +2230,6 @@ uint32_t D3D12Backend::EnsureStageSamplers(const State& s, const DrawTextures& s
     return base;
 }
 
-// only methods render_thread.cpp's StateRanges sends reach the render thread
-uint32_t SimpleState(const State& s, uint32_t method) {
-    return s.simple[method >> 2];
-}
-
 // HDR starts at a frame's first 3D draw into the HDR scene target; screen space quads never start it: a loading
 // screen's fade redraws over the last tone mapped picture every frame
 bool D3D12Backend::EnterHdrForScene(const State& s, const Assembled& a) {
@@ -3095,48 +2243,11 @@ bool D3D12Backend::EnterHdrForScene(const State& s, const Assembled& a) {
     return true;
 }
 
-constexpr uint32_t kQuadVertices = 6;  // a quad drawn as two triangles
-
-DrawShaders ClassifyShaders(const State& s, const Assembled& a, uint32_t count) {
-    DrawShaders sh;
-    // a shader made from a declaration alone (no program) is the fixed function pipeline on those inputs
-    sh.prog = (s.vs_handle & 1) && s.vs && !s.vs->program.empty();
-    // up to a quad with no depth test: it may be a pass over the whole target, see QuadHlsl
-    sh.quad = count <= kQuadVertices && !s.rs[kRsZEnable];
-    sh.fixed_transform = !sh.prog && !a.pretransformed;
-    if (!sh.prog) sh.fk = MakeFixedKey(s);
-    return sh;
-}
-
-// the program's hash is cached in the guest shader object
-void EnsureProgramHash(const State& s) {
-    if (!s.vs->hash) s.vs->hash = Hash(s.vs->program.data(), s.vs->program.size() * 4) | 1;
-}
-
-// vertex shader cache key salts
-constexpr uint64_t kDeclarationSalt = 0x10000;    // fixed function seed, above the 16 bit register mask
-constexpr uint64_t kPretransformedSalt = 0x5A5A;  // screen space fixed function vertices, apart from untransformed
-constexpr uint64_t kQuadSalt = 0xC3C30000;        // the QuadHlsl variant, apart from the plain shader
-
-uint64_t VertexKey(const State& s, const Assembled& a, const DrawShaders& sh) {
-    uint64_t seed = sh.prog ? s.vs->hash ^ a.regs : Hash(&s.vs_handle, 4, a.regs | kDeclarationSalt);
-    uint64_t vkey = Hash(&a.decode, 8, seed);
-    if (!sh.prog && a.pretransformed) vkey ^= kPretransformedSalt;
-    if (sh.quad) vkey ^= kQuadSalt;
-    if (!sh.prog) vkey = Hash(&sh.fk, sizeof(sh.fk), vkey);
-    return vkey;
-}
-
-std::string VertexHlsl(const State& s, const Assembled& a, const DrawShaders& sh) {
-    if (sh.prog) return VertexProgramHlsl(s.vs->program, a.regs, a.decode);
-    return FixedVertexHlsl(a.regs, a.pretransformed, a.decode, sh.fk);
-}
-
 uint64_t D3D12Backend::EnsureVertexShader(const State& s, const Assembled& a, const DrawShaders& sh) {
     auto vit = shader_src_.find(sh.vkey);
     if (vit != shader_src_.end()) return vit->second;
     std::string src = VertexHlsl(s, a, sh);
-    uint64_t vh = Register(sh.quad ? QuadHlsl(std::move(src)) : src, "main", "vs_5_0");
+    uint64_t vh = shaders_.Register(sh.quad ? QuadHlsl(std::move(src)) : src, "main", "vs_5_0");
     shader_src_[sh.vkey] = vh;
     return vh;
 }
@@ -3152,59 +2263,13 @@ bool D3D12Backend::BindStageTexturesAndTargets(const State& s, DrawTextures& sta
     return true;
 }
 
-constexpr uint64_t kPixelKeySalt = 0x9E3779B97F4A7C15ull;
-
 uint64_t D3D12Backend::EnsurePixelShader(const PixelKey& pk, uint64_t pkey) {
     // pixel shaders share the map with vertex shaders, the salt keeps their keys apart
     auto pit = shader_src_.find(pkey ^ kPixelKeySalt);
     if (pit != shader_src_.end()) return pit->second;
-    uint64_t ph = Register(PixelHlsl(pk), "main", "ps_5_0");
+    uint64_t ph = shaders_.Register(PixelHlsl(pk), "main", "ps_5_0");
     shader_src_[pkey ^ kPixelKeySalt] = ph;
     return ph;
-}
-
-void KeyBlend(const State& s, PsoKey& k) {
-    k.blend = SimpleState(s, kMBlendEnable) != 0;
-    if (k.blend) {
-        k.src = SimpleState(s, kMSrcBlend);
-        k.dst = SimpleState(s, kMDestBlend);
-        k.op = SimpleState(s, kMBlendOp);
-    }
-    uint32_t cw = SimpleState(s, kMColorWriteEnable);
-    // the console's enables are one per byte, A R G B; D3D12 wants bits R G B A
-    k.wmask = ((cw >> 16) & 1) | ((cw >> 8) & 1) << 1 | (cw & 1) << 2 | ((cw >> 24) & 1) << 3;
-}
-
-constexpr float kDepth24Max = 16777215.0f;  // 2^24 minus 1: a 24 bit depth buffer's units per 1.0
-
-void D3D12Backend::KeyDepthStencil(const State& s, const Assembled& a, PsoKey& k) {
-    k.zen = s.rs[kRsZEnable] != 0;
-    if (k.zen) {
-        k.zwrite = SimpleState(s, kMZWriteEnable) != 0;
-        k.zfunc = SimpleState(s, kMZFunc);
-    }
-    k.sten = s.rs[kRsStencilEnable] != 0;
-    if (k.sten) {
-        k.sfunc = SimpleState(s, kMStencilFunc);
-        k.smask = SimpleState(s, kMStencilMask) & 0xFF;
-        k.swmask = SimpleState(s, kMStencilWriteMask) & 0xFF;
-        k.sfail = s.rs[kRsStencilFail];
-        k.szfail = SimpleState(s, kMStencilZFail);
-        k.spass = SimpleState(s, kMStencilPass);
-    }
-    // polygon offset: bias in depth buffer units, the target is always 24 bit; the slope is per console pixel,
-    // and an upscaled target's pixels are smaller
-    if (a.topology == Topology::Triangles && SimpleState(s, kMSolidOffsetEnable)) {
-        k.zbias = int32_t(std::lround(Bits(SimpleState(s, kMDepthOffset)) * kDepth24Max / s.zscale));
-        k.zslope = Bits(SimpleState(s, kMSlopeScale)) * (bound_ds_ ? float(bound_ds_->w) / bound_ds_->gw : 1.0f);
-    }
-}
-
-void KeyRasterizer(const State& s, const Assembled& a, PsoKey& k) {
-    uint32_t cull = s.rs[kRsCullMode];
-    k.cull = cull != 0 && a.topology == Topology::Triangles;
-    k.ccw = cull == kCullCw;  // culling clockwise leaves counter clockwise as the front
-    k.fill = s.rs[kRsFillMode];
 }
 
 void D3D12Backend::BuildPipelineKey(const State& s, const Assembled& a, uint64_t vh, uint64_t ph, PsoKey& k) {
@@ -3225,190 +2290,8 @@ void D3D12Backend::BuildPipelineKey(const State& s, const Assembled& a, uint64_t
     uint32_t samples = bound_rt_ ? bound_rt_->samples : bound_ds_->samples;
     k.msaa = samples > 1 ? samples : 0;
     KeyBlend(s, k);
-    if (k.has_ds) KeyDepthStencil(s, a, k);
+    if (k.has_ds) KeyDepthStencil(s, a, float(bound_ds_->w) / bound_ds_->gw, k);
     KeyRasterizer(s, a, k);
-}
-
-// alpha test off: compare always, in Cmp() - 1 terms like the enabled test
-constexpr float kAlphaTestAlways = float(D3D12_COMPARISON_FUNC_ALWAYS - 1);
-
-void FillSurfaceConstants(const State& s, GuestSize size, DrawConstants& c) {
-    c.surf[0] = float(size.w);
-    c.surf[1] = float(size.h);
-    c.surf[2] = 1.0f / s.zscale;
-    if (s.rs[kRsFogEnable]) {
-        c.fog[0] = Bits(s.rs[kRsFogStart]);
-        c.fog[1] = Bits(s.rs[kRsFogEnd]);
-        c.fog[2] = Bits(s.rs[kRsFogDensity]);
-        c.fog[3] = float(s.rs[kRsFogTableMode]);
-    }
-    Color(s.rs[kRsFogColor], c.fog_color);
-    c.misc[0] = float(SimpleState(s, kMAlphaRef) & 0xFF);
-    c.misc[1] = SimpleState(s, kMAlphaTestEnable) ? float(Cmp(SimpleState(s, kMAlphaFunc)) - 1) : kAlphaTestAlways;
-    c.misc[2] = float(Cmp(s.rs[kRsShadowFunc]) - 1);
-    c.misc[3] = s.rs[kRsSpecularEnable] ? 1.0f : 0.0f;
-}
-
-void FillCombinerConstants(const State& s, DrawConstants& c) {
-    for (int i = 0; i < 8; i++) {
-        Color(SimpleState(s, kMPsConstant0 + i * 4), c.pc[i * 2]);
-        Color(SimpleState(s, kMPsConstant1 + i * 4), c.pc[i * 2 + 1]);
-    }
-    Color(SimpleState(s, kMPsFinalConstant0), c.pc[16]);
-    Color(SimpleState(s, kMPsFinalConstant1), c.pc[17]);
-    Color(s.rs[kRsTextureFactor], c.tfactor);
-}
-
-void D3D12Backend::FillHdrConstants(const PsoKey& k, DrawConstants& c) {
-    // colour lands over the headroom unless the blend multiplies it with what the target holds
-    uint32_t src_factor = k.blend ? k.src : 1;
-    c.hdr[0] = bound_rt_ && bound_rt_->hdr && src_factor != 0 && src_factor != kBlendDestColor ? 1 / kHeadroom : 1;
-    c.hdr[1] = kHeadroom;
-}
-
-constexpr float kGlowBoxTexels = 3.0f;  // console texels across the box each wide tap averages
-
-void D3D12Backend::FillTexelConstants(int i, const TextureDesc& d, const DrawTextures& stages, DrawConstants& c) {
-    c.texsize[i][0] = float(d.width);
-    c.texsize[i][1] = float(d.height);
-    // the console samples pixels at integer positions, D3D12 half a pixel on: targets are read half a texel back
-    if (!stages.rt[i]) return;
-    c.texsize[i][2] = -0.5f / float(d.width);
-    c.texsize[i][3] = -0.5f / float(d.height);
-    // a 3 console texel box per tap keeps the console chain's glow width and brightness
-    if (stages.wide[i] > 0) {
-        float n = std::ceil(kGlowBoxTexels * stages.wide[i] * 0.5f);
-        c.spread[i][0] = kGlowBoxTexels / (n * float(d.width));
-        c.spread[i][1] = kGlowBoxTexels / (n * float(d.height));
-        c.spread[i][2] = n;
-    }
-}
-
-void D3D12Backend::FillTextureConstants(const State& s, const DrawTextures& stages, DrawConstants& c) {
-    for (int i = 0; i < 4; i++) {
-        TextureDesc d;
-        if (s.textures[size_t(i)] && Describe(s.textures[size_t(i)], d)) FillTexelConstants(i, d, stages, c);
-        const auto& t = s.tss[size_t(i)];
-        c.bump[i][0] = Bits(t[kTssBumpEnvMat00]);
-        c.bump[i][1] = Bits(t[kTssBumpEnvMat01]);
-        c.bump[i][2] = Bits(t[kTssBumpEnvMat10]);
-        c.bump[i][3] = Bits(t[kTssBumpEnvMat11]);
-        c.bumpl[i][0] = Bits(t[kTssBumpEnvLScale]);
-        c.bumpl[i][1] = Bits(t[kTssBumpEnvLOffset]);
-    }
-}
-
-void MatMul(const float* x, const float* y, float* o) {
-    for (int r = 0; r < 4; r++) {
-        for (int col = 0; col < 4; col++) {
-            o[r * 4 + col] = x[r * 4] * y[col] + x[r * 4 + 1] * y[4 + col] + x[r * 4 + 2] * y[8 + col] +
-                             x[r * 4 + 3] * y[12 + col];
-        }
-    }
-}
-
-// HLSL mul(row vector, matrix) with column major packing wants the transpose
-void Transpose(const float* m, float* o) {
-    for (int r = 0; r < 4; r++) {
-        for (int col = 0; col < 4; col++) o[col * 4 + r] = m[r * 4 + col];
-    }
-}
-
-void InverseTranspose3x3(const float* wv, float* n) {
-    float det = wv[0] * (wv[5] * wv[10] - wv[6] * wv[9]) - wv[1] * (wv[4] * wv[10] - wv[6] * wv[8]) +
-                wv[2] * (wv[4] * wv[9] - wv[5] * wv[8]);
-    float id = det != 0 ? 1.0f / det : 0.0f;
-    for (int r = 0; r < 3; r++) {
-        for (int col = 0; col < 3; col++) {
-            int r1 = (r + 1) % 3;
-            int r2 = (r + 2) % 3;
-            int c1 = (col + 1) % 3;
-            int c2 = (col + 2) % 3;
-            n[r * 4 + col] = (wv[r1 * 4 + c1] * wv[r2 * 4 + c2] - wv[r1 * 4 + c2] * wv[r2 * 4 + c1]) * id;
-        }
-    }
-}
-
-// D3DTRANSFORMSTATETYPE indices into s.transforms
-constexpr size_t kTsView = 2;
-constexpr size_t kTsProjection = 3;
-constexpr size_t kTsTexture0 = 16;
-constexpr size_t kTsWorld = 256;
-
-void FillTransformConstants(const State& s, GuestSize size, DrawConstants& c) {
-    uint32_t gw = size.w;
-    uint32_t gh = size.h;
-    // world, view, projection, then the viewport inside the target
-    float wv[16];
-    float wvp[16];
-    MatMul(s.transforms[kTsWorld].data(), s.transforms[kTsView].data(), wv);
-    MatMul(wv, s.transforms[kTsProjection].data(), wvp);
-    const auto& v = s.viewport;
-    float sx = float(v.w) / gw;
-    float sy = float(v.h) / gh;
-    float ox = (2.0f * v.x + v.w) / gw - 1;
-    float oy = 1 - (2.0f * v.y + v.h) / gh;
-    float vpm[16] = {sx, 0, 0, 0, 0, sy, 0, 0, 0, 0, v.max_z - v.min_z, 0, ox, oy, v.min_z, 1};
-    float full[16];
-    MatMul(wvp, vpm, full);
-    Transpose(full, c.wvp);
-    Transpose(wv, c.wv);
-    // normals take the inverse transpose of the upper 3x3
-    float n[16] = {};
-    InverseTranspose3x3(wv, n);
-    Transpose(n, c.wvn);
-    for (int t = 0; t < 4; t++) Transpose(s.transforms[kTsTexture0 + size_t(t)].data(), c.tm[t]);
-}
-
-// D3DLIGHT8 as floats: Type, Diffuse[4], Specular[4], Ambient[4], Position[3], Direction[3], Range, Falloff,
-// Attenuation0 to 2, Theta, Phi
-constexpr int kLightFloats = 26;
-constexpr int kLightDiffuse = 1;
-constexpr int kLightSpecular = 5;
-constexpr int kLightAmbient = 9;
-constexpr int kLightPosition = 13;
-constexpr int kLightDirection = 16;
-constexpr int kLightRange = 19;
-constexpr int kLightFalloff = 20;
-constexpr int kLightAttenuation0 = 21;
-constexpr int kLightAttenuation1 = 22;
-constexpr int kLightAttenuation2 = 23;
-constexpr int kLightTheta = 24;
-constexpr int kLightPhi = 25;
-
-void LightToView(const std::array<uint32_t, kLightFloats>& l, const float* vm, float (&o)[7][4]) {
-    float f[kLightFloats];
-    std::memcpy(f, l.data(), sizeof(f));
-    for (int j = 0; j < 4; j++) {
-        o[0][j] = f[kLightDiffuse + j];
-        o[1][j] = f[kLightSpecular + j];
-        o[2][j] = f[kLightAmbient + j];
-    }
-    const float* pos = f + kLightPosition;
-    const float* dir = f + kLightDirection;
-    for (int j = 0; j < 3; j++) {
-        o[3][j] = pos[0] * vm[j] + pos[1] * vm[4 + j] + pos[2] * vm[8 + j] + vm[12 + j];
-        o[4][j] = dir[0] * vm[j] + dir[1] * vm[4 + j] + dir[2] * vm[8 + j];
-    }
-    o[3][3] = f[kLightRange];
-    o[4][3] = f[kLightFalloff];
-    o[5][0] = f[kLightAttenuation0];
-    o[5][1] = f[kLightAttenuation1];
-    o[5][2] = f[kLightAttenuation2];
-    o[6][0] = std::cos(f[kLightTheta] * 0.5f);
-    o[6][1] = std::cos(f[kLightPhi] * 0.5f);
-}
-
-void FillLightConstants(const State& s, const FixedKey& fk, DrawConstants& c) {
-    std::memcpy(c.mat, s.material.data(), sizeof(float) * 16);
-    c.mat[4][0] = s.material[16];
-    Color(s.rs[kRsAmbient], c.amb);
-    // lights to view space
-    const float* vm = s.transforms[kTsView].data();
-    for (int i = 0; i < 8; i++) {
-        if (!((fk.types >> (i * 2)) & 3)) continue;
-        LightToView(s.lights[size_t(i)], vm, c.lt[i]);
-    }
 }
 
 void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
@@ -3418,7 +2301,7 @@ void D3D12Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     Alloc dc = Upload(sizeof(DrawConstants), 256);
     FillSurfaceConstants(s, size, c);
     FillCombinerConstants(s, c);
-    FillHdrConstants(k, c);
+    FillHdrConstants(k, bound_rt_ && bound_rt_->hdr, c);
     FillTextureConstants(s, stages, c);
     if (sh.fixed_transform) {
         FillTransformConstants(s, size, c);
@@ -3515,39 +2398,6 @@ D3D12_SRV_DIMENSION NullViewDimension(uint8_t kind) {
     return D3D12_SRV_DIMENSION_TEXTURE2D;
 }
 
-// A small draw whose every float2 input lies in 0..1: sprites, HUD pieces, text, full screen passes. The console's
-// pixel centres sample such a quad from its first texel to half a texel short of its far edge; upscaled, the far
-// edge's last half texel is drawn too, and wrapped it blends in the opposite edge (the crosshair ticks' dark lines).
-// Clamped, it takes the edge texel instead, which a wrapped texture used once over 0..1 has there anyway.
-bool UnitTexcoords(const Assembled& a) {
-    constexpr float kLo = -1e-4f;
-    constexpr float kHi = 1.0001f;
-    constexpr uint32_t kSmallDrawVertices = 4096;  // most vertices a small draw has
-    if (!a.vertices.empty() || !a.vertex_count || a.vertex_count > kSmallDrawVertices) return false;
-    bool any = false;
-    for (int r = 0; r < 16; r++) {
-        const VertexElement& e = a.elements[size_t(r)];
-        if (!(a.regs >> r & 1) || e.format != DXGI_FORMAT_R32G32_FLOAT) continue;
-        const VertexBuffer& vb = a.buffers[e.buffer];
-        if (!vb.src || !vb.stride || uint64_t(a.vertex_count) * vb.stride > vb.bytes) return false;
-        for (uint32_t v = 0; v < a.vertex_count; v++) {
-            float uv[2];
-            std::memcpy(uv, vb.src + size_t(v) * vb.stride + e.offset, sizeof(uv));
-            if (!(uv[0] >= kLo && uv[0] <= kHi && uv[1] >= kLo && uv[1] <= kHi)) return false;
-        }
-        any = true;
-    }
-    return any;
-}
-
-// UnitTexcoords only changes stages that wrap
-bool AnyStageWraps(const State& s) {
-    for (const auto& t : s.tss) {
-        if (t[kTssAddressU] == kTaddressWrap || t[kTssAddressV] == kTaddressWrap) return true;
-    }
-    return false;
-}
-
 // a stage without a texture gets a null view of its kind; the samplers read the views after
 void D3D12Backend::SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages) {
     uint32_t slot = AllocSrvSlots(4);
@@ -3570,19 +2420,7 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
     float H = float(bound_rt_ ? bound_rt_->h : bound_ds_->h);
     D3D12_VIEWPORT vp{0, 0, W, H, 0, 1};
     cl_->RSSetViewports(1, &vp);
-    float sc = W / gw;
-    LONG x0 = LONG(s.viewport.x * sc);
-    LONG y0 = LONG(s.viewport.y * sc);
-    LONG x1 = LONG((s.viewport.x + s.viewport.w) * sc);
-    LONG y1 = LONG((s.viewport.y + s.viewport.h) * sc);
-    if (s.scissor_count) {
-        x0 = std::max(x0, LONG(s.scissors[0] * sc));
-        y0 = std::max(y0, LONG(s.scissors[1] * sc));
-        x1 = std::min(x1, LONG(s.scissors[2] * sc));
-        y1 = std::min(y1, LONG(s.scissors[3] * sc));
-    }
-    D3D12_RECT rect{std::clamp<LONG>(x0, 0, LONG(W)), std::clamp<LONG>(y0, 0, LONG(H)),
-                    std::clamp<LONG>(x1, 0, LONG(W)), std::clamp<LONG>(y1, 0, LONG(H))};
+    D3D12_RECT rect = ViewportScissorRect(s, gw, W, H);
     cl_->RSSetScissorRects(1, &rect);
 }
 
@@ -3591,14 +2429,6 @@ void D3D12Backend::SetBlendFactorStencilRef(const State& s) {
     Color(SimpleState(s, kMBlendColor), bf);
     cl_->OMSetBlendFactor(bf);
     cl_->OMSetStencilRef(SimpleState(s, kMStencilRef) & 0xFF);
-}
-
-D3D_PRIMITIVE_TOPOLOGY PrimitiveTopology(const Assembled& a) {
-    if (a.topology == Topology::Points) return D3D_PRIMITIVE_TOPOLOGY_POINTLIST;
-    if (a.topology == Topology::Lines) {
-        return a.strip ? D3D_PRIMITIVE_TOPOLOGY_LINESTRIP : D3D_PRIMITIVE_TOPOLOGY_LINELIST;
-    }
-    return a.strip ? D3D_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP : D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
 }
 
 void D3D12Backend::UploadVertexBuffers(const Assembled& a) {
@@ -3681,13 +2511,6 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     DrawGeometry(a);
 }
 
-// a guest rect scaled to the target and clamped to it
-D3D12_RECT ScaledRect(const Target& t, int x0, int y0, int x1, int y1) {
-    float sc = float(t.w) / t.gw;
-    return {std::clamp<LONG>(LONG(x0 * sc), 0, t.w), std::clamp<LONG>(LONG(y0 * sc), 0, t.h),
-            std::clamp<LONG>(LONG(x1 * sc), 0, t.w), std::clamp<LONG>(LONG(y1 * sc), 0, t.h)};
-}
-
 // rs: the rects buffer, reused across targets
 void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, std::vector<D3D12_RECT>& rs) {
     rs.clear();
@@ -3737,80 +2560,6 @@ void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, u
         if (t) ClearTarget(*t, s, c, rs);
     }
 }
-
-// CopyRects' guest lists: src_rects RECTs, dst_points POINTs, all int32
-constexpr uint32_t kGuestRectBytes = 16;
-constexpr uint32_t kRectLeft = 0;
-constexpr uint32_t kRectTop = 4;
-constexpr uint32_t kRectRight = 8;
-constexpr uint32_t kRectBottom = 12;
-constexpr uint32_t kGuestPointBytes = 8;
-constexpr uint32_t kPointX = 0;
-constexpr uint32_t kPointY = 4;
-
-struct GuestRect {
-    int32_t left;
-    int32_t top;
-    int32_t right;
-    int32_t bottom;
-};
-
-struct GuestPoint {
-    int32_t x;
-    int32_t y;
-};
-
-GuestRect ReadGuestRect(uint32_t rects, uint32_t i) {
-    uint32_t r = rects + i * kGuestRectBytes;
-    GuestRect g;
-    g.left = int32_t(kernel::R32(r + kRectLeft));
-    g.top = int32_t(kernel::R32(r + kRectTop));
-    g.right = int32_t(kernel::R32(r + kRectRight));
-    g.bottom = int32_t(kernel::R32(r + kRectBottom));
-    return g;
-}
-
-GuestPoint ReadGuestPoint(uint32_t points, uint32_t i) {
-    uint32_t p = points + i * kGuestPointBytes;
-    GuestPoint g;
-    g.x = int32_t(kernel::R32(p + kPointX));
-    g.y = int32_t(kernel::R32(p + kPointY));
-    return g;
-}
-
-// a drawn copy's rect in guest pixels: the source corners and where it lands
-struct DrawnRect {
-    float x0 = 0;
-    float y0 = 0;
-    float x1 = 0;
-    float y1 = 0;
-    float dx = 0;
-    float dy = 0;
-};
-
-// without dst_points the rect lands where it is
-DrawnRect ReadDrawnRect(uint32_t src_rects, uint32_t dst_points, uint32_t i) {
-    GuestRect g = ReadGuestRect(src_rects, i);
-    DrawnRect r;
-    r.x0 = float(g.left);
-    r.y0 = float(g.top);
-    r.x1 = float(g.right);
-    r.y1 = float(g.bottom);
-    r.dx = r.x0;
-    r.dy = r.y0;
-    if (dst_points) {
-        GuestPoint p = ReadGuestPoint(dst_points, i);
-        r.dx = float(p.x);
-        r.dy = float(p.y);
-    }
-    return r;
-}
-
-// a guest coordinate read as unsigned, times the host scale
-UINT ScaleUnsigned(int32_t v, float sc) { return UINT(uint32_t(v) * sc); }
-
-// a drawn copy's taps round down a ratio a hair over a whole number
-constexpr float kTapsSlack = 1e-3f;
 
 // one Blit per rect: for formats that differ or a multisampled destination
 void D3D12Backend::CopyByDraw(const Target& src_t, ID3D12Resource* src_res, D3D12_RESOURCE_STATES& src_state,
@@ -3998,29 +2747,11 @@ void D3D12Backend::StartCapture() {
     cap_sh_.clear();
 }
 
-// Brightness and contrast range from 0 to 100, 50/50 leaves the image unchanged.
-// Unreal's PC ramp offsets brightness and scales contrast linearly, graying blacks
-// and clipping both ends. Here, black and white stay fixed: contrast uses an S-curve
-// around mid-gray (slope 0.5–2), while brightness adjusts gamma from 2 to 0.5.
-// Both match Unreal's ramp at quarter gray.
 void D3D12Backend::UploadGammaRamp(uint32_t brightness, uint32_t contrast) {
     constexpr uint32_t kRampBytes = 256 * 4;  // one BGRA texel per ramp entry
     ramp_set_ = brightness << 8 | contrast;
-    float k = std::exp2((float(contrast) - 50.0f) / 50.0f);
-    float g = std::exp2((50.0f - float(brightness)) / 50.0f);
     Alloc a = Upload(kRampBytes + D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT, D3D12_TEXTURE_DATA_PLACEMENT_ALIGNMENT);
-    bool identity = true;
-    for (int i = 0; i < 256; i++) {
-        float x = i / 255.0f;
-        float y = x < 0.5f ? 0.5f * std::pow(2.0f * x, k) : 1.0f - 0.5f * std::pow(2.0f - 2.0f * x, k);
-        float v = std::pow(y, g);
-        uint8_t o = uint8_t(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f));
-        uint8_t* p = a.cpu + i * 4;
-        p[0] = p[1] = p[2] = o;
-        p[3] = 255;
-        identity &= o == i;
-    }
-    gamma_ = !identity;
+    gamma_ = FillGammaRamp(brightness, contrast, a.cpu);
     Transition(lut_.Get(), lut_state_, D3D12_RESOURCE_STATE_COPY_DEST);
     D3D12_TEXTURE_COPY_LOCATION dl{lut_.Get(), D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX};
     D3D12_TEXTURE_COPY_LOCATION sl{a.res, D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT};
@@ -4040,34 +2771,6 @@ ID3D12Resource* D3D12Backend::PrepareShownFrame(Target* t) {
         }
     }
     return r;
-}
-
-// Colour blind modes: Machado 2009 simulation at full severity, then Fidaner's daltonize, which moves the difference
-// the eye loses into channels it still sees. Rows of protanopia, deuteranopia, tritanopia.
-constexpr float kColourBlindSimulate[3][9] = {
-    {0.152286f, 1.052583f, -0.204868f, 0.114503f, 0.786281f, 0.099216f, -0.003882f, -0.048116f, 1.051998f},
-    {0.367322f, 0.860646f, -0.227968f, 0.280085f, 0.672501f, 0.047413f, -0.011820f, 0.042940f, 0.968881f},
-    {1.255528f, -0.076749f, -0.178779f, -0.078411f, 0.930809f, 0.147602f, 0.004733f, 0.691367f, 0.303900f},
-};
-constexpr float kColourBlindShift[3][9] = {
-    {0, 0, 0, 0.7f, 1, 0, 0.7f, 0, 1},
-    {0, 0, 0, 0.7f, 1, 0, 0.7f, 0, 1},
-    {1, 0, 0.7f, 0, 1, 0.7f, 0, 0, 0},
-};
-
-// mode 1 to 3: identity + shift * (identity - simulate)
-std::array<float, 9> ColourBlindMatrix(uint32_t mode) {
-    const float* sim = kColourBlindSimulate[mode - 1];
-    const float* shift = kColourBlindShift[mode - 1];
-    std::array<float, 9> m{};
-    for (int r = 0; r < 3; r++) {
-        for (int c = 0; c < 3; c++) {
-            float lost = 0;
-            for (int k = 0; k < 3; k++) lost += shift[r * 3 + k] * (float(k == c) - sim[k * 3 + c]);
-            m[r * 3 + c] = float(r == c) + lost;
-        }
-    }
-    return m;
 }
 
 void D3D12Backend::BlitFrame(const Target& t, ID3D12Resource* r, bool pillarbox, DXGI_FORMAT rtv) {
