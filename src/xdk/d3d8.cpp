@@ -203,9 +203,12 @@ void ApplyShadows() {
     if (g_backend) g_backend->ApplyShadows(g_state);
 }
 
-void SceneBegin(const float* m) {
+void SceneBegin(const float* world_to_screen, const float* camera_to_screen) {
     std::lock_guard<std::recursive_mutex> lock(g_lock);
-    if (g_backend) g_backend->SceneBegin(m);
+    gpu::SceneView v;
+    std::memcpy(v.world_to_screen, world_to_screen, sizeof(v.world_to_screen));
+    std::memcpy(v.camera_to_screen, camera_to_screen, sizeof(v.camera_to_screen));
+    if (g_backend) g_backend->SceneBegin(v);
 }
 
 void SceneEnd() {

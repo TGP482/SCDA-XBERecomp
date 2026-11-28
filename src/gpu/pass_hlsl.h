@@ -497,11 +497,14 @@ float4 taa(float4 pos : SV_Position) : SV_Target {
 }
 )";
 
-// AMD CAS around ffx_a.h and ffx_cas.h (cas_shader.h): TAA's frame sharpened, a pixel each, its alpha kept
+// AMD CAS around ffx_a.h and ffx_cas.h (cas_shader.h): TAA's or FSR's frame sharpened, a pixel each, its alpha from
+// alpha_src shifted by the jitter
 inline constexpr const char* kCasDefines = "#define A_GPU 1\n#define A_HLSL 1\n";
 inline constexpr const char* kCasLoad = R"(
-cbuffer P : register(b1) { uint4 const1; };
+cbuffer P : register(b1) { uint4 const1; float4 alpha_shift; };
 Texture2D img : register(t0);
+Texture2D alpha_src : register(t1);
+SamplerState ls : register(s0);
 AF3 CasLoad(ASU2 p) { return img.Load(int3(p, 0)).rgb; }
 void CasInput(inout AF1 r, inout AF1 g, inout AF1 b) {}
 )";
@@ -514,8 +517,25 @@ float4 cas(float4 pos : SV_Position) : SV_Target {
     AF3 c;
     // sharpening alone reads no scaling constants
     CasFilter(c.r, c.g, c.b, AU2(pos.xy), AU4(0, 0, 0, 0), const1, true);
-    return float4(c, img.Load(int3(pos.xy, 0)).a);
+    float2 size;
+    img.GetDimensions(size.x, size.y);
+    return float4(c, alpha_src.SampleLevel(ls, pos.xy / size + alpha_shift.xy, 0).a);
 }
+)";
+
+// FSR: the view's depth at the output's size, nearest sample
+inline constexpr const char* kUpscaleDepthHlsl = R"(
+Texture2D<float> depth : register(t0);
+SamplerState nearest : register(s1);
+struct O { float4 p : SV_Position; float2 uv : TEXCOORD0; };
+O vs(uint id : SV_VertexID) {
+    O o;
+    float2 t = float2((id << 1) & 2, id & 2);
+    o.p = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+    o.uv = t;
+    return o;
+}
+float depth_up(O i) : SV_Depth { return depth.SampleLevel(nearest, i.uv, 0); }
 )";
 
 }  // namespace gpu

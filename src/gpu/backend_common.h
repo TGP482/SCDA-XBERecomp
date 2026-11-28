@@ -300,11 +300,11 @@ RECT ScaledRect(const TargetBase& t, int x0, int y0, int x1, int y1);
 RECT ViewportScissorRect(const State& s, uint32_t gw, float w, float h);
 
 // TAA
-constexpr uint32_t kTaaPhases = 8;  // jitter positions before they repeat
+constexpr uint32_t kTaaPhases = 8;  // jitter positions before they repeat, per output pixel a view pixel covers
 constexpr DXGI_FORMAT kMotionFormat = DXGI_FORMAT_R16G16_FLOAT;
 constexpr uint32_t kMotionConstants = 24;
-// phase i's jitter in pixels, -0.5 to 0.5 on each axis
-void TaaJitter(uint32_t i, float out[2]);
+// phase i of phases' jitter in pixels, -0.5 to 0.5 on each axis
+void TaaJitter(uint32_t i, uint32_t phases, float out[2]);
 // what the motion pass reprojects: the view's WorldToScreen this frame and last, its viewport, the scene target's
 // console size and host pixels per console pixel, the jitter its draws took in host pixels
 struct MotionView {

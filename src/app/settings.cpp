@@ -103,7 +103,9 @@ void Load() {
     s.aniso = t["anisotropic_filtering"].value_or(s.aniso);
     s.msaa = t["msaa"].value_or(s.msaa);
     s.taa = t["taa"].value_or(s.taa);
-    if (s.taa) s.msaa = 0;
+    s.fsr = t["fsr"].value_or(s.fsr);
+    if (s.fsr) s.taa = false;
+    if (s.taa || s.fsr) s.msaa = 0;
     s.smaa = t["smaa"].value_or(s.smaa);
     s.shadow_resolution = std::min(t["shadow_resolution"].value_or(s.shadow_resolution), 8192u);
     // 0 was the old UNLIMITED, now the furthest
@@ -193,6 +195,7 @@ toml::table Table() {
                   {"anisotropic_filtering", int64_t(s.aniso)},
                   {"msaa", int64_t(s.msaa)},
                   {"taa", s.taa},
+                  {"fsr", s.fsr},
                   {"smaa", s.smaa},
                   {"shadow_resolution", int64_t(s.shadow_resolution)},
                   {"shadow_distance", int64_t(s.shadow_distance)},

@@ -247,9 +247,9 @@ public:
         Written(s.rt);
     }
 
-    void SceneBegin(const float world_to_screen[16]) override {
+    void SceneBegin(const SceneView& v) override {
         Cmd c{Op::SceneBegin};
-        c.data = Put(world_to_screen, 16 * sizeof(float));
+        c.data = Put(&v, sizeof(v));
         cur_->cmds.push_back(c);
     }
 
@@ -505,9 +505,9 @@ private:
             }
             case Op::ApplyShadows: inner_->ApplyShadows(state_); break;
             case Op::SceneBegin: {
-                float m[16];
-                std::memcpy(m, data, sizeof(m));
-                inner_->SceneBegin(m);
+                SceneView v;
+                std::memcpy(&v, data, sizeof(v));
+                inner_->SceneBegin(v);
                 break;
             }
             case Op::SceneEnd: inner_->SceneEnd(state_); break;

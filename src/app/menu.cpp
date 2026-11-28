@@ -28,6 +28,7 @@
 #include "audio/audio.h"
 #include "core/input.h"
 #include "game/console.h"
+#include "gpu/fsr.h"
 #include "image_symbols.h"
 
 namespace app {
@@ -506,6 +507,38 @@ Mode StepResolution(Settings& s, int step) {
     return m;
 }
 
+// MSAA's sample counts, then TAA and FSR3, which versus doesn't draw
+void StepAntiAliasing(Settings& s, int step, char (&text)[64]) {
+    constexpr int kTaa = int(std::size(kMsaaValues));
+    constexpr int kFsr = kTaa + 1;
+    int i = NearestIndex(kMsaaValues, kTaa, s.msaa);
+    if (s.taa && !kVersus) i = kTaa;
+    if (s.fsr && !kVersus) i = kFsr;
+    if (step) {
+        i = StepIndex(i, step, kVersus ? kTaa : kFsr + 1);
+        s.taa = i == kTaa;
+        s.fsr = i == kFsr;
+        s.msaa = i < kTaa ? kMsaaValues[i] : 0;
+    }
+    if (i < kTaa) std::snprintf(text, sizeof(text), "%s", kMsaaNames[i]);
+    else if (i == kTaa) std::snprintf(text, sizeof(text), "TAA");
+    else std::snprintf(text, sizeof(text), "FSR3%s", fsr::StatusNote(fsr::UpscalingStatus()));
+}
+
+// with FSR3, its range in fives and its modes' percentages, named
+constexpr uint32_t kFsrPercents[] = {33, 35, 40, 45, 50, 55, 59, 60, 65, 67, 70, 75, 80, 85, 90, 95, 100};
+
+void StepFsrResolution(Settings& s, int step, char (&text)[64]) {
+    uint32_t percent = kFsrPercents[StepTable(kFsrPercents, s.render_percent, step)];
+    for (const fsr::ModePoint& m : fsr::kModes) {
+        if (m.percent != percent) continue;
+        std::snprintf(text, sizeof(text), "%u%% %s", percent, m.name);
+        return;
+    }
+    Mode out = StepResolution(s, 0);
+    std::snprintf(text, sizeof(text), "%u%% (%ux%u)", percent, out.width * percent / 100, out.height * percent / 100);
+}
+
 // the display rows that are no ON / OFF, stepped first; false for another row
 bool StepDisplayRow(int id, int step, Settings& s, char (&text)[64]) {
     switch (id) {
@@ -540,6 +573,10 @@ bool StepDisplayRow(int id, int step, Settings& s, char (&text)[64]) {
             return true;
         }
         case kRenderResolution: {
+            if (s.fsr && !kVersus) {
+                StepFsrResolution(s, step, text);
+                return true;
+            }
             // 20% to 200% in steps of 5
             if (step) s.render_percent = uint32_t(StepRange(int(s.render_percent), 20, 200, 5, step));
             // Get the selected monitor's mode before applying the display change
@@ -599,18 +636,9 @@ bool StepGraphicsRow(int id, int step, Settings& s, char (&text)[64]) {
             if (step) s.shader_model = StepIndex(s.shader_model >= 3, step, 2) ? 3 : 1;
             std::snprintf(text, sizeof(text), "%s", s.shader_model >= 3 ? "3.0" : "1.1 (DEFAULT)");
             return true;
-        case kAntiAliasing: {
-            // MSAA's sample counts, then TAA, which versus doesn't draw
-            constexpr int kTaa = int(std::size(kMsaaValues));
-            int i = s.taa ? kTaa : NearestIndex(kMsaaValues, kTaa, s.msaa);
-            if (step) {
-                i = StepIndex(i, step, kVersus ? kTaa : kTaa + 1);
-                s.taa = i == kTaa;
-                s.msaa = s.taa ? 0 : kMsaaValues[i];
-            }
-            std::snprintf(text, sizeof(text), "%s", s.taa ? "TAA" : kMsaaNames[i]);
+        case kAntiAliasing:
+            StepAntiAliasing(s, step, text);
             return true;
-        }
         case kAmbientOcclusion:
             std::snprintf(text, sizeof(text), "%s", kAoNames[StepTable(kAoValues, s.ambient_occlusion, step)]);
             return true;

@@ -15,6 +15,12 @@ enum : uint32_t {
 };
 
 constexpr int kOcclusionParams = 10;
+
+// the frame's view as its scene node keeps them, rows of 4: world to -1..1 y up, and camera to screen
+struct SceneView {
+    float world_to_screen[16];
+    float camera_to_screen[16];
+};
 constexpr int kShadowFilterParams = 2;
 
 class Backend {
@@ -49,9 +55,9 @@ public:
     // depth with view z = p[0] / (ndc depth - p[1]); ApplyShadows, after the game's own edge blur, writes it back
     virtual void FilterShadows(const State&, const float /*p*/[kShadowFilterParams]) {}
     virtual void ApplyShadows(const State&) {}
-    // TAA over the frame's view: from SceneBegin its draws to back buffer sized targets are jittered, SceneEnd
-    // resolves them into the scene before the post effects. world_to_screen: the view's, rows of 4, -1..1 y up
-    virtual void SceneBegin(const float /*world_to_screen*/[16]) {}
+    // TAA and FSR over the frame's view: from SceneBegin its draws to back buffer sized targets are jittered, SceneEnd
+    // resolves them into the scene before the post effects
+    virtual void SceneBegin(const SceneView&) {}
     virtual void SceneEnd(const State&) {}
 
     // the XDK's fences and busy checks against the render thread; a backend that draws at once is never behind

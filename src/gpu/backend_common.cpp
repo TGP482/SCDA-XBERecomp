@@ -893,8 +893,8 @@ float Halton(uint32_t i, uint32_t b) {
 
 }  // namespace
 
-void TaaJitter(uint32_t i, float out[2]) {
-    uint32_t n = i % kTaaPhases + 1;
+void TaaJitter(uint32_t i, uint32_t phases, float out[2]) {
+    uint32_t n = i % phases + 1;
     out[0] = Halton(n, 2) - 0.5f;
     out[1] = Halton(n, 3) - 0.5f;
 }

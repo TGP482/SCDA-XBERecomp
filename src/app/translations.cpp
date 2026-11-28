@@ -268,7 +268,7 @@ std::string app::TitleCase(std::string_view text) {
     constexpr std::string_view kSmall[] = {"AND", "OR", "OF", "TO", "A"};
     constexpr std::string_view kKeep[] = {"FPS", "FMV", "EEV", "EMF", "LMB", "RMB", "MMB", "IP", "OPSAT", "ESC", "HDR",
                                           "MSAA", "SMAA", "TAA", "SSAO", "GTAO", "HUD", "LB", "RB", "LT", "RT", "LS",
-                                          "RS", "PNG", "DDS"};
+                                          "RS", "PNG", "DDS", "FSR3", "AA"};
     std::string out;
     size_t i = 0;
     while (i < text.size()) {

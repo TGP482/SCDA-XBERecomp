@@ -25,6 +25,8 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -38,6 +40,7 @@
 #include "gpu/backend.h"
 #include "gpu/backend_common.h"
 #include "gpu/cas_shader.h"
+#include "gpu/fsr.h"
 #include "gpu/pipeline_cache.h"
 #include "gpu/shaders.h"
 #include "gpu/smaa_shader.h"
@@ -45,6 +48,7 @@
 #include "gpu/texture.h"
 #include "gpu/texturedumper.h"
 #include "gpu/vertex.h"
+#include "image_symbols.h"
 #include "kernel/kernel.h"
 
 using Microsoft::WRL::ComPtr;
@@ -154,9 +158,16 @@ D3D12_RESOURCE_DESC Texture2DDesc(DXGI_FORMAT fmt, uint64_t w, uint32_t h) {
     return td;
 }
 
+// versus draws no view for TAA or FSR
+constexpr bool kStory = std::string_view(IMAGE_XBE) != "sc4_adv.xbe";
+constexpr uint64_t kSceneKey = 1ull << 63;  // a targets_ key's: the view's own target at FSR's scale
+constexpr DXGI_FORMAT kUpscaledFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+
 struct Target : TargetBase {
     ComPtr<ID3D12Resource> res;
     uint32_t view = 0;
+    bool scene = false;            // the view's own while FSR draws it at the render resolution
+    uint64_t scene_cleared = ~0ull;  // the present it was last cleared at, as the game clears the output's
     D3D12_RESOURCE_STATES state = D3D12_RESOURCE_STATE_COMMON;
     // single sample copy draws read: of the target being drawn to, or a multisampled one resolved
     ComPtr<ID3D12Resource> fb;
@@ -191,6 +202,16 @@ struct PostTarget {
     uint32_t w;
     uint32_t h;
     uint32_t samples = 1;
+};
+
+// CAS's inputs, readable by shaders: the colour, and the picture its alpha comes from with the uv shift that takes
+// the jitter out
+struct SharpenInputs {
+    ID3D12Resource* color;
+    DXGI_FORMAT color_fmt;
+    ID3D12Resource* alpha;
+    DXGI_FORMAT alpha_fmt;
+    float shift[2];
 };
 
 // what a full screen pass reads at t0 to t2
@@ -232,7 +253,7 @@ public:
     void Occlusion(const State& s, const float p[kOcclusionParams]) override;
     void FilterShadows(const State& s, const float p[kShadowFilterParams]) override;
     void ApplyShadows(const State& s) override;
-    void SceneBegin(const float world_to_screen[16]) override;
+    void SceneBegin(const SceneView& v) override;
     void SceneEnd(const State& s) override;
     void WaitGpuFrame(uint64_t n) override;
 
@@ -361,7 +382,16 @@ private:
     void BeginDrawnMotion();
     bool DrawMotion(Target& rt, Target& ds, const MotionView& view);
     bool ResolveTaa(Target& rt, bool reset);
-    void Sharpen(Target& rt);
+    bool UpscaleScene(const State& s, Target& rt, Target& ds, bool reset);
+    bool EnsureUpscaled(uint32_t w, uint32_t h);
+    void UpscaleDepth(Target& ds, Target& out);
+    bool Sharpen(const SharpenInputs& in, Target& out);
+    // FSR: the render scale of every target but the view's, and of the view's
+    bool Fsr() const { return kStory && app::Get().fsr && fsr::Upscaling(); }
+    float BaseScale() const;
+    float SceneScale() const;
+    uint64_t SlotKey(uint32_t data, bool depth, uint32_t gw, uint32_t gh) const;
+    void ClearSceneTarget(Target& t);
     // Draw, in call order, each callee right after its caller
     bool BindTargets(const State& s);
     bool EnterHdrForScene(const State& s, const Assembled& a);
@@ -580,6 +610,7 @@ private:
     // pixels; motion, the history pair and the motion the draws wrote at the scene's size and format
     struct Taa {
         bool open = false;
+        SceneView view{};
         bool cleared = false;  // the drawn motion, this view
         MotionHistory draws;
         uint32_t motion_draws = 0;
@@ -589,8 +620,7 @@ private:
         bool fresh = true;  // the history holds nothing yet
         float jitter[2] = {};
         uint32_t phase = 0;
-        float world_to_screen[16] = {};
-        float last[16] = {};  // the view last resolved
+        float last[16] = {};  // WorldToScreen of the view last resolved
         uint64_t last_present = 0;
         ComPtr<ID3D12Resource> motion;
         D3D12_RESOURCE_STATES motion_state = {};
@@ -602,6 +632,14 @@ private:
         DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
     } taa_;
     bool motion_want_ = false;   // the draw writes motion when its target is the view's
+    // FSR: the view is open and drawn at scene_scale_, upscaled into its output
+    bool upscaling_ = false;
+    float scene_scale_ = 1.0f;
+    ComPtr<ID3D12Resource> upscaled_;
+    D3D12_RESOURCE_STATES upscaled_state_ = {};
+    uint32_t upscaled_w_ = 0;
+    uint32_t upscaled_h_ = 0;
+    ComPtr<ID3D12PipelineState> depth_up_pso_;
     bool bound_motion_ = false;  // the drawn motion is bound beside bound_rt_
     // SMAA: edges, blend weights and the blended frame, at the frame's size; its two lookups
     ComPtr<ID3D12Resource> smaa_[3];
@@ -664,7 +702,9 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     guest_w_ = width;
     guest_h_ = height;
     HWND hwnd = static_cast<HWND>(app::Window());
+    fsr::Load();
     if (!CreateDevice()) return false;
+    fsr::SetDevice(dev_.Get());
     if (!CreateSwapChain(hwnd)) return false;
     CreateHeaps();
     CreateBackBufferViews();
@@ -686,6 +726,7 @@ D3D12Backend::~D3D12Backend() {
     cache::DropJobs();
     if (!ready_) return;
     Flush();
+    fsr::Shutdown();
     {
         std::lock_guard lock(app::UiLock());
         ImGui_ImplDX12_Shutdown();
@@ -828,7 +869,8 @@ void D3D12Backend::CreateGammaLut() {
 }
 
 void D3D12Backend::LoadSettings() {
-    scale_ = app::RenderScale(guest_h_);
+    scale_ = BaseScale();
+    scene_scale_ = SceneScale();
     shadow_res_ = app::Get().shadow_resolution;
     const app::Settings& set = app::Get();
     sm3_ = set.shader_model >= 3;
@@ -953,7 +995,8 @@ void D3D12Backend::ReleaseTarget(std::unordered_map<uint64_t, Target>::iterator 
 
 // the host texture of a new target, at render scale or the shadow resolution
 bool D3D12Backend::CreateTargetResource(Target& t, bool shadow, bool blur) {
-    float sc = shadow && shadow_res_ ? float(shadow_res_) / t.gw : scale_;
+    float sc = t.scene ? scene_scale_ : scale_;
+    if (shadow && shadow_res_) sc = float(shadow_res_) / t.gw;
     t.w = std::max(1u, uint32_t(std::lround(t.gw * sc)));
     t.h = std::max(1u, uint32_t(std::lround(t.gh * sc)));
     if (shadow) LOGI("d3d12: shadow map %ux%u", t.w, t.h);
@@ -1008,8 +1051,8 @@ bool D3D12Backend::CreateTargetView(Target& t) {
 D3D12Backend::TargetSlot D3D12Backend::FindTargetSlot(const Surface& s, bool depth) {
     TargetSlot slot;
     slot.data = mem::VirtualFromPhysical(s.data);
-    slot.key = TargetKey(slot.data, depth);
     SurfaceSize(s, slot.gw, slot.gh);
+    slot.key = SlotKey(slot.data, depth, slot.gw, slot.gh);
     slot.it = targets_.find(slot.key);
     slot.sized = slot.it != targets_.end() && slot.it->second.gw == slot.gw && slot.it->second.gh == slot.gh;
     return slot;
@@ -1040,6 +1083,7 @@ Target* D3D12Backend::EnsureTarget(const Surface& s, bool depth) {
     t.depth = depth;
     t.gw = slot.gw;
     t.gh = slot.gh;
+    t.scene = slot.key & kSceneKey;
     if (!CreateTargetResource(t, shadow, blur)) return nullptr;
     // an empty pool drops the new resource with t
     if (!CreateTargetView(t)) return nullptr;
@@ -1079,6 +1123,8 @@ bool D3D12Backend::BindTargets(const State& s) {
         Transition(ds->res.Get(), ds->state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
         ds->drawn = true;
     }
+    if (rt && rt->scene) ClearSceneTarget(*rt);
+    if (ds && ds->scene) ClearSceneTarget(*ds);
     bool scene = rt && ds && rt->gw == guest_w_ && rt->gh == guest_h_ && rt->samples == 1;
     bool motion = motion_want_ && scene && EnsureTaaTargets(*rt);
     if (motion) BeginDrawnMotion();
@@ -1699,9 +1745,12 @@ void LogTaa(const char* what) {
     LOGR("TAA: %s", what);
 }
 
-void D3D12Backend::SceneBegin(const float world_to_screen[16]) {
-    std::memcpy(taa_.world_to_screen, world_to_screen, sizeof(taa_.world_to_screen));
-    TaaJitter(taa_.phase++, taa_.jitter);
+void D3D12Backend::SceneBegin(const SceneView& v) {
+    taa_.view = v;
+    upscaling_ = Fsr();
+    // eight phases for each output pixel a view pixel covers
+    float ratio = upscaling_ ? scale_ / scene_scale_ : 1.0f;
+    TaaJitter(taa_.phase++, uint32_t(std::ceil(kTaaPhases * ratio * ratio)), taa_.jitter);
     taa_.draws.Begin();
     taa_.cleared = false;
     taa_.motion_draws = 0;
@@ -1709,11 +1758,13 @@ void D3D12Backend::SceneBegin(const float world_to_screen[16]) {
     taa_.open = true;
 }
 
-// the view's motion from its depth, its colour resolved over the history, then sharpened back into the scene
+// the view's motion, then its colour resolved over the history and sharpened back into the scene, or with FSR
+// upscaled into the output
 void D3D12Backend::SceneEnd(const State& s) {
     if (!std::exchange(taa_.open, false)) return;
     Target* rt = FindTarget(s.rt, false);
     Target* ds = FindTarget(s.zs, true);
+    bool upscale = std::exchange(upscaling_, false);
     bool scene = rt && ds && rt->gw == guest_w_ && rt->gh == guest_h_ && ds->w == rt->w && ds->h == rt->h;
     if (!scene || rt->samples > 1 || ds->samples > 1) {
         LogTaa("the view drew no single sample back buffer sized scene");
@@ -1727,25 +1778,33 @@ void D3D12Backend::SceneEnd(const State& s) {
     }
     // a history older than the last present shows another view
     bool reset = taa_.fresh || presents_ - taa_.last_present > 1;
-    MotionView view{.now = taa_.world_to_screen,
-                    .last = reset ? taa_.world_to_screen : taa_.last,
+    const float* now = taa_.view.world_to_screen;
+    MotionView view{.now = now,
+                    .last = reset ? now : taa_.last,
                     .viewport = s.viewport,
                     .gw = rt->gw,
                     .gh = rt->gh,
                     .scale = {float(rt->w) / float(rt->gw), float(rt->h) / float(rt->gh)},
                     .jitter = {taa_.jitter[0], taa_.jitter[1]}};
-    std::memcpy(taa_.last, taa_.world_to_screen, sizeof(taa_.last));
+    std::memcpy(taa_.last, now, sizeof(taa_.last));
     taa_.last_present = presents_;
-    if (!DrawMotion(*rt, *ds, view) || !ResolveTaa(*rt, reset)) {
-        LogTaa("not resolved, the view can't be reprojected or a pass failed");
-        taa_.fresh = true;
-        return;
-    }
-    taa_.fresh = false;
-    Sharpen(*rt);
-    char what[64];
-    std::snprintf(what, sizeof(what), "resolving %ux%u", rt->w, rt->h);
+    bool motion = DrawMotion(*rt, *ds, view);
+    bool ok = upscale ? UpscaleScene(s, *rt, *ds, reset || !motion) : motion && ResolveTaa(*rt, reset);
+    taa_.fresh = !ok;
+    char what[96];
+    if (!ok) std::snprintf(what, sizeof(what), "not resolved, the view can't be reprojected or a pass failed");
+    else if (upscale) std::snprintf(what, sizeof(what), "FSR upscaling %ux%u", rt->w, rt->h);
+    else std::snprintf(what, sizeof(what), "resolving %ux%u", rt->w, rt->h);
     LogTaa(what);
+    if (!ok || upscale) return;
+    // CAS from the history into the scene; on failure the history is copied in unsharpened
+    ID3D12Resource* history = taa_.history[taa_.now].Get();
+    D3D12_RESOURCE_STATES& state = taa_.history_state[taa_.now];
+    Transition(history, state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    if (Sharpen({history, rt->fmt, history, rt->fmt, {}}, *rt)) return;
+    Transition(history, state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+    Transition(rt->res.Get(), rt->state, D3D12_RESOURCE_STATE_COPY_DEST);
+    cl_->CopyResource(rt->res.Get(), history);
 }
 
 // made again when the scene's size or format changes
@@ -1807,24 +1866,159 @@ bool D3D12Backend::ResolveTaa(Target& rt, bool reset) {
     return true;
 }
 
-// CAS from the history into the scene; on failure the history is copied in unsharpened
-void D3D12Backend::Sharpen(Target& rt) {
+// FSR
+
+// the render scale without FSR; with it the output's, as the view alone is drawn at the render resolution
+float D3D12Backend::BaseScale() const {
+    float scale = app::RenderScale(guest_h_);
+    if (!Fsr()) return scale;
+    // the output's height in whole pixels, so the upscaled view matches the targets the HUD draws on
+    float out_h = std::round(scale * float(guest_h_) * 100.0f / float(app::Get().render_percent));
+    return out_h / float(guest_h_);
+}
+
+float D3D12Backend::SceneScale() const {
+    if (!Fsr()) return BaseScale();
+    uint32_t percent = std::clamp(app::Get().render_percent, fsr::kMinPercent, fsr::kMaxPercent);
+    // whole view pixels in height, so a mode's own size lands exactly (a third of 2160 is 720)
+    float out_h = BaseScale() * float(guest_h_);
+    return std::round(out_h * fsr::SceneFraction(percent)) / float(guest_h_);
+}
+
+// back buffer sized surfaces have a target of their own while FSR draws the view
+uint64_t D3D12Backend::SlotKey(uint32_t data, bool depth, uint32_t gw, uint32_t gh) const {
+    uint64_t key = TargetKey(data, depth);
+    return upscaling_ && gw == guest_w_ && gh == guest_h_ ? key | kSceneKey : key;
+}
+
+// a view target cleared once a frame, as the game clears its output before the view
+void D3D12Backend::ClearSceneTarget(Target& t) {
+    if (std::exchange(t.scene_cleared, presents_) == presents_) return;
+    if (t.depth) {
+        cl_->ClearDepthStencilView(Cpu(dsv_heap_.Get(), t.view, dsv_inc_),
+                                   D3D12_CLEAR_FLAG_DEPTH | D3D12_CLEAR_FLAG_STENCIL, 1, 0, 0, nullptr);
+        return;
+    }
+    const float black[4] = {0, 0, 0, 0};
+    cl_->ClearRenderTargetView(Cpu(rtv_heap_.Get(), t.view, rtv_inc_), black, 0, nullptr);
+}
+
+bool D3D12Backend::EnsureUpscaled(uint32_t w, uint32_t h) {
+    if (upscaled_ && upscaled_w_ == w && upscaled_h_ == h) return true;
+    if (upscaled_) CurrentFrame().garbage.push_back(upscaled_);
+    upscaled_.Reset();
+    upscaled_w_ = 0;
+    D3D12_HEAP_PROPERTIES hp{D3D12_HEAP_TYPE_DEFAULT};
+    D3D12_RESOURCE_DESC td = Texture2DDesc(kUpscaledFormat, w, h);
+    td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+    upscaled_state_ = D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
+    if (FAILED(dev_->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, upscaled_state_, nullptr,
+                                             IID_PPV_ARGS(&upscaled_)))) {
+        LOGE("d3d12: no %ux%u FSR output", w, h);
+        return false;
+    }
+    upscaled_w_ = w;
+    upscaled_h_ = h;
+    return true;
+}
+
+// the view's colour upscaled into the output surface's own target and sharpened, its depth beside it; the post
+// effects and the HUD draw over that at the render scale
+bool D3D12Backend::UpscaleScene(const State& s, Target& rt, Target& ds, bool reset) {
+    Target* out = EnsureTarget(s.rt, false);
+    Target* out_ds = EnsureTarget(s.zs, true);
+    if (!out || !out_ds || !EnsureUpscaled(out->w, out->h)) return false;
+    const float* p = taa_.view.camera_to_screen;
+    // a D3D projection: depth = m10 + m14 / z, so 0 at the near plane and 1 at the far one, infinite at m10 = 1
+    constexpr float kFarthest = 1e7f;
+    fsr::Frame f;
+    f.color = {rt.res.Get(), 0, rt.w, rt.h};
+    f.depth = {ds.res.Get(), 0, ds.w, ds.h};
+    f.motion = {taa_.motion.Get(), 0, rt.w, rt.h};
+    f.output = {upscaled_.Get(), 0, out->w, out->h};
+    f.near_plane = p[10] ? -p[14] / p[10] : 0;
+    f.far_plane = p[10] < 1 ? p[14] / (1 - p[10]) : kFarthest;
+    f.fov_y = 2 * std::atan(1 / p[5]);
+    f.jitter[0] = taa_.jitter[0];
+    f.jitter[1] = taa_.jitter[1];
+    f.reset = reset;
+    Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    Transition(ds.res.Get(), ds.state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    Transition(taa_.motion.Get(), taa_.motion_state, D3D12_RESOURCE_STATE_ALL_SHADER_RESOURCE);
+    Transition(upscaled_.Get(), upscaled_state_, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    bool ok = fsr::Upscale(cl_.Get(), f);
+    Begin();  // FSR's passes left their heaps and root signature bound
+    if (ok) {
+        Transition(upscaled_.Get(), upscaled_state_, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        const SharpenInputs in{upscaled_.Get(), kUpscaledFormat, rt.res.Get(), rt.fmt,
+                               {taa_.jitter[0] / float(rt.w), taa_.jitter[1] / float(rt.h)}};
+        ok = Sharpen(in, *out);
+    }
+    if (!ok) {
+        // the view stretched over the output unsharpened, so the frame still shows
+        Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        Transition(out->res.Get(), out->state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+        SetBlitTarget(Cpu(rtv_heap_.Get(), out->view, rtv_inc_), out->w, out->h);
+        float uv[4] = {0, 0, 1, 1};
+        Blit(rt.res.Get(), rt.fmt, uv, {.alpha = true, .rtv = out->fmt});
+        out->drawn = true;
+    }
+    // colour over the HDR headroom stays so until the output's resolve
+    out->hdr = rt.hdr;
+    out->hdr_frame = rt.hdr_frame;
+    UpscaleDepth(ds, *out_ds);
+    return ok;
+}
+
+// the view's depth at the output's size, for what draws over the upscaled view
+void D3D12Backend::UpscaleDepth(Target& ds, Target& out) {
+    constexpr uint64_t kDepthUpscaleKey = 0xDE9705CA;
+    if (!depth_up_pso_) {
+        ID3DBlob* vs = shaders_.Compile(kUpscaleDepthHlsl, "vs", "vs_5_0");
+        ID3DBlob* ps = shaders_.Compile(kUpscaleDepthHlsl, "depth_up", "ps_5_0");
+        if (!vs || !ps) return;
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC d = FullScreenPipelineDesc(vs, ps, DXGI_FORMAT_UNKNOWN, 1);
+        d.NumRenderTargets = 0;
+        d.BlendState.RenderTarget[0].RenderTargetWriteMask = 0;
+        d.DSVFormat = DXGI_FORMAT_D24_UNORM_S8_UINT;
+        d.DepthStencilState.DepthEnable = TRUE;
+        d.DepthStencilState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+        d.DepthStencilState.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+        depth_up_pso_ = BuildPipeline(d, kDepthUpscaleKey);
+        if (!depth_up_pso_) return;
+    }
+    Transition(ds.res.Get(), ds.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(out.res.Get(), out.state, D3D12_RESOURCE_STATE_DEPTH_WRITE);
+    uint32_t slot = AllocSrvSlots(4);
+    D3D12_SHADER_RESOURCE_VIEW_DESC sv{};
+    sv.Format = kDepthViewFormat;
+    sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    sv.Texture2D.MipLevels = 1;
+    dev_->CreateShaderResourceView(ds.res.Get(), &sv, Cpu(srv_heap_.Get(), slot, srv_inc_));
+    D3D12_CPU_DESCRIPTOR_HANDLE dh = Cpu(dsv_heap_.Get(), out.view, dsv_inc_);
+    cl_->ClearDepthStencilView(dh, D3D12_CLEAR_FLAG_STENCIL, 1, 0, 0, nullptr);
+    cl_->OMSetRenderTargets(0, nullptr, FALSE, &dh);
+    SetFullViewport(out.w, out.h);
+    Alloc cb = Upload(256, 256);
+    DrawFullScreen(depth_up_pso_.Get(), cb.gpu, slot);
+    bound_rt_ = bound_ds_ = nullptr;
+    out.drawn = true;
+}
+
+// AMD CAS into a target, its alpha taken from in.alpha
+bool D3D12Backend::Sharpen(const SharpenInputs& in, Target& out) {
     static const std::string hlsl = std::string(kCasDefines) + kFfxA + kCasLoad + kFfxCas + kCasPass;
     // CasSetup (ffx_cas.h) without scaling, at sharpness 0, AMD's default with the least ringing
     constexpr float kSharpness = 0.0f;
-    ComPtr<ID3D12Resource>& history = taa_.history[taa_.now];
-    D3D12_RESOURCE_STATES& state = taa_.history_state[taa_.now];
-    Transition(history.Get(), state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
-    Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
-    const float p[4] = {-1.0f / std::lerp(8.0f, 5.0f, kSharpness), 0, 8, 0};
-    PostInputs in{{history.Get()}, {rt.fmt}};
-    PostTarget out{Cpu(rtv_heap_.Get(), rt.view, rtv_inc_), rt.fmt, rt.w, rt.h};
-    if (!DrawPostPass("cas", out, in, p, {.hlsl = hlsl.c_str()})) {
-        Transition(history.Get(), state, D3D12_RESOURCE_STATE_COPY_SOURCE);
-        Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_COPY_DEST);
-        cl_->CopyResource(rt.res.Get(), history.Get());
-    }
-    rt.drawn = true;
+    Transition(out.res.Get(), out.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const float p[8] = {-1.0f / std::lerp(8.0f, 5.0f, kSharpness), 0, 8, 0, in.shift[0], in.shift[1], 0, 0};
+    PostInputs views{{in.color, in.alpha}, {in.color_fmt, in.alpha_fmt}};
+    PostTarget target{Cpu(rtv_heap_.Get(), out.view, rtv_inc_), out.fmt, out.w, out.h};
+    if (!DrawPostPass("cas", target, views, p, {.hlsl = hlsl.c_str()})) return false;
+    out.drawn = true;
+    return true;
 }
 
 bool D3D12Backend::EnsureAoTargets(uint32_t w, uint32_t h) {
@@ -2363,7 +2557,7 @@ ID3D12Resource* D3D12Backend::BindTexture(const State& s, int stage, DrawTexture
     info.rect = d.linear;
 
     // rendered by the GPU: sample the target itself; DXT data loaded over a target's memory is not it
-    auto tit = targets_.find(TargetKey(d.data, fi.depth));
+    auto tit = targets_.find(SlotKey(d.data, fi.depth, d.width, d.height));
     if (tit != targets_.end() && !d.cube && d.depth == 1 && !fi.compressed) {
         return BindTargetTexture(s, stage, d, tit->second, stages);
     }
@@ -2521,7 +2715,7 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
         ID3D12Resource* res = stages.res[i];
         TextureDesc d;
         if (!s.textures[size_t(i)] || !Describe(s.textures[size_t(i)], d)) continue;
-        bool tg = targets_.count(TargetKey(d.data, Format(d.format).depth));
+        bool tg = targets_.count(SlotKey(d.data, Format(d.format).depth, d.width, d.height));
         fprintf(cap_.file, " | t%d %08X fmt %X %ux%u%s%s", i, d.data, d.format, d.width, d.height, tg ? " target" : "",
                 res ? "" : " unbound");
         if (res && !tg && stages.info[i].kind == kTex2D && cap_.seen.insert(d.data).second) {
@@ -3080,7 +3274,8 @@ void D3D12Backend::WaitGpuFrame(uint64_t n) {
 }
 
 void D3D12Backend::ApplySettings() {
-    float want = app::RenderScale(guest_h_);
+    float want = BaseScale();
+    float scene = SceneScale();
     const app::Settings& set = app::Get();
     uint32_t shadows = set.shadow_resolution;
     sm3_ = set.shader_model >= 3;
@@ -3092,7 +3287,8 @@ void D3D12Backend::ApplySettings() {
         msaa_set_ = set.msaa;
         msaa = Samples(msaa_set_);
     }
-    if (std::fabs(want - scale_) > 1e-4f || shadows != shadow_res_ || hdr != hdr_ || msaa != msaa_) {
+    bool scaled = std::fabs(want - scale_) > 1e-4f || std::fabs(scene - scene_scale_) > 1e-4f;
+    if (scaled || shadows != shadow_res_ || hdr != hdr_ || msaa != msaa_) {
         hdr_ = hdr;
         msaa_ = msaa;
         expo_fresh_ = true;
@@ -3100,6 +3296,7 @@ void D3D12Backend::ApplySettings() {
         for (auto& [key, tg] : targets_) (tg.depth ? free_dsv_ : free_rtv_).push_back(tg.view);
         targets_.clear();
         scale_ = want;
+        scene_scale_ = scene;
         shadow_res_ = shadows;
         bound_rt_ = bound_ds_ = nullptr;
     }

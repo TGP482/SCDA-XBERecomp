@@ -66,8 +66,48 @@ set(IMGUI_SOURCES
     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx11.cpp
     ${imgui_SOURCE_DIR}/backends/imgui_impl_dx12.cpp)
 
+# AMD FSR 3, built from the open source AMD FSR SDK in third_party/fidelityfx with the glue in src/gpu/fsr; its
+# shaders go to the FSR folder beside the exe, compiled when first used
+set(FFX_DIR ${CMAKE_CURRENT_SOURCE_DIR}/third_party/fidelityfx)
+set(FFX_DEFINES FFX_BACKEND_DX12 FFX_UPSCALER FFX_FRAMEGENERATION NOMINMAX)
+file(GLOB_RECURSE FFX_SOURCES CONFIGURE_DEPENDS ${FFX_DIR}/*.cpp)
+add_library(fidelityfx STATIC ${FFX_SOURCES})
+target_include_directories(fidelityfx PRIVATE ${FFX_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/fsr)
+target_compile_definitions(fidelityfx PRIVATE ${FFX_DEFINES} UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
+# ffx_message.cpp uses FFX_UNUSED without including the header that defines it
+target_compile_options(fidelityfx PRIVATE -w -include ${FFX_DIR}/api/internal/ffx_util.h)
+file(GLOB FSR_GLUE_SOURCES CONFIGURE_DEPENDS src/gpu/fsr/*.cpp)
+set_source_files_properties(src/gpu/fsr.cpp ${FSR_GLUE_SOURCES} PROPERTIES
+    COMPILE_OPTIONS "-isystem;${FFX_DIR};-I${CMAKE_CURRENT_SOURCE_DIR}/src/gpu/fsr" COMPILE_DEFINITIONS "${FFX_DEFINES}")
+file(GLOB_RECURSE FSR_SHADERS RELATIVE ${FFX_DIR} CONFIGURE_DEPENDS
+    ${FFX_DIR}/api/internal/gpu/*
+    ${FFX_DIR}/upscalers/fsr3/include/gpu/*
+    ${FFX_DIR}/upscalers/fsr3/internal/shaders/*
+    ${FFX_DIR}/framegeneration/fsr3/include/gpu/*
+    ${FFX_DIR}/framegeneration/fsr3/internal/shaders/*)
+foreach(file ${FSR_SHADERS})
+    configure_file(${FFX_DIR}/${file} ${CMAKE_BINARY_DIR}/FSR/shaders/${file} COPYONLY)
+endforeach()
+configure_file(${FFX_DIR}/license.txt ${CMAKE_BINARY_DIR}/FSR/license.txt COPYONLY)
+
+# FSR's shader compiler, dxcompiler.dll and dxil.dll: the newest Windows SDK's unless SCDA_DXC_DIR says
+if(NOT SCDA_DXC_DIR)
+    file(GLOB SCDA_DXC_DIRS "C:/Program Files (x86)/Windows Kits/10/bin/10.*/x64")
+    list(SORT SCDA_DXC_DIRS COMPARE NATURAL ORDER DESCENDING)
+    foreach(dir ${SCDA_DXC_DIRS})
+        if(EXISTS ${dir}/dxcompiler.dll AND EXISTS ${dir}/dxil.dll)
+            set(SCDA_DXC_DIR ${dir})
+            break()
+        endif()
+    endforeach()
+endif()
+if(NOT SCDA_DXC_DIR)
+    message(WARNING "dxcompiler.dll and dxil.dll not found, set SCDA_DXC_DIR to the folder holding them")
+endif()
+
 file(GLOB HOST_SOURCES CONFIGURE_DEPENDS src/*/*.cpp)
 list(FILTER HOST_SOURCES EXCLUDE REGEX "/src/(game|versus)/")
+list(APPEND HOST_SOURCES ${FSR_GLUE_SOURCES})
 # SDL's and Opus's headers go to the input, gyro and voice code alone (both are linked LINK_ONLY)
 set_source_files_properties(src/core/input.cpp src/core/gyro.cpp src/audio/voice.cpp src/audio/voice_link.cpp
     PROPERTIES
@@ -124,7 +164,12 @@ function(scda_image target xbe config partitions game_dir)
     target_compile_options(${target} PRIVATE -fno-strict-aliasing)
     target_compile_definitions(${target} PRIVATE UNICODE _UNICODE _CRT_SECURE_NO_WARNINGS)
     target_link_libraries(${target} PRIVATE tomlplusplus::tomlplusplus $<LINK_ONLY:SDL3::SDL3-static> $<LINK_ONLY:opus> d3d11 d3d12 dxgi dxguid d3dcompiler xaudio2 ole32 windowscodecs dbghelp winmm dwmapi ws2_32)
-    target_link_libraries(${target} PRIVATE ${GEN}/code.lib delayimp)
+    target_link_libraries(${target} PRIVATE ${GEN}/code.lib delayimp fidelityfx)
+    if(SCDA_DXC_DIR)
+        add_custom_command(TARGET ${target} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${SCDA_DXC_DIR}/dxcompiler.dll ${SCDA_DXC_DIR}/dxil.dll
+                    $<TARGET_FILE_DIR:${target}>)
+    endif()
     target_link_options(${target} PRIVATE -fuse-ld=lld -g -Wl,/delayload:${target}.dll)
 
     # without a C runtime: the executable passes on what the code calls
