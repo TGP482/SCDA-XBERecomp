@@ -53,6 +53,7 @@ constexpr Entry kEntries[] = {
     {"HDR OUTPUT", {u"Sortie HDR", u"HDR-Ausgabe", u"Uscita HDR", u"Salida HDR"}},
     {"TONE MAPPING", {u"Assignation des teintes", u"Tone Mapping", u"Tone mapping", u"Mapeado por tonos"}},
     {"AMBIENT OCCLUSION", {u"Occlusion ambiante", u"Ambient Occlusion", u"Occlusione ambientale", u"Oclusión ambiental"}},
+    {"ANTI ALIASING", {u"Anticrénelage", u"Kantenglättung", u"Antialiasing", u"Antialiasing"}},
     {"ANISOTROPIC FILTERING", {u"Filtrage anisotropique", u"Anisotropische Filterung", u"Filtro anisotropico", u"Filtro anisotrópico"}},
     {"SHADOW RESOLUTION", {u"Résolution des ombres", u"Schattenauflösung", u"Risoluzione delle ombre", u"Resolución de sombras"}},
     {"SHADOW DISTANCE", {u"Distance des ombres", u"Schattendistanz", u"Distanza delle ombre", u"Distancia de sombras"}},
@@ -266,8 +267,8 @@ std::u16string app::Translate(std::string_view text, std::string (*rest)(std::st
 std::string app::TitleCase(std::string_view text) {
     constexpr std::string_view kSmall[] = {"AND", "OR", "OF", "TO", "A"};
     constexpr std::string_view kKeep[] = {"FPS", "FMV", "EEV", "EMF", "LMB", "RMB", "MMB", "IP", "OPSAT", "ESC", "HDR",
-                                          "MSAA", "SMAA", "SSAO", "GTAO", "HUD", "LB", "RB", "LT", "RT", "LS", "RS",
-                                          "PNG", "DDS"};
+                                          "MSAA", "SMAA", "TAA", "SSAO", "GTAO", "HUD", "LB", "RB", "LT", "RT", "LS",
+                                          "RS", "PNG", "DDS"};
     std::string out;
     size_t i = 0;
     while (i < text.size()) {

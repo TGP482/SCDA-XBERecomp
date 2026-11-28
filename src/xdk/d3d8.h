@@ -17,5 +17,8 @@ void FilterShadows(const float* m);
 void ApplyShadows();
 // draws from here on are magnified about the viewport's centre, 1 for none
 void ViewScale(float xy);
+// TAA over the frame's view, from its first draw to before its post effects; m: its WorldToScreen, rows of 4
+void SceneBegin(const float* m);
+void SceneEnd();
 
 }  // namespace d3d

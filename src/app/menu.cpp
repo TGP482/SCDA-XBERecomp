@@ -39,7 +39,7 @@ std::atomic<bool> g_open{false};
 constexpr uint32_t kAnisoValues[] = {0, 2, 4, 8, 16};
 const char* const kAnisoNames[] = {"OFF", "2x", "4x", "8x", "16x"};
 constexpr uint32_t kMsaaValues[] = {0, 2, 4, 8};
-const char* const kMsaaNames[] = {"OFF", "2x", "4x", "8x"};
+const char* const kMsaaNames[] = {"OFF", "2X MSAA", "4X MSAA", "8X MSAA"};
 constexpr uint32_t kAoValues[] = {0, 1, 2};
 const char* const kAoNames[] = {"OFF", "SSAO", "GTAO"};
 constexpr uint32_t kFmvScales[] = {0, 1};
@@ -312,7 +312,7 @@ enum RowId {
     kDisplayMode, kResolution, kRenderResolution, kMaxFps, kVsync, kFpsCounter, kAniso, kShadowResolution,
     kShaderModel, kHdr, kToneMapping, kSkipIntros, kTickRate, kInputDelay, kJoinIp, kMicrophone,
     kPushToTalk, kSensitivity, kInvertMouse,
-    kPlayer1, kPlayer2, kShadowDistance, kMsaa, kFov, kAmbientOcclusion, kSmaa, kLanguage, kMonitor,
+    kPlayer1, kPlayer2, kShadowDistance, kAntiAliasing, kFov, kAmbientOcclusion, kSmaa, kLanguage, kMonitor,
     kAudioOutput, kHdrOutput, kShadowFilter, kBrightness, kContrast, kPauseOnFocusLoss, kFreeLookSensitivity, kWeaponSensitivity,
     kSniperSensitivity, kFmvScale, kColourBlind, kAimHorizontal, kAimVertical, kInvertMouseX, kInvertPadX, kInvertPadY,
     kSensitivityVertical, kPadDeadZone, kPadHorizontal, kPadVertical, kPadAimHorizontal, kPadAimVertical,
@@ -355,7 +355,7 @@ constexpr Row kSettingsRows[] = {
     {Kind::Value, kHdr, "HDR RENDERING"},
     {Kind::Value, kToneMapping, "TONE MAPPING"},
     {Kind::Value, kAmbientOcclusion, "AMBIENT OCCLUSION"},
-    {Kind::Value, kMsaa, "MSAA"},
+    {Kind::Value, kAntiAliasing, "ANTI ALIASING"},
     {Kind::Value, kSmaa, "SMAA"},
     {Kind::Value, kAniso, "ANISOTROPIC FILTERING"},
     {Kind::Value, kShadowResolution, "SHADOW RESOLUTION"},
@@ -599,9 +599,18 @@ bool StepGraphicsRow(int id, int step, Settings& s, char (&text)[64]) {
             if (step) s.shader_model = StepIndex(s.shader_model >= 3, step, 2) ? 3 : 1;
             std::snprintf(text, sizeof(text), "%s", s.shader_model >= 3 ? "3.0" : "1.1 (DEFAULT)");
             return true;
-        case kMsaa:
-            std::snprintf(text, sizeof(text), "%s", kMsaaNames[StepTable(kMsaaValues, s.msaa, step)]);
+        case kAntiAliasing: {
+            // MSAA's sample counts, then TAA, which versus doesn't draw
+            constexpr int kTaa = int(std::size(kMsaaValues));
+            int i = s.taa ? kTaa : NearestIndex(kMsaaValues, kTaa, s.msaa);
+            if (step) {
+                i = StepIndex(i, step, kVersus ? kTaa : kTaa + 1);
+                s.taa = i == kTaa;
+                s.msaa = s.taa ? 0 : kMsaaValues[i];
+            }
+            std::snprintf(text, sizeof(text), "%s", s.taa ? "TAA" : kMsaaNames[i]);
             return true;
+        }
         case kAmbientOcclusion:
             std::snprintf(text, sizeof(text), "%s", kAoNames[StepTable(kAoValues, s.ambient_occlusion, step)]);
             return true;

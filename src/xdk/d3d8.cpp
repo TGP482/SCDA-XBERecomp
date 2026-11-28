@@ -203,6 +203,16 @@ void ApplyShadows() {
     if (g_backend) g_backend->ApplyShadows(g_state);
 }
 
+void SceneBegin(const float* m) {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (g_backend) g_backend->SceneBegin(m);
+}
+
+void SceneEnd() {
+    std::lock_guard<std::recursive_mutex> lock(g_lock);
+    if (g_backend) g_backend->SceneEnd(g_state);
+}
+
 }  // namespace d3d
 
 using namespace d3d;
@@ -235,7 +245,8 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
     }
     if (!g_backend) {
         uint32_t direct3d = app::Get().direct3d;
-        g_backend = gpu::CreateBackend(direct3d);
+        // the threaded backend keeps the size for a renderer swapped in later
+        g_backend = gpu::CreateThreadedBackend(gpu::CreateBackend(direct3d), direct3d);
         if (!g_backend->Init(w, h)) {
             LOGE("d3d: renderer init failed");
             // no owner window, as this runs on the title's thread and the window may already be fullscreen over the box
@@ -247,7 +258,6 @@ HLE_STDCALL(Direct3D_CreateDevice, 6) {
             MessageBoxW(nullptr, text, L"Splinter Cell: Double Agent", MB_ICONERROR | MB_TOPMOST);
             Shutdown(1);
         }
-        g_backend = gpu::CreateThreadedBackend(std::move(g_backend), direct3d);
     }
     g_state = gpu::State{};
     g_state.viewport = {0, 0, w, h, 0.0f, 1.0f};

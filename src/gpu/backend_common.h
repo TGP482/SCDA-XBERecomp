@@ -297,6 +297,26 @@ RECT ScaledViewportRect(const Viewport& v, const TargetBase& rt);
 RECT ScaledRect(const TargetBase& t, int x0, int y0, int x1, int y1);
 RECT ViewportScissorRect(const State& s, uint32_t gw, float w, float h);
 
+// TAA
+constexpr uint32_t kTaaPhases = 8;  // jitter positions before they repeat
+constexpr DXGI_FORMAT kMotionFormat = DXGI_FORMAT_R16G16_FLOAT;
+constexpr uint32_t kMotionConstants = 24;
+// phase i's jitter in pixels, -0.5 to 0.5 on each axis
+void TaaJitter(uint32_t i, float out[2]);
+// what the motion pass reprojects: the view's WorldToScreen this frame and last, its viewport, the scene target's
+// console size and host pixels per console pixel, the jitter its draws took in host pixels
+struct MotionView {
+    const float* now;
+    const float* last;
+    Viewport viewport;
+    uint32_t gw;
+    uint32_t gh;
+    float scale[2];
+    float jitter[2];
+};
+// kTaaHlsl's motion constants; false when the view can't be reprojected
+bool FillMotionConstants(const MotionView& v, float out[kMotionConstants]);
+
 // shaders and pipeline keys
 DrawShaders ClassifyShaders(const State& s, const Assembled& a, uint32_t count);
 void EnsureProgramHash(const State& s);

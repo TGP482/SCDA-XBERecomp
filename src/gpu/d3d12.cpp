@@ -37,6 +37,7 @@
 #include "core/log.h"
 #include "gpu/backend.h"
 #include "gpu/backend_common.h"
+#include "gpu/cas_shader.h"
 #include "gpu/pipeline_cache.h"
 #include "gpu/shaders.h"
 #include "gpu/smaa_shader.h"
@@ -61,14 +62,16 @@ constexpr uint32_t kSamplerCount = 2048;
 constexpr uint32_t kRtvCount = 1024;
 constexpr uint32_t kDsvCount = 256;
 // post pass views after the back buffers': bloom pair, exposure, ambient occlusion pair, SMAA's three, HDR10
-// output's frame and panel, the soft shadow targets
+// output's frame and panel, the soft shadow targets, TAA's motion and history pair
 constexpr uint32_t kBloomRtv = 0;
 constexpr uint32_t kExposureRtv = 2;
 constexpr uint32_t kAoRtv = 3;
 constexpr uint32_t kSmaaRtv = 5;
 constexpr uint32_t kOutRtv = 8;
 constexpr uint32_t kSoftShadowRtv = 10;
-constexpr uint32_t kPostRtvs = 14;
+constexpr uint32_t kMotionRtv = 14;
+constexpr uint32_t kTaaRtv = 15;
+constexpr uint32_t kPostRtvs = 17;
 D3D12_BLEND Blend(uint32_t v, bool alpha) {
     switch (v) {
         case 0: return D3D12_BLEND_ZERO;
@@ -228,6 +231,8 @@ public:
     void Occlusion(const State& s, const float p[kOcclusionParams]) override;
     void FilterShadows(const State& s, const float p[kShadowFilterParams]) override;
     void ApplyShadows(const State& s) override;
+    void SceneBegin(const float world_to_screen[16]) override;
+    void SceneEnd(const State& s) override;
     void WaitGpuFrame(uint64_t n) override;
 
 private:
@@ -350,6 +355,11 @@ private:
     bool DrawSoftShadowPass(const SoftShadowFrame& f, const SoftShadowPass& pass);
     ID3D12PipelineState* EnsureSoftShadowPipeline(const SoftShadowPass& pass, bool ms);
     void CreateSoftShadowViews(uint32_t slot, const SoftShadowPass& pass, bool ms);
+    // SceneEnd, in order
+    bool EnsureTaaTargets(const Target& rt);
+    bool DrawMotion(Target& rt, Target& ds, const MotionView& view);
+    bool ResolveTaa(Target& rt, bool reset);
+    void Sharpen(Target& rt);
     // Draw, in call order, each callee right after its caller
     bool BindTargets(const State& s);
     bool EnterHdrForScene(const State& s, const Assembled& a);
@@ -564,6 +574,25 @@ private:
     uint32_t soft_scale_ = 1;  // the copy and the mask over Chaos Theory's 256x256 and 128x128
     uint32_t soft_rt_ = 0;  // surface data of the scene FilterShadows filtered, 0 when none is pending
     SoftShadowFrame soft_frame_{};
+    // TAA: the view between SceneBegin and SceneEnd, its draws to back buffer sized targets offset by jitter host
+    // pixels; motion and the history pair at the scene's size and format
+    struct Taa {
+        bool open = false;
+        bool fresh = true;  // the history holds nothing yet
+        float jitter[2] = {};
+        uint32_t phase = 0;
+        float world_to_screen[16] = {};
+        float last[16] = {};  // the view last resolved
+        uint64_t last_present = 0;
+        ComPtr<ID3D12Resource> motion;
+        D3D12_RESOURCE_STATES motion_state = {};
+        ComPtr<ID3D12Resource> history[2];
+        D3D12_RESOURCE_STATES history_state[2] = {};
+        uint32_t now = 0;  // the history written last
+        uint32_t w = 0;
+        uint32_t h = 0;
+        DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+    } taa_;
     // SMAA: edges, blend weights and the blended frame, at the frame's size; its two lookups
     ComPtr<ID3D12Resource> smaa_[3];
     ComPtr<ID3D12Resource> smaa_lut_[2];
@@ -1643,6 +1672,127 @@ void D3D12Backend::ApplyShadows(const State& s) {
     rt->drawn = true;
 }
 
+// TAA
+
+// what the last views did, logged when it changes
+void LogTaa(const char* what) {
+    static std::string last;
+    if (what == last) return;
+    last = what;
+    LOGR("TAA: %s", what);
+}
+
+void D3D12Backend::SceneBegin(const float world_to_screen[16]) {
+    std::memcpy(taa_.world_to_screen, world_to_screen, sizeof(taa_.world_to_screen));
+    TaaJitter(taa_.phase++, taa_.jitter);
+    taa_.open = true;
+}
+
+// the view's motion from its depth, its colour resolved over the history, then sharpened back into the scene
+void D3D12Backend::SceneEnd(const State& s) {
+    if (!std::exchange(taa_.open, false)) return;
+    Target* rt = FindTarget(s.rt, false);
+    Target* ds = FindTarget(s.zs, true);
+    bool scene = rt && ds && rt->gw == guest_w_ && rt->gh == guest_h_ && ds->w == rt->w && ds->h == rt->h;
+    if (!scene || rt->samples > 1 || ds->samples > 1) {
+        LogTaa("the view drew no single sample back buffer sized scene");
+        return;
+    }
+    if (!EnsureTaaTargets(*rt)) return;
+    if (cap_.file) {
+        CapStep(s.rt);
+        fprintf(cap_.file, "%04u taa rt %08X ds %08X jitter %.3f %.3f\n", cap_.i++, s.rt.data, s.zs.data,
+                taa_.jitter[0], taa_.jitter[1]);
+    }
+    // a history older than the last present shows another view
+    bool reset = taa_.fresh || presents_ - taa_.last_present > 1;
+    MotionView view{.now = taa_.world_to_screen,
+                    .last = reset ? taa_.world_to_screen : taa_.last,
+                    .viewport = s.viewport,
+                    .gw = rt->gw,
+                    .gh = rt->gh,
+                    .scale = {float(rt->w) / float(rt->gw), float(rt->h) / float(rt->gh)},
+                    .jitter = {taa_.jitter[0], taa_.jitter[1]}};
+    std::memcpy(taa_.last, taa_.world_to_screen, sizeof(taa_.last));
+    taa_.last_present = presents_;
+    if (!DrawMotion(*rt, *ds, view) || !ResolveTaa(*rt, reset)) {
+        LogTaa("not resolved, the view can't be reprojected or a pass failed");
+        taa_.fresh = true;
+        return;
+    }
+    taa_.fresh = false;
+    Sharpen(*rt);
+    char what[64];
+    std::snprintf(what, sizeof(what), "resolving %ux%u", rt->w, rt->h);
+    LogTaa(what);
+}
+
+// made again when the scene's size or format changes
+bool D3D12Backend::EnsureTaaTargets(const Target& rt) {
+    if (taa_.motion && taa_.w == rt.w && taa_.h == rt.h && taa_.fmt == rt.fmt) return true;
+    taa_.w = 0;
+    taa_.fresh = true;
+    bool ok = CreatePostTarget(taa_.motion, taa_.motion_state, kMotionFormat, rt.w, rt.h, kMotionRtv);
+    for (int i = 0; i < 2 && ok; i++) {
+        ok = CreatePostTarget(taa_.history[i], taa_.history_state[i], rt.fmt, rt.w, rt.h, kTaaRtv + i);
+    }
+    if (!ok) {
+        LOGE("d3d12: no %ux%u TAA targets", rt.w, rt.h);
+        return false;
+    }
+    taa_.w = rt.w;
+    taa_.h = rt.h;
+    taa_.fmt = rt.fmt;
+    return true;
+}
+
+bool D3D12Backend::DrawMotion(Target& rt, Target& ds, const MotionView& view) {
+    float c[kMotionConstants];
+    if (!FillMotionConstants(view, c)) return false;
+    bound_rt_ = bound_ds_ = nullptr;
+    Transition(ds.res.Get(), ds.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(taa_.motion.Get(), taa_.motion_state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    PostInputs in{{ds.res.Get()}, {kDepthViewFormat}};
+    PostTarget out{PostRtv(kMotionRtv), kMotionFormat, rt.w, rt.h};
+    return DrawPostPass("motion", out, in, c, {.hlsl = kMotionHlsl});
+}
+
+// this frame's history from the scene over last frame's
+bool D3D12Backend::ResolveTaa(Target& rt, bool reset) {
+    uint32_t prev = taa_.now;
+    uint32_t now = prev ^ 1;
+    Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(taa_.history[prev].Get(), taa_.history_state[prev], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(taa_.motion.Get(), taa_.motion_state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(taa_.history[now].Get(), taa_.history_state[now], D3D12_RESOURCE_STATE_RENDER_TARGET);
+    PostInputs in{{rt.res.Get(), taa_.history[prev].Get(), taa_.motion.Get()}, {rt.fmt, rt.fmt, kMotionFormat}};
+    PostTarget out{PostRtv(kTaaRtv + now), rt.fmt, rt.w, rt.h};
+    const float p[4] = {taa_.jitter[0] / float(rt.w), taa_.jitter[1] / float(rt.h), reset ? 1.0f : 0.0f, 0};
+    if (!DrawPostPass("taa", out, in, p, {.hlsl = kTaaHlsl})) return false;
+    taa_.now = now;
+    return true;
+}
+
+// CAS from the history into the scene; on failure the history is copied in unsharpened
+void D3D12Backend::Sharpen(Target& rt) {
+    static const std::string hlsl = std::string(kCasDefines) + kFfxA + kCasLoad + kFfxCas + kCasPass;
+    // CasSetup (ffx_cas.h) without scaling, at sharpness 0, AMD's default with the least ringing
+    constexpr float kSharpness = 0.0f;
+    ComPtr<ID3D12Resource>& history = taa_.history[taa_.now];
+    D3D12_RESOURCE_STATES& state = taa_.history_state[taa_.now];
+    Transition(history.Get(), state, D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_RENDER_TARGET);
+    const float p[4] = {-1.0f / std::lerp(8.0f, 5.0f, kSharpness), 0, 8, 0};
+    PostInputs in{{history.Get()}, {rt.fmt}};
+    PostTarget out{Cpu(rtv_heap_.Get(), rt.view, rtv_inc_), rt.fmt, rt.w, rt.h};
+    if (!DrawPostPass("cas", out, in, p, {.hlsl = hlsl.c_str()})) {
+        Transition(history.Get(), state, D3D12_RESOURCE_STATE_COPY_SOURCE);
+        Transition(rt.res.Get(), rt.state, D3D12_RESOURCE_STATE_COPY_DEST);
+        cl_->CopyResource(rt.res.Get(), history.Get());
+    }
+    rt.drawn = true;
+}
+
 bool D3D12Backend::EnsureAoTargets(uint32_t w, uint32_t h) {
     if (ao_[1] && ao_w_ == w && ao_h_ == h) return true;
     ao_w_ = w;
@@ -2366,6 +2516,11 @@ void D3D12Backend::SetViewportScissor(const State& s, uint32_t gw) {
     float W = float(bound_rt_ ? bound_rt_->w : bound_ds_->w);
     float H = float(bound_rt_ ? bound_rt_->h : bound_ds_->h);
     D3D12_VIEWPORT vp{0, 0, W, H, 0, 1};
+    const Target* t = bound_rt_ ? bound_rt_ : bound_ds_;
+    if (taa_.open && t->gw == guest_w_ && t->gh == guest_h_) {
+        vp.TopLeftX = taa_.jitter[0];
+        vp.TopLeftY = taa_.jitter[1];
+    }
     cl_->RSSetViewports(1, &vp);
     D3D12_RECT rect = ViewportScissorRect(s, gw, W, H);
     cl_->RSSetScissorRects(1, &rect);

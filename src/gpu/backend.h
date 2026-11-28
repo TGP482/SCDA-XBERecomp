@@ -49,6 +49,10 @@ public:
     // depth with view z = p[0] / (ndc depth - p[1]); ApplyShadows, after the game's own edge blur, writes it back
     virtual void FilterShadows(const State&, const float /*p*/[kShadowFilterParams]) {}
     virtual void ApplyShadows(const State&) {}
+    // TAA over the frame's view: from SceneBegin its draws to back buffer sized targets are jittered, SceneEnd
+    // resolves them into the scene before the post effects. world_to_screen: the view's, rows of 4, -1..1 y up
+    virtual void SceneBegin(const float /*world_to_screen*/[16]) {}
+    virtual void SceneEnd(const State&) {}
 
     // the XDK's fences and busy checks against the render thread; a backend that draws at once is never behind
     virtual uint32_t Fence() { return ++fence_; }

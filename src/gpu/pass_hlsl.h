@@ -1,6 +1,7 @@
 #pragma once
 
-// HLSL of the renderers' own full screen passes: blits, HDR resolve, HDR10 output, SMAA, ambient occlusion, soft shadows
+// HLSL of the renderers' own full screen passes: blits, HDR resolve, HDR10 output, SMAA, ambient occlusion, soft
+// shadows, TAA
 namespace gpu {
 
 inline constexpr const char* kBlitHlsl = R"(
@@ -401,6 +402,117 @@ float4 shadow_filter(float4 pos : SV_Position) : SV_Target {
     return lerp(lit, sum / weights, blend);
 }
 float4 shadow_apply(float4 pos : SV_Position) : SV_Target { return float4(0, 0, 0, scene.Load(int3(pos.xy, 0)).x); }
+)";
+
+// TAA's motion: the scene's depth reprojected into last frame's view (FillMotionConstants)
+inline constexpr const char* kMotionHlsl = R"(
+cbuffer P : register(b1) {
+    row_major float4x4 reproject;
+    float4 ndc;
+    float4 zuv;
+};
+Texture2D<float> depth : register(t0);
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 t = float2((id << 1) & 2, id & 2);
+    return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+// last frame's uv minus this one's; 2 where last frame's view can't see it
+float2 motion(float4 pos : SV_Position) : SV_Target {
+    float2 n = pos.xy * ndc.xy + ndc.zw;
+    float z = (depth.Load(int3(pos.xy, 0)) - zuv.x) * zuv.y;
+    float4 last = mul(float4(n, z, 1), reproject);
+    if (last.w <= 0) return 2;
+    return clamp((last.xy / last.w - n) * zuv.zw, -2, 2);
+}
+)";
+
+// TAA: the scene blended into its history where its motion carries it back, the history clipped to the scene around
+// each pixel. p0.xy the jitter in uv, p0.z 1 when the history holds nothing
+inline constexpr const char* kTaaHlsl = R"(
+cbuffer P : register(b1) { float4 p0; };
+Texture2D scene : register(t0);
+Texture2D history : register(t1);
+Texture2D<float2> motion : register(t2);
+SamplerState ls : register(s0);
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 t = float2((id << 1) & 2, id & 2);
+    return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float3 ycocg(float3 c) {
+    return float3(dot(c, float3(0.25, 0.5, 0.25)), dot(c, float3(0.5, 0, -0.5)), dot(c, float3(-0.25, 0.5, -0.25)));
+}
+float3 rgb(float3 c) {
+    return float3(c.x + c.y - c.z, c.x + c.z, c.x - c.y - c.z);
+}
+// Catmull Rom from nine bilinear taps, so the history stays sharp as it moves
+float3 history_at(float2 uv, float2 size) {
+    float2 p = uv * size - 0.5;
+    float2 f = frac(p);
+    float2 c = (floor(p) + 0.5) / size;
+    float2 w0 = f * (-0.5 + f * (1 - 0.5 * f));
+    float2 w1 = 1 + f * f * (-2.5 + 1.5 * f);
+    float2 w2 = f * (0.5 + f * (2 - 1.5 * f));
+    float2 w3 = f * f * (-0.5 + 0.5 * f);
+    float2 at[3] = {c - 1 / size, c + w2 / (w1 + w2) / size, c + 2 / size};
+    float2 w[3] = {w0, w1 + w2, w3};
+    float3 r = 0;
+    for (int y = 0; y < 3; y++) {
+        for (int x = 0; x < 3; x++) r += history.SampleLevel(ls, float2(at[x].x, at[y].y), 0).rgb * w[x].x * w[y].y;
+    }
+    return max(r, 0);
+}
+float4 taa(float4 pos : SV_Position) : SV_Target {
+    int2 px = int2(pos.xy);
+    float2 size;
+    scene.GetDimensions(size.x, size.y);
+    float2 uv = pos.xy / size;
+    // alpha holds the game's own masks: the scene's, unjittered
+    float alpha = scene.SampleLevel(ls, uv + p0.xy, 0).a;
+    float3 c = ycocg(scene.Load(int3(px, 0)).rgb);
+    float3 sum = 0;
+    float3 sq = 0;
+    for (int y = -1; y <= 1; y++) {
+        for (int x = -1; x <= 1; x++) {
+            float3 n = ycocg(scene.Load(int3(clamp(px + int2(x, y), 0, int2(size) - 1), 0)).rgb);
+            sum += n;
+            sq += n * n;
+        }
+    }
+    float2 mv = motion.Load(int3(px, 0));
+    float2 last = uv + mv;
+    if (p0.z > 0 || any(abs(mv) >= 2) || any(last != saturate(last))) return float4(rgb(c), alpha);
+    float3 mean = sum / 9;
+    float3 spread = sqrt(max(sq / 9 - mean * mean, 0)) * 1.25 + 1e-5;
+    float3 h = ycocg(history_at(last, size));
+    float3 v = abs(h - mean) / spread;
+    float out_by = max(v.x, max(v.y, v.z));
+    if (out_by > 1) h = mean + (h - mean) / out_by;
+    // weighted by inverse luma so bright specks don't flicker
+    float wc = 0.1 / (1 + c.x);
+    float wh = 0.9 / (1 + h.x);
+    return float4(rgb((c * wc + h * wh) / (wc + wh)), alpha);
+}
+)";
+
+// AMD CAS around ffx_a.h and ffx_cas.h (cas_shader.h): TAA's frame sharpened, a pixel each, its alpha kept
+inline constexpr const char* kCasDefines = "#define A_GPU 1\n#define A_HLSL 1\n";
+inline constexpr const char* kCasLoad = R"(
+cbuffer P : register(b1) { uint4 const1; };
+Texture2D img : register(t0);
+AF3 CasLoad(ASU2 p) { return img.Load(int3(p, 0)).rgb; }
+void CasInput(inout AF1 r, inout AF1 g, inout AF1 b) {}
+)";
+inline constexpr const char* kCasPass = R"(
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 t = float2((id << 1) & 2, id & 2);
+    return float4(t * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+float4 cas(float4 pos : SV_Position) : SV_Target {
+    AF3 c;
+    // sharpening alone reads no scaling constants
+    CasFilter(c.r, c.g, c.b, AU2(pos.xy), AU4(0, 0, 0, 0), const1, true);
+    return float4(c, img.Load(int3(pos.xy, 0)).a);
+}
 )";
 
 }  // namespace gpu

@@ -139,6 +139,9 @@ X86_FUNC(sub_002898CB) {
 
 namespace game {
 
+// the frame's own view node, 0 before the first frame
+uint32_t FrameView() { return g_view; }
+
 // The frame's view: a world point to -1..1 across the shown frame, y up, where the held-up models are drawn (grown
 // by the widened view's scale, as d3d::ViewScale draws them); false behind the camera or before the first frame.
 bool ProjectModel(const float point[3], float& x, float& y) {

@@ -834,4 +834,89 @@ void WriteBmp(const CaptureLog& cap, const char* name, const std::vector<uint8_t
     fclose(f);
 }
 
+// TAA
+
+namespace {
+
+void Multiply(const float a[16], const float b[16], float out[16]) {
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            float v = 0;
+            for (int k = 0; k < 4; k++) v += a[r * 4 + k] * b[k * 4 + c];
+            out[r * 4 + c] = v;
+        }
+    }
+}
+
+// Gauss Jordan with partial pivoting
+bool Invert(const float m[16], float out[16]) {
+    double a[4][8];
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) {
+            a[r][c] = m[r * 4 + c];
+            a[r][c + 4] = r == c ? 1 : 0;
+        }
+    }
+    for (int c = 0; c < 4; c++) {
+        int pivot = c;
+        for (int r = c + 1; r < 4; r++) {
+            if (std::fabs(a[r][c]) > std::fabs(a[pivot][c])) pivot = r;
+        }
+        if (std::fabs(a[pivot][c]) < 1e-12) return false;
+        std::swap(a[c], a[pivot]);
+        double inv = 1 / a[c][c];
+        for (double& v : a[c]) v *= inv;
+        for (int r = 0; r < 4; r++) {
+            if (r == c) continue;
+            double f = a[r][c];
+            for (int k = 0; k < 8; k++) a[r][k] -= f * a[c][k];
+        }
+    }
+    for (int r = 0; r < 4; r++) {
+        for (int c = 0; c < 4; c++) out[r * 4 + c] = float(a[r][c + 4]);
+    }
+    return true;
+}
+
+// the radical inverse of i in base b, 0 to 1
+float Halton(uint32_t i, uint32_t b) {
+    float f = 1;
+    float r = 0;
+    for (; i; i /= b) {
+        f /= float(b);
+        r += f * float(i % b);
+    }
+    return r;
+}
+
+}  // namespace
+
+void TaaJitter(uint32_t i, float out[2]) {
+    uint32_t n = i % kTaaPhases + 1;
+    out[0] = Halton(n, 2) - 0.5f;
+    out[1] = Halton(n, 3) - 0.5f;
+}
+
+bool FillMotionConstants(const MotionView& v, float out[kMotionConstants]) {
+    const Viewport& vp = v.viewport;
+    float zr = vp.max_z - vp.min_z;
+    float inv[16];
+    if (zr <= 0 || !vp.w || !vp.h || !Invert(v.now, inv)) return false;
+    // a point at this frame's ndc to last frame's clip space
+    Multiply(inv, v.last, out);
+    float vw = float(vp.w);
+    float vh = float(vp.h);
+    // a host pixel centre to the view's ndc, the jitter taken out
+    out[16] = 2 / (v.scale[0] * vw);
+    out[17] = -2 / (v.scale[1] * vh);
+    out[18] = -2 * (v.jitter[0] / v.scale[0] + float(vp.x)) / vw - 1;
+    out[19] = 2 * (v.jitter[1] / v.scale[1] + float(vp.y)) / vh + 1;
+    // depth to ndc z, then a step in ndc to one in the target's uv
+    out[20] = vp.min_z;
+    out[21] = 1 / zr;
+    out[22] = 0.5f * vw / float(v.gw);
+    out[23] = -0.5f * vh / float(v.gh);
+    return true;
+}
+
 }  // namespace gpu

@@ -42,7 +42,8 @@ constexpr uint32_t kHeaderRing = 1u << 20;  // guest memory for header copies; a
 enum class WaitFor : uint8_t { ReadBack, Resource, Fence, Flush, Copy, Frame, Count };
 
 enum class Op : uint8_t {
-    State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, Occlusion, FilterShadows, ApplyShadows
+    State, Draw, Clear, Copy, Present, Sync, RecordLate, Flush, Gamma, Occlusion, FilterShadows, ApplyShadows,
+    SceneBegin, SceneEnd
 };
 
 struct Cmd {
@@ -243,6 +244,20 @@ public:
         SendState(s);
         cur_->cmds.push_back(Cmd{Op::ApplyShadows});
         Use(s.rt.header);
+        Written(s.rt);
+    }
+
+    void SceneBegin(const float world_to_screen[16]) override {
+        Cmd c{Op::SceneBegin};
+        c.data = Put(world_to_screen, 16 * sizeof(float));
+        cur_->cmds.push_back(c);
+    }
+
+    void SceneEnd(const State& s) override {
+        SendState(s);
+        cur_->cmds.push_back(Cmd{Op::SceneEnd});
+        Use(s.rt.header);
+        Use(s.zs.header);
         Written(s.rt);
     }
 
@@ -489,6 +504,13 @@ private:
                 break;
             }
             case Op::ApplyShadows: inner_->ApplyShadows(state_); break;
+            case Op::SceneBegin: {
+                float m[16];
+                std::memcpy(m, data, sizeof(m));
+                inner_->SceneBegin(m);
+                break;
+            }
+            case Op::SceneEnd: inner_->SceneEnd(state_); break;
         }
     }
 
