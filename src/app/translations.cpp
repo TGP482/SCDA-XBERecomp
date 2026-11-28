@@ -41,6 +41,7 @@ constexpr Entry kEntries[] = {
     {"VERTICAL SYNC", {u"Synchro verticale", u"V-Sync", u"Sincronia verticale", u"Sincronismo vertical"}},
     {"MAX FRAME RATE", {u"Images par seconde max.", u"Max. Bildrate", u"Frame rate massimo", u"Fotogramas por segundo máx."}},
     {"FPS COUNTER", {u"Compteur d'images par seconde", u"FPS-Anzeige", u"Contatore FPS", u"Contador de FPS"}},
+    {"RENDERER", {u"Moteur de rendu", u"Renderer", u"Renderer", u"Renderizador"}},
     {"SHADER MODEL", {u"Modèle de shader", u"Shader Model", u"Modello di shader", u"Modelo de shader"}},
     {"HDR RENDERING", {u"Rendu HDR", u"HDR-Rendering", u"Rendering HDR", u"Renderizado HDR"}},
     {"FMV SCALE", {u"Échelle des cinématiques", u"Videoskalierung", u"Scala dei filmati", u"Escala de vídeos"}},
@@ -276,6 +277,7 @@ std::string app::TitleCase(std::string_view text) {
         bool digit = word.find_first_of("0123456789") != std::string::npos;
         if (word == "HZ") word = "Hz";
         else if (word == "D-PAD") word = "D-Pad";
+        else if (word == "DIRECTX") word = "DirectX";
         else if (word == "MS") word = "ms";
         else if (!digit && std::find(std::begin(kKeep), std::end(kKeep), word) == std::end(kKeep)) {
             bool small = !out.empty() && std::find(std::begin(kSmall), std::end(kSmall), word) != std::end(kSmall);

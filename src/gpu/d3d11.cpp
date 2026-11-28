@@ -266,6 +266,7 @@ struct Samplers {
 
 class D3D11Backend final : public Backend {
 public:
+    ~D3D11Backend() override;
     bool Init(uint32_t width, uint32_t height) override;
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                uint32_t stencil) override;
@@ -363,7 +364,8 @@ private:
     const States& EnsureStates(const PsoKey& k);
     void ApplyStates(const State& s, const PsoKey& k);
     void UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
-                         GuestSize size);
+                         GuestSize size, DrawConstants& c);
+    void CaptureTextures(const State& s, const DrawTextures& stages);
     void SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages);
     void SetViewportScissor(const State& s, uint32_t gw);
     void DrawGeometry(const Assembled& a);
@@ -413,6 +415,11 @@ private:
     ComPtr<ID3D11Texture2D> Shrink(ID3D11ShaderResourceView* src, uint32_t w, uint32_t h, const ShrinkOptions& o);
     bool ReadBack(ID3D11Texture2D* res, uint32_t w, uint32_t h, std::vector<uint8_t>& out);
     void ReadRows(ID3D11Texture2D* staging, uint32_t w, uint32_t h, uint8_t* out, uint32_t pitch);
+    // F3's capture: the targets as the frame leaves them, the textures its draws read
+    void FinishCapture(const Surface& front);
+    void CapStep(const Surface& rt);
+    void CapSave(Target& t, const char* name);
+    void CapSave(ID3D11ShaderResourceView* srv, uint32_t w, uint32_t h, float mul, const char* name);
     struct Late;
     void ResetLate(Late& l, const Target& t);
     void RecordLateCopy(Late& l, ID3D11Texture2D* src);
@@ -423,6 +430,7 @@ private:
     ComPtr<IDXGISwapChain3> swap_;
     ComPtr<ID3D11RenderTargetView> bb_rtv_;
     bool tearing_ = false;
+    bool ready_ = false;  // Init went through
     uint32_t bb_w_ = 0;
     uint32_t bb_h_ = 0;
 
@@ -528,6 +536,15 @@ private:
     std::mutex late_lock_;                    // DeliverLate runs on the title's thread
     std::atomic<uint64_t> presents_seen_{0};  // presents_ for DeliverLate
 
+    CaptureLog cap_;
+    struct CapTex {
+        ComPtr<ID3D11ShaderResourceView> srv;
+        uint32_t data;
+        uint32_t w;
+        uint32_t h;
+    };
+    std::vector<CapTex> cap_tex_;
+
     Assembled asm_;  // kept between draws for its buffers
     uint64_t presents_ = 0;
     std::chrono::steady_clock::time_point fps_t_ = std::chrono::steady_clock::now();
@@ -546,8 +563,25 @@ bool D3D11Backend::Init(uint32_t width, uint32_t height) {
     cache::OpenShaderFiles();
     ImGui_ImplDX11_Init(dev_.Get(), ctx_.Get());
     LoadSettings();
+    ready_ = true;
     LOGI("d3d11: %ux%u guest, %ux%u window, render scale %.3f", width, height, bb_w_, bb_h_, scale_);
     return true;
+}
+
+// a renderer swap: the build threads let go of this one; the swap chain is freed only once the context has let go
+// of everything and flushed, before the next renderer makes its own for the window
+D3D11Backend::~D3D11Backend() {
+    cache::DropJobs();
+    if (ready_) {
+        std::lock_guard lock(app::UiLock());
+        ImGui_ImplDX11_Shutdown();
+    }
+    bb_rtv_.Reset();
+    swap_.Reset();
+    if (ctx_) {
+        ctx_->ClearState();
+        ctx_->Flush();
+    }
 }
 
 bool D3D11Backend::CreateDevice() {
@@ -870,6 +904,11 @@ void D3D11Backend::DrawBloom(const PostInputs& in, const Target& t, uint32_t bw,
 
 // the frame is read: exposure, bloom and tone mapping take the target back to 0..1
 void D3D11Backend::Resolve(Target& t) {
+    if (cap_.file) {
+        char name[32];
+        snprintf(name, sizeof(name), "%04u_hdr_%08X", cap_.i, t.data);
+        CapSave(t, name);
+    }
     t.hdr = false;
     ID3D11ShaderResourceView* fb = EnsureFeedbackCopy(t);
     if (!fb) return;
@@ -1038,6 +1077,10 @@ void D3D11Backend::Occlusion(const State& s, const float p[kOcclusionParams]) {
     D3D11_RECT rect = ScaledViewportRect(v, *rt);
     if (rect.right <= rect.left || rect.bottom <= rect.top || zr <= 0) return;
     if (!EnsureAoTargets(rt->w, rt->h)) return;
+    if (cap_.file) {
+        CapStep(s.rt);
+        fprintf(cap_.file, "%04u occlusion rt %08X ds %08X\n", cap_.i++, s.rt.data, s.zs.data);
+    }
     LOG_FIRST(1, "d3d11: ambient occlusion %s %ux%u, %u samples, projection %.4f %.4f, view z %.6f / (depth - %.8f)",
               p[9] ? "GTAO" : "SSAO", rt->w, rt->h, ds->samples, 1 / p[0], 1 / p[1], p[4], p[5]);
     float rect_w = float(rect.right - rect.left);
@@ -1108,6 +1151,10 @@ void D3D11Backend::FilterShadows(const State& s, const float p[kShadowFilterPara
     D3D11_RECT rect = ScaledViewportRect(v, *rt);
     if (rect.right <= rect.left || rect.bottom <= rect.top || zr <= 0) return;
     if (!EnsureSoftShadowTargets(rt->w, rt->h)) return;
+    if (cap_.file) {
+        CapStep(s.rt);
+        fprintf(cap_.file, "%04u soft shadows rt %08X ds %08X\n", cap_.i++, s.rt.data, s.zs.data);
+    }
     float rect_w = float(rect.right - rect.left);
     float rect_h = float(rect.bottom - rect.top);
     float copy_size = float(kSoftSmallSize * soft_scale_);
@@ -1599,7 +1646,7 @@ void D3D11Backend::BuildPipelineKey(const State& s, const Assembled& a, uint64_t
 // the shader's bytecode, null when it failed or while the build threads make it: then pending is set and the draw
 // is skipped
 ID3DBlob* D3D11Backend::EnsureCode(uint64_t hash, bool wait, bool& pending) {
-    bool async = async_ && !wait;
+    bool async = async_ && !cap_.file && !wait;
     bool need = false;
     ID3DBlob* code = shaders_.EnsureCode(hash, !async, need);
     if (!need) {
@@ -1704,8 +1751,7 @@ void D3D11Backend::ApplyStates(const State& s, const PsoKey& k) {
 }
 
 void D3D11Backend::UploadConstants(const State& s, const DrawShaders& sh, const PsoKey& k, const DrawTextures& stages,
-                                   GuestSize size) {
-    DrawConstants c{};
+                                   GuestSize size, DrawConstants& c) {
     FillSurfaceConstants(s, size, c);
     FillCombinerConstants(s, c);
     FillHdrConstants(k, bound_rt_ && bound_rt_->hdr, c);
@@ -1721,7 +1767,20 @@ void D3D11Backend::UploadConstants(const State& s, const DrawShaders& sh, const 
     ctx_->PSSetConstantBuffers(0, 2, cbs);
 }
 
-// D3DTEXTUREFILTERTYPE and D3DTEXTUREADDRESS values the samplers test, past kTexfLinear and the address modes
+void D3D11Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
+    for (int i = 0; i < 4; i++) {
+        ID3D11ShaderResourceView* srv = stages.srv[i];
+        TextureDesc d;
+        if (!s.textures[size_t(i)] || !Describe(s.textures[size_t(i)], d)) continue;
+        bool tg = targets_.count(TargetKey(d.data, Format(d.format).depth));
+        fprintf(cap_.file, " | t%d %08X fmt %X %ux%u%s%s", i, d.data, d.format, d.width, d.height, tg ? " target" : "",
+                srv ? "" : " unbound");
+        if (srv && !tg && stages.info[i].kind == kTex2D && cap_.seen.insert(d.data).second) {
+            cap_tex_.push_back({srv, d.data, d.width, d.height});
+        }
+    }
+}
+
 D3D11_SAMPLER_DESC StageSampler(const State& s, int i, const DrawTextures& stages, bool clamp, uint32_t aniso) {
     D3D11_SAMPLER_DESC sd = {};
     const auto& t = s.tss[size_t(i)];
@@ -1836,6 +1895,7 @@ void D3D11Backend::DrawGeometry(const Assembled& a) {
 }
 
 void D3D11Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
+    if (cap_.file) CapStep(s.rt);
     Assembled& a = asm_;
     if (!Assemble(s, prim, start, count, indices, a)) return;
     if (!BindTargets(s)) return;
@@ -1869,7 +1929,14 @@ void D3D11Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     // constants, texture views and samplers, viewport and scissor
     GuestSize size;
     SurfaceSize(bound_rt_ ? s.rt : s.zs, size.w, size.h);
-    UploadConstants(s, sh, k, stages, size);
+    DrawConstants c{};
+    UploadConstants(s, sh, k, stages, size, c);
+    if (cap_.file) {
+        WriteDrawLine(cap_, s, {prim, count, bound_ds_ ? s.zs.data : 0}, k, c);
+        CaptureTextures(s, stages);
+        EndDrawLine(cap_, s, a, {prim, count, 0}, sh.prog, c);
+        CaptureShaders(cap_, s, a, sh, pk);
+    }
     SetTextureViewsAndSamplers(s, a, stages);
     SetViewportScissor(s, size.w);
 
@@ -1939,6 +2006,11 @@ void D3D11Backend::ClearRects(Target& t, const ClearArgs& c, const std::vector<R
 
 void D3D11Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                          uint32_t stencil) {
+    if (cap_.file) {
+        CapStep(s.rt);
+        fprintf(cap_.file, "%04u clear rt %08X ds %08X flags %X color %08X z %.3f\n", cap_.i++, s.rt.data, s.zs.data,
+                flags, color, z);
+    }
     Target* rt = (flags & kClearTarget) ? EnsureTarget(s.rt, false) : nullptr;
     Target* ds = (flags & (kClearZ | kClearStencil)) ? EnsureTarget(s.zs, true) : nullptr;
     std::vector<RECT> rs;
@@ -2014,6 +2086,11 @@ void D3D11Backend::CopyByRegion(const Target& src_t, ID3D11Texture2D* src, Targe
 void D3D11Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects,
                         uint32_t dst_points) {
     Target* src_t = FindTarget(src, false);
+    if (cap_.file) {
+        const char* from = "memory";
+        if (src_t) from = src_t->drawn ? "target" : "idle target";
+        fprintf(cap_.file, "%04u copy %08X %s to %08X\n", cap_.i++, src.data, from, dst.data);
+    }
     // pixels the CPU made: the copy happens in memory, textures and targets pick it up from there
     if (!src_t || !src_t->drawn) {
         if (!CopySurfaceMemory(src, dst, count, src_rects, dst_points)) {
@@ -2035,6 +2112,11 @@ void D3D11Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, 
         return;
     }
     CopyByRegion(*src_t, src_r.res, *dst_t, l);
+    if (cap_.file) {
+        char name[32];
+        snprintf(name, sizeof(name), "%04u_copy_%08X", cap_.i, dst_t->data);
+        CapSave(*dst_t, name);
+    }
 }
 
 // the output the window's display has: a factory made before Windows HDR was switched no longer tells
@@ -2196,6 +2278,11 @@ void D3D11Backend::CountFps() {
 }
 
 void D3D11Backend::Present(const Surface& front, bool pillarbox) {
+    if (cap_.file) {
+        FinishCapture(front);
+    } else if (g_capture.exchange(false)) {
+        StartCapture(cap_);
+    }
     DetectHdr();
     ResizeSwap();
     Target* t = EnsureTarget(front, false);
@@ -2410,6 +2497,51 @@ void D3D11Backend::RecordLate(uint32_t data) {
     if (!src.res) return;
     if (src.down) l.down = src.down;
     RecordLateCopy(l, src.res);
+}
+
+void D3D11Backend::FinishCapture(const Surface& front) {
+    CapStep(Surface{});
+    if (Target* f = FindTarget(front, false)) CapSave(*f, "final");
+    for (auto& t : cap_tex_) {
+        char name[32];
+        snprintf(name, sizeof(name), "tex_%08X", t.data);
+        CapSave(t.srv.Get(), t.w, t.h, 1, name);
+    }
+    fclose(cap_.file);
+    cap_.file = nullptr;
+    cap_tex_.clear();
+    LOGI("d3d11: frame captured to %s", cap_.dir.string().c_str());
+}
+
+// the frame moves to another target: save the one it leaves
+void D3D11Backend::CapStep(const Surface& rt) {
+    uint32_t d = rt.header ? mem::VirtualFromPhysical(rt.data) : 0;
+    if (d == cap_.rt) return;
+    auto it = targets_.find(TargetKey(cap_.rt, false));
+    if (cap_.rt && it != targets_.end()) {
+        char name[32];
+        snprintf(name, sizeof(name), "%04u_%08X", cap_.i, cap_.rt);
+        CapSave(it->second, name);
+    }
+    auto z = targets_.find(TargetKey(cap_.rt, true));
+    if (cap_.rt && z != targets_.end()) {
+        char name[32];
+        snprintf(name, sizeof(name), "%04u_%08X_z", cap_.i, cap_.rt);
+        CapSave(z->second, name);
+    }
+    cap_.rt = d;
+}
+
+void D3D11Backend::CapSave(Target& t, const char* name) {
+    Readable r = ReadableResource(t);
+    if (r.srv) CapSave(r.srv, t.gw, t.gh, t.hdr ? kHeadroom : 1, name);
+}
+
+// srv shrunk to w x h, colour times mul, as name.bmp
+void D3D11Backend::CapSave(ID3D11ShaderResourceView* srv, uint32_t w, uint32_t h, float mul, const char* name) {
+    ComPtr<ID3D11Texture2D> down = Shrink(srv, w, h, {.mul = mul});
+    std::vector<uint8_t> px;
+    if (down && ReadBack(down.Get(), w, h, px)) WriteBmp(cap_, name, px, w, h);
 }
 
 // the game's ramp is Shadow Calibration's, which can only brighten, the brightness and contrast settings replace it

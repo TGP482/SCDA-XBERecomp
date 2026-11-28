@@ -317,7 +317,7 @@ enum RowId {
     kSniperSensitivity, kFmvScale, kColourBlind, kAimHorizontal, kAimVertical, kInvertMouseX, kInvertPadX, kInvertPadY,
     kSensitivityVertical, kPadDeadZone, kPadHorizontal, kPadVertical, kPadAimHorizontal, kPadAimVertical,
     kVibration, kGyroAiming, kGyroSensitivity, kGyroAxis, kGyroButton, kGyroButtonMode, kGyroRecenter, kGyroCalibrate,
-    kTextureReplacement, kTextureDumping, kDumpFormat
+    kTextureReplacement, kTextureDumping, kDumpFormat, kRenderer
 };
 
 using rows::Kind;
@@ -350,6 +350,7 @@ constexpr Row kSettingsRows[] = {
     {Kind::Value, kFmvScale, "FMV SCALE"},
     {Kind::Value, kColourBlind, "COLOUR BLIND MODE"},
     {Kind::Heading, -1, "GRAPHICS"},
+    {Kind::Value, kRenderer, "RENDERER"},
     {Kind::Value, kShaderModel, "SHADER MODEL"},
     {Kind::Value, kHdr, "HDR RENDERING"},
     {Kind::Value, kToneMapping, "TONE MAPPING"},
@@ -590,6 +591,10 @@ bool StepDisplayRow(int id, int step, Settings& s, char (&text)[64]) {
 // the graphics rows that are no ON / OFF, stepped first; false for another row
 bool StepGraphicsRow(int id, int step, Settings& s, char (&text)[64]) {
     switch (id) {
+        case kRenderer:
+            if (step) s.direct3d = StepIndex(s.direct3d == 11, step, 2) ? 11 : 12;
+            std::snprintf(text, sizeof(text), "%s", s.direct3d == 11 ? "DIRECTX 11" : "DIRECTX 12 (DEFAULT)");
+            return true;
         case kShaderModel:
             if (step) s.shader_model = StepIndex(s.shader_model >= 3, step, 2) ? 3 : 1;
             std::snprintf(text, sizeof(text), "%s", s.shader_model >= 3 ? "3.0" : "1.1 (DEFAULT)");

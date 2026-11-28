@@ -28,6 +28,7 @@ The latest version of [SCDA-XBERecomp](https://github.com/TGP482/SCDA-XBERecomp/
 - **Colour Blind Mode** - Adjusts the colours for Protanopia, Deuteranopia or Tritanopia.
 
 ### Graphics
+- **Renderer** - Choose between DirectX 12 (default) and DirectX 11, which can be switched while the game is running.
 - **Multisample Antialiasing (MSAA)** - Enables 2x, 4x or 8x MSAA to smooth jagged edges while preserving a sharp image. MSAA does not smooth alpha-tested edges such as fences and foliage.
 <div align="center">
   <table>
@@ -177,7 +178,7 @@ As the host, you must port forward the following ports on your router so other p
 - **CPU** with 2 cores and support for SSE4.2 and POPCNT
   - Intel Nehalem (Intel Core 1st Generation)
   - AMD Bulldozer (AMD FX series)
-- **GPU** with support for Direct3D 12
+- **GPU** with support for Direct3D 11 or Direct3D 12
   - NVIDIA GeForce GT 630 (Kepler)
   - AMD Radeon HD 7750
   - Intel HD Graphics 510 (Skylake)

@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstring>
 #include <cwchar>
+#include <filesystem>
 
 #include "app/app.h"
 #include "core/log.h"
@@ -181,6 +182,59 @@ constexpr float kColourBlindShift[3][9] = {
     {0, 0, 0, 0.7f, 1, 0, 0.7f, 0, 1},
     {1, 0, 0.7f, 0, 1, 0.7f, 0, 0, 0},
 };
+
+
+// s.vsc holds the 192 vertex shader constants in hardware order: D3D register + 96
+constexpr int kVsConstants = 192;
+constexpr int kVsConstantBias = 96;
+
+void CaptureInputs(CaptureLog& cap, const State& s, const Assembled& a, const DrawConstants& c) {
+    fprintf(cap.file, "\n     verts");
+    uint32_t n = 0;
+    for (int r = 0; r < 16; r++) n += (a.regs >> r) & 1;
+    for (size_t v = 0; v < std::min<size_t>(4, n ? a.vertices.size() / (n * 4) : 0); v++) {
+        fprintf(cap.file, " [");
+        for (uint32_t k = 0; k < n * 4; k++) fprintf(cap.file, " %g", a.vertices[v * n * 4 + k]);
+        fprintf(cap.file, " ]");
+    }
+    for (int r = 0; r < kVsConstants; r++) {
+        const auto& v = s.vsc[r];
+        if (v[0] || v[1] || v[2] || v[3]) {
+            fprintf(cap.file, "\n     c%d %g %g %g %g", r - kVsConstantBias, v[0], v[1], v[2], v[3]);
+        }
+    }
+    fprintf(cap.file, "\n     pc");
+    for (size_t r = 0; r < std::size(c.pc); r++) {
+        fprintf(cap.file, " (%.3f %.3f %.3f %.3f)", c.pc[r][0], c.pc[r][1], c.pc[r][2], c.pc[r][3]);
+    }
+}
+
+// a CaptureLog::shaders entry apart from the shader keys: this vertex program's inputs were captured
+constexpr uint64_t kInputsCapturedTag = 0xC0;
+
+// each shader once, as translated
+void CaptureShader(CaptureLog& cap, const char* kind, uint64_t key, const std::string& src) {
+    if (!cap.shaders.insert(key).second) return;
+    char name[48];
+    snprintf(name, sizeof(name), "%s_%016llX.hlsl", kind, (unsigned long long)key);
+    if (FILE* f = _wfopen((cap.dir / name).c_str(), L"w")) {
+        fwrite(src.data(), 1, src.size(), f);
+        fclose(f);
+    }
+    fprintf(cap.file, "     %s\n", name);
+}
+
+// BMP file and info header: byte offsets of the fields WriteBmp writes
+constexpr int kBmpHeaderBytes = 54;
+constexpr int kBmpFileSize = 2;
+constexpr int kBmpPixelOffset = 10;
+constexpr int kBmpInfoSize = 14;
+constexpr int kBmpWidth = 18;
+constexpr int kBmpHeight = 22;  // negative: rows top down
+constexpr int kBmpPlanes = 26;
+constexpr int kBmpBitCount = 28;
+constexpr int kBmpImageSize = 34;
+constexpr uint32_t kBmpInfoBytes = 40;
 
 }  // namespace
 
@@ -617,8 +671,8 @@ std::array<float, 9> ColourBlindMatrix(uint32_t mode) {
     return m;
 }
 
-std::unique_ptr<Backend> CreateBackend() {
-    return app::Get().direct3d == 11 ? CreateD3D11Backend() : CreateD3D12Backend();
+std::unique_ptr<Backend> CreateBackend(uint32_t direct3d) {
+    return direct3d == 11 ? CreateD3D11Backend() : CreateD3D12Backend();
 }
 
 uint32_t CmpFunc(uint32_t v) {
@@ -723,6 +777,61 @@ ID3DBlob* ShaderStore::Compile(const std::string& src, const char* entry, const 
 uint64_t ShaderStore::Check(uint64_t hash) {
     std::lock_guard lock(lock_);
     return shaders_[hash].check;
+}
+
+void StartCapture(CaptureLog& cap) {
+    SYSTEMTIME tm;
+    GetLocalTime(&tm);
+    char stamp[32];
+    snprintf(stamp, sizeof(stamp), "%02u%02u%02u", tm.wHour, tm.wMinute, tm.wSecond);
+    std::error_code ec;
+    cap.dir = app::ExeDir() / "captures" / stamp;
+    std::filesystem::create_directories(cap.dir, ec);
+    cap.file = _wfopen((cap.dir / "frame.txt").c_str(), L"w");
+    cap.i = cap.rt = 0;
+    cap.seen.clear();
+    cap.shaders.clear();
+}
+
+void WriteDrawLine(CaptureLog& cap, const State& s, const DrawCall& d, const PsoKey& k, const DrawConstants& c) {
+    fprintf(cap.file,
+            "%04u draw rt %08X ds %08X prim %u count %u vs %08X ps %08X blend %u %X %X zen %u %X zwrite %u "
+            "zbias %d %.2f cull %u cw %X c0 %.3f %.3f %.3f %.3f tf %08X atest %g %g",
+            cap.i++, s.rt.data, d.ds, d.prim, d.count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend, k.src, k.dst,
+            k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1], c.pc[0][2],
+            c.pc[0][3], s.rs[kRsTextureFactor], c.misc[1], c.misc[0]);
+}
+
+// small draws, and a vertex program's first draw: its inputs and constants; then ends the draw's line
+void EndDrawLine(CaptureLog& cap, const State& s, const Assembled& a, const DrawCall& d, bool prog,
+                 const DrawConstants& c) {
+    uint64_t inputs_key = uint64_t(s.vs_handle) << 32 | kInputsCapturedTag;
+    if (d.count <= kQuadVertices || (prog && cap.shaders.insert(inputs_key).second)) CaptureInputs(cap, s, a, c);
+    fputc('\n', cap.file);
+}
+
+void CaptureShaders(CaptureLog& cap, const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk) {
+    std::string src = VertexHlsl(s, a, sh);
+    CaptureShader(cap, "vs", sh.vkey, sh.quad ? QuadHlsl(std::move(src)) : src);
+    CaptureShader(cap, "ps", sh.pkey, PixelHlsl(pk));
+}
+
+void WriteBmp(const CaptureLog& cap, const char* name, const std::vector<uint8_t>& px, uint32_t w, uint32_t h) {
+    FILE* f = _wfopen((cap.dir / (std::string(name) + ".bmp")).c_str(), L"wb");
+    if (!f) return;
+    uint8_t hd[kBmpHeaderBytes] = {'B', 'M'};
+    auto put = [&](int o, uint32_t v) { std::memcpy(hd + o, &v, 4); };
+    put(kBmpFileSize, kBmpHeaderBytes + uint32_t(px.size()));
+    put(kBmpPixelOffset, kBmpHeaderBytes);
+    put(kBmpInfoSize, kBmpInfoBytes);
+    put(kBmpWidth, w);
+    put(kBmpHeight, uint32_t(-int32_t(h)));
+    hd[kBmpPlanes] = 1;
+    hd[kBmpBitCount] = 32;
+    put(kBmpImageSize, uint32_t(px.size()));
+    fwrite(hd, 1, kBmpHeaderBytes, f);
+    fwrite(px.data(), 1, px.size(), f);
+    fclose(f);
 }
 
 }  // namespace gpu

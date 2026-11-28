@@ -33,5 +33,9 @@ void AddPipelineKey(const void* key, size_t size);
 
 // runs job on a build thread; ahead: before the jobs already waiting
 void Post(std::function<void()> job, bool ahead = false);
+// the jobs not started are dropped, then waits for the running ones: before the renderer they reach goes
+void DropJobs();
+// the pipeline library saved and let go, for a renderer about to free its device
+void CloseLibrary();
 
 }  // namespace gpu::cache

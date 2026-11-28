@@ -212,6 +212,7 @@ struct DrawTextures : StageInfo {
 
 class D3D12Backend final : public Backend {
 public:
+    ~D3D12Backend() override;
     bool Init(uint32_t width, uint32_t height) override;
     void Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                uint32_t stencil) override;
@@ -380,10 +381,6 @@ private:
     void CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
                      const DrawTextures& stages);
     void CaptureTextures(const State& s, const DrawTextures& stages);
-    void EndDrawCapture(const State& s, const Assembled& a, uint32_t count, bool prog, const DrawConstants& c);
-    void CaptureInputs(const State& s, const Assembled& a, const DrawConstants& c);
-    void CaptureShaders(const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk);
-    void CaptureShader(const char* kind, uint64_t key, const std::string& src);
     void SetTextureViewsAndSamplers(const State& s, const Assembled& a, DrawTextures& stages);
     uint32_t EnsureStageSamplers(const State& s, const DrawTextures& stages, bool clamp);
     void SetViewportScissor(const State& s, uint32_t gw);
@@ -406,7 +403,6 @@ private:
     void LatchFeatureSettings(const app::Settings& set);
     // Present, in call order, each callee right after its caller; DrawFrame runs the ones after it to RenderUi
     void FinishCapture(const Surface& front);
-    void StartCapture();
     void DetectHdr();
     void ResizeSwap();
     bool ResizeBackBuffers(uint32_t w, uint32_t h, DXGI_FORMAT fmt, DXGI_COLOR_SPACE_TYPE space);
@@ -577,12 +573,7 @@ private:
     DXGI_FORMAT smaa_fmt_ = DXGI_FORMAT_UNKNOWN;
     std::chrono::steady_clock::time_point expo_t_ = std::chrono::steady_clock::now();
     // one frame capture: every draw in a text file, each target as the frame leaves it, the textures it read
-    FILE* cap_ = nullptr;
-    std::filesystem::path cap_dir_;
-    uint32_t cap_i_ = 0;
-    uint32_t cap_rt_ = 0;
-    std::unordered_set<uint32_t> cap_seen_;
-    std::unordered_set<uint64_t> cap_sh_;
+    CaptureLog cap_;
     struct CapTex {
         ComPtr<ID3D12Resource> res;
         DXGI_FORMAT fmt;
@@ -624,6 +615,7 @@ private:
     std::atomic<uint64_t> present_fence_[kFrames + 1] = {};  // by presents_, for WaitGpuFrame
     Assembled asm_;  // kept between draws for its buffers
     bool tearing_ = false;
+    bool ready_ = false;  // Init went through
     uint64_t presents_ = 0;
     std::chrono::steady_clock::time_point fps_t_ = std::chrono::steady_clock::now();
     uint64_t fps_n_ = 0;
@@ -645,8 +637,22 @@ bool D3D12Backend::Init(uint32_t width, uint32_t height) {
     LoadSettings();
     WarmPipelines();
     Begin();
+    ready_ = true;
     LOGI("d3d12: %ux%u guest, %ux%u window, render scale %.3f", width, height, bb_w_, bb_h_, scale_);
     return true;
+}
+
+// a renderer swap: the build threads let go of this one, the GPU finishes, the pipeline library is saved
+D3D12Backend::~D3D12Backend() {
+    cache::DropJobs();
+    if (!ready_) return;
+    Flush();
+    {
+        std::lock_guard lock(app::UiLock());
+        ImGui_ImplDX12_Shutdown();
+    }
+    cache::CloseLibrary();
+    CloseHandle(event_);
 }
 
 bool D3D12Backend::CreateDevice() {
@@ -1357,9 +1363,9 @@ void D3D12Backend::DrawBloom(const PostInputs& in, const Target& t, uint32_t bw,
 
 // the frame is read: exposure, bloom and tone mapping take the target back to 0..1
 void D3D12Backend::Resolve(Target& t) {
-    if (cap_) {
+    if (cap_.file) {
         char name[32];
-        snprintf(name, sizeof(name), "%04u_hdr_%08X", cap_i_, t.data);
+        snprintf(name, sizeof(name), "%04u_hdr_%08X", cap_.i, t.data);
         CapSave(t, name);
     }
     t.hdr = false;
@@ -1498,9 +1504,9 @@ void D3D12Backend::FilterShadows(const State& s, const float p[kShadowFilterPara
     D3D12_RECT rect = ScaledViewportRect(v, *rt);
     if (rect.right <= rect.left || rect.bottom <= rect.top || zr <= 0) return;
     if (!EnsureSoftShadowTargets(rt->w, rt->h)) return;
-    if (cap_) {
+    if (cap_.file) {
         CapStep(s.rt);
-        fprintf(cap_, "%04u soft shadows rt %08X ds %08X\n", cap_i_++, s.rt.data, s.zs.data);
+        fprintf(cap_.file, "%04u soft shadows rt %08X ds %08X\n", cap_.i++, s.rt.data, s.zs.data);
     }
     float rect_w = float(rect.right - rect.left);
     float rect_h = float(rect.bottom - rect.top);
@@ -1743,9 +1749,9 @@ void D3D12Backend::Occlusion(const State& s, const float p[kOcclusionParams]) {
     D3D12_RECT rect = ScaledViewportRect(v, *rt);
     if (rect.right <= rect.left || rect.bottom <= rect.top || zr <= 0) return;
     if (!EnsureAoTargets(rt->w, rt->h)) return;
-    if (cap_) {
+    if (cap_.file) {
         CapStep(s.rt);
-        fprintf(cap_, "%04u occlusion rt %08X ds %08X\n", cap_i_++, s.rt.data, s.zs.data);
+        fprintf(cap_.file, "%04u occlusion rt %08X ds %08X\n", cap_.i++, s.rt.data, s.zs.data);
     }
     LOG_FIRST(1, "d3d12: ambient occlusion %s %ux%u, %u samples, projection %.4f %.4f, view z %.6f / (depth - %.8f)",
               p[9] ? "GTAO" : "SSAO", rt->w, rt->h, ds->samples, 1 / p[0], 1 / p[1], p[4], p[5]);
@@ -1812,7 +1818,7 @@ ID3D12PipelineState* D3D12Backend::EnsurePipeline(const PsoKey& k, bool wait) {
     uint64_t h = Hash(&k, sizeof(k));
     auto it = psos_.find(h);
     if (it != psos_.end()) return it->second.Get();
-    bool async = async_ && !cap_ && !wait;
+    bool async = async_ && !cap_.file && !wait;
     if (async && building_.count(h)) {
         skipped_frame_ = true;
         return nullptr;
@@ -2318,78 +2324,19 @@ void D3D12Backend::CaptureTextures(const State& s, const DrawTextures& stages) {
         TextureDesc d;
         if (!s.textures[size_t(i)] || !Describe(s.textures[size_t(i)], d)) continue;
         bool tg = targets_.count(TargetKey(d.data, Format(d.format).depth));
-        fprintf(cap_, " | t%d %08X fmt %X %ux%u%s%s", i, d.data, d.format, d.width, d.height, tg ? " target" : "",
+        fprintf(cap_.file, " | t%d %08X fmt %X %ux%u%s%s", i, d.data, d.format, d.width, d.height, tg ? " target" : "",
                 res ? "" : " unbound");
-        if (res && !tg && stages.info[i].kind == kTex2D && cap_seen_.insert(d.data).second) {
+        if (res && !tg && stages.info[i].kind == kTex2D && cap_.seen.insert(d.data).second) {
             cap_tex_.push_back({res, stages.sv[i].Format, d.data, d.width, d.height});
         }
-    }
-}
-
-// s.vsc holds the 192 vertex shader constants in hardware order: D3D register + 96
-constexpr int kVsConstants = 192;
-constexpr int kVsConstantBias = 96;
-
-void D3D12Backend::CaptureInputs(const State& s, const Assembled& a, const DrawConstants& c) {
-    fprintf(cap_, "\n     verts");
-    uint32_t n = 0;
-    for (int r = 0; r < 16; r++) n += (a.regs >> r) & 1;
-    for (size_t v = 0; v < std::min<size_t>(4, n ? a.vertices.size() / (n * 4) : 0); v++) {
-        fprintf(cap_, " [");
-        for (uint32_t k = 0; k < n * 4; k++) fprintf(cap_, " %g", a.vertices[v * n * 4 + k]);
-        fprintf(cap_, " ]");
-    }
-    for (int r = 0; r < kVsConstants; r++) {
-        const auto& v = s.vsc[r];
-        if (v[0] || v[1] || v[2] || v[3]) {
-            fprintf(cap_, "\n     c%d %g %g %g %g", r - kVsConstantBias, v[0], v[1], v[2], v[3]);
-        }
-    }
-    fprintf(cap_, "\n     pc");
-    for (size_t r = 0; r < std::size(c.pc); r++) {
-        fprintf(cap_, " (%.3f %.3f %.3f %.3f)", c.pc[r][0], c.pc[r][1], c.pc[r][2], c.pc[r][3]);
     }
 }
 
 // the draw's line: its state, then its textures
 void D3D12Backend::CaptureDraw(const State& s, uint32_t prim, uint32_t count, const PsoKey& k, const DrawConstants& c,
                                const DrawTextures& stages) {
-    fprintf(cap_,
-            "%04u draw rt %08X ds %08X prim %u count %u vs %08X ps %08X blend %u %X %X zen %u %X zwrite %u "
-            "zbias %d %.2f cull %u cw %X c0 %.3f %.3f %.3f %.3f tf %08X atest %g %g",
-            cap_i_++, s.rt.data, bound_ds_ ? s.zs.data : 0, prim, count, s.vs_handle, s.ps ? s.ps->handle : 0, k.blend,
-            k.src, k.dst, k.zen, k.zfunc, k.zwrite, k.zbias, k.zslope, k.cull, k.wmask, c.pc[0][0], c.pc[0][1],
-            c.pc[0][2], c.pc[0][3], s.rs[kRsTextureFactor], c.misc[1], c.misc[0]);
+    WriteDrawLine(cap_, s, {prim, count, bound_ds_ ? s.zs.data : 0}, k, c);
     CaptureTextures(s, stages);
-}
-
-// a cap_sh_ entry apart from the shader keys: this vertex program's inputs were captured
-constexpr uint64_t kInputsCapturedTag = 0xC0;
-
-// small draws, and a vertex program's first draw: its inputs and constants; then ends the draw's line
-void D3D12Backend::EndDrawCapture(const State& s, const Assembled& a, uint32_t count, bool prog,
-                                  const DrawConstants& c) {
-    uint64_t inputs_key = uint64_t(s.vs_handle) << 32 | kInputsCapturedTag;
-    if (count <= kQuadVertices || (prog && cap_sh_.insert(inputs_key).second)) CaptureInputs(s, a, c);
-    fputc('\n', cap_);
-}
-
-// each shader once, as translated
-void D3D12Backend::CaptureShader(const char* kind, uint64_t key, const std::string& src) {
-    if (!cap_sh_.insert(key).second) return;
-    char name[48];
-    snprintf(name, sizeof(name), "%s_%016llX.hlsl", kind, (unsigned long long)key);
-    if (FILE* f = _wfopen((cap_dir_ / name).c_str(), L"w")) {
-        fwrite(src.data(), 1, src.size(), f);
-        fclose(f);
-    }
-    fprintf(cap_, "     %s\n", name);
-}
-
-void D3D12Backend::CaptureShaders(const State& s, const Assembled& a, const DrawShaders& sh, const PixelKey& pk) {
-    std::string src = VertexHlsl(s, a, sh);
-    CaptureShader("vs", sh.vkey, sh.quad ? QuadHlsl(std::move(src)) : src);
-    CaptureShader("ps", sh.pkey, PixelHlsl(pk));
 }
 
 D3D12_SRV_DIMENSION NullViewDimension(uint8_t kind) {
@@ -2458,7 +2405,7 @@ void D3D12Backend::DrawGeometry(const Assembled& a) {
 }
 
 void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t count, const uint8_t* indices) {
-    if (cap_) CapStep(s.rt);
+    if (cap_.file) CapStep(s.rt);
     Assembled& a = asm_;
     bool assembled = Assemble(s, prim, start, count, indices, a);
     if (!assembled) return;
@@ -2496,10 +2443,10 @@ void D3D12Backend::Draw(const State& s, uint32_t prim, uint32_t start, uint32_t 
     DrawConstants c{};
     UploadConstants(s, sh, k, stages, size, c);
 
-    if (cap_) {
+    if (cap_.file) {
         CaptureDraw(s, prim, count, k, c, stages);
-        EndDrawCapture(s, a, count, sh.prog, c);
-        CaptureShaders(s, a, sh, pk);
+        EndDrawLine(cap_, s, a, {prim, count, 0}, sh.prog, c);
+        CaptureShaders(cap_, s, a, sh, pk);
     }
 
     // texture views and samplers, viewport and scissor, blend factor and stencil reference
@@ -2544,10 +2491,10 @@ void D3D12Backend::ClearTarget(Target& t, const State& s, const ClearArgs& c, st
 
 void D3D12Backend::Clear(const State& s, uint32_t count, const uint8_t* rects, uint32_t flags, uint32_t color, float z,
                          uint32_t stencil) {
-    if (cap_) {
+    if (cap_.file) {
         CapStep(s.rt);
-        fprintf(cap_, "%04u clear rt %08X ds %08X flags %X color %08X z %.3f\n", cap_i_++, s.rt.data, s.zs.data, flags,
-                color, z);
+        fprintf(cap_.file, "%04u clear rt %08X ds %08X flags %X color %08X z %.3f\n", cap_.i++, s.rt.data, s.zs.data,
+                flags, color, z);
     }
     Target* rt = (flags & kClearTarget) ? EnsureTarget(s.rt, false) : nullptr;
     Target* ds = (flags & (kClearZ | kClearStencil)) ? EnsureTarget(s.zs, true) : nullptr;
@@ -2636,10 +2583,10 @@ void D3D12Backend::CopyByRegion(const Target& src_t, ID3D12Resource* src_res, D3
 void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, uint32_t src_rects,
                         uint32_t dst_points) {
     Target* src_t = FindTarget(src, false);
-    if (cap_) {
+    if (cap_.file) {
         const char* from = "memory";
         if (src_t) from = src_t->drawn ? "target" : "idle target";
-        fprintf(cap_, "%04u copy %08X %s to %08X\n", cap_i_++, src.data, from, dst.data);
+        fprintf(cap_.file, "%04u copy %08X %s to %08X\n", cap_.i++, src.data, from, dst.data);
     }
     // pixels the CPU made: the copy happens in memory, textures and targets pick it up from there
     if (!src_t || !src_t->drawn) {
@@ -2662,9 +2609,9 @@ void D3D12Backend::Copy(const Surface& src, const Surface& dst, uint32_t count, 
         return;
     }
     CopyByRegion(*src_t, src_r.res, *src_r.state, *dst_t, l);
-    if (cap_) {
+    if (cap_.file) {
         char name[32];
-        snprintf(name, sizeof(name), "%04u_copy_%08X", cap_i_, dst_t->data);
+        snprintf(name, sizeof(name), "%04u_copy_%08X", cap_.i, dst_t->data);
         CapSave(*dst_t, name);
     }
 }
@@ -2727,24 +2674,10 @@ void D3D12Backend::FinishCapture(const Surface& front) {
         D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         CapSave({.res = t.res.Get(), .state = &st, .fmt = t.fmt, .w = t.w, .h = t.h}, name);
     }
-    fclose(cap_);
-    cap_ = nullptr;
+    fclose(cap_.file);
+    cap_.file = nullptr;
     cap_tex_.clear();
-    LOGI("d3d12: frame captured to %s", cap_dir_.string().c_str());
-}
-
-void D3D12Backend::StartCapture() {
-    SYSTEMTIME tm;
-    GetLocalTime(&tm);
-    char stamp[32];
-    snprintf(stamp, sizeof(stamp), "%02u%02u%02u", tm.wHour, tm.wMinute, tm.wSecond);
-    std::error_code ec;
-    cap_dir_ = app::ExeDir() / "captures" / stamp;
-    std::filesystem::create_directories(cap_dir_, ec);
-    cap_ = _wfopen((cap_dir_ / "frame.txt").c_str(), L"w");
-    cap_i_ = cap_rt_ = 0;
-    cap_seen_.clear();
-    cap_sh_.clear();
+    LOGI("d3d12: frame captured to %s", cap_.dir.string().c_str());
 }
 
 void D3D12Backend::UploadGammaRamp(uint32_t brightness, uint32_t contrast) {
@@ -2890,10 +2823,10 @@ void D3D12Backend::CountFps() {
 }
 
 void D3D12Backend::Present(const Surface& front, bool pillarbox) {
-    if (cap_) {
+    if (cap_.file) {
         FinishCapture(front);
     } else if (g_capture.exchange(false)) {
-        StartCapture();
+        StartCapture(cap_);
     }
     DetectHdr();
     ResizeSwap();
@@ -3157,37 +3090,11 @@ bool D3D12Backend::ReadBack(ID3D12Resource* res, uint32_t w, uint32_t h, std::ve
     return true;
 }
 
-// BMP file and info header: byte offsets of the fields CapSave writes
-constexpr int kBmpHeaderBytes = 54;
-constexpr int kBmpFileSize = 2;
-constexpr int kBmpPixelOffset = 10;
-constexpr int kBmpInfoSize = 14;
-constexpr int kBmpWidth = 18;
-constexpr int kBmpHeight = 22;  // negative: rows top down
-constexpr int kBmpPlanes = 26;
-constexpr int kBmpBitCount = 28;
-constexpr int kBmpImageSize = 34;
-constexpr uint32_t kBmpInfoBytes = 40;
-
 void D3D12Backend::CapSave(const CapImage& img, const char* name) {
     ComPtr<ID3D12Resource> down = Shrink(img.res, *img.state, img.fmt, img.w, img.h, {.mul = img.mul});
     std::vector<uint8_t> px;
     if (!down || !ReadBack(down.Get(), img.w, img.h, px)) return;
-    FILE* f = _wfopen((cap_dir_ / (std::string(name) + ".bmp")).c_str(), L"wb");
-    if (!f) return;
-    uint8_t hd[kBmpHeaderBytes] = {'B', 'M'};
-    auto put = [&](int o, uint32_t v) { std::memcpy(hd + o, &v, 4); };
-    put(kBmpFileSize, kBmpHeaderBytes + uint32_t(px.size()));
-    put(kBmpPixelOffset, kBmpHeaderBytes);
-    put(kBmpInfoSize, kBmpInfoBytes);
-    put(kBmpWidth, img.w);
-    put(kBmpHeight, uint32_t(-int32_t(img.h)));
-    hd[kBmpPlanes] = 1;
-    hd[kBmpBitCount] = 32;
-    put(kBmpImageSize, uint32_t(px.size()));
-    fwrite(hd, 1, kBmpHeaderBytes, f);
-    fwrite(px.data(), 1, px.size(), f);
-    fclose(f);
+    WriteBmp(cap_, name, px, img.w, img.h);
 }
 
 void D3D12Backend::CapSave(Target& t, const char* name) {
@@ -3201,20 +3108,20 @@ void D3D12Backend::CapSave(Target& t, const char* name) {
 // the frame moves to another target: save the one it leaves
 void D3D12Backend::CapStep(const Surface& rt) {
     uint32_t d = rt.header ? mem::VirtualFromPhysical(rt.data) : 0;
-    if (d == cap_rt_) return;
-    auto it = targets_.find(TargetKey(cap_rt_, false));
-    if (cap_rt_ && it != targets_.end()) {
+    if (d == cap_.rt) return;
+    auto it = targets_.find(TargetKey(cap_.rt, false));
+    if (cap_.rt && it != targets_.end()) {
         char name[32];
-        snprintf(name, sizeof(name), "%04u_%08X", cap_i_, cap_rt_);
+        snprintf(name, sizeof(name), "%04u_%08X", cap_.i, cap_.rt);
         CapSave(it->second, name);
     }
-    auto z = targets_.find(TargetKey(cap_rt_, true));
-    if (cap_rt_ && z != targets_.end()) {
+    auto z = targets_.find(TargetKey(cap_.rt, true));
+    if (cap_.rt && z != targets_.end()) {
         char name[32];
-        snprintf(name, sizeof(name), "%04u_%08X_z", cap_i_, cap_rt_);
+        snprintf(name, sizeof(name), "%04u_%08X_z", cap_.i, cap_.rt);
         CapSave(z->second, name);
     }
-    cap_rt_ = d;
+    cap_.rt = d;
 }
 
 // the game's ramp is Shadow Calibration's, which can only brighten, the brightness and contrast settings replace it

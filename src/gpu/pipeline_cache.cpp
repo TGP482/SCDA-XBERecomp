@@ -96,6 +96,8 @@ struct Pool {
     std::condition_variable wake;
     std::deque<std::function<void()>> jobs;
     bool started = false;
+    uint32_t running = 0;
+    std::condition_variable idle;  // running fell to 0
 };
 
 // never freed: build threads may still run when the process exits
@@ -297,14 +299,19 @@ void Run() {
             p.wake.wait(lock, [&] { return !p.jobs.empty(); });
             job = std::move(p.jobs.front());
             p.jobs.pop_front();
+            p.running++;
         }
         job();
+        std::lock_guard lock(p.lock);
+        if (--p.running == 0) p.idle.notify_all();
     }
 }
 
 }  // namespace
 
 void OpenShaderFiles() {
+    // a renderer swapped in during the run finds them open
+    if (S().file != INVALID_HANDLE_VALUE) return;
     auto dir = app::ExeDir() / "shadercache";
     std::error_code ec;
     std::filesystem::create_directories(dir, ec);
@@ -321,7 +328,7 @@ void Open(ID3D12Device* dev, uint64_t root) {
     // per executable: offline and versus write theirs whole
     std::wstring stem = std::filesystem::path(exe).stem().wstring();
     OpenLibrary(dev, dir / (stem + L"_pipelines.bin"));
-    OpenKeys(dir / (stem + L"_pipeline_keys.bin"));
+    if (K().file == INVALID_HANDLE_VALUE) OpenKeys(dir / (stem + L"_pipeline_keys.bin"));
 }
 
 ComPtr<ID3DBlob> FindShader(uint64_t key, uint64_t check) {
@@ -409,6 +416,24 @@ void Post(std::function<void()> job, bool ahead) {
         }
     }
     p.wake.notify_one();
+}
+
+void DropJobs() {
+    Pool& p = P();
+    std::unique_lock lock(p.lock);
+    p.jobs.clear();
+    p.idle.wait(lock, [&] { return p.running == 0; });
+    // a dropped save would leave it set
+    L().saving = false;
+}
+
+void CloseLibrary() {
+    SavePipelineCache();
+    Library& l = L();
+    std::lock_guard lock(l.save_lock);
+    l.lib.Reset();
+    l.blob.clear();
+    l.unsaved = 0;
 }
 
 }  // namespace gpu::cache

@@ -63,9 +63,11 @@ private:
     uint32_t fence_ = 0;
 };
 
-std::unique_ptr<Backend> CreateBackend();
+// direct3d: 11 or 12
+std::unique_ptr<Backend> CreateBackend(uint32_t direct3d);
 // the same backend driven from a thread of its own: calls return once recorded
-std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner);
+// it swaps in the renderer the settings name after the present that finds them changed; direct3d: inner's
+std::unique_ptr<Backend> CreateThreadedBackend(std::unique_ptr<Backend> inner, uint32_t direct3d);
 
 // the pipeline library to disk now: before a quick reboot starts the next process, and at quit
 void SavePipelineCache();
