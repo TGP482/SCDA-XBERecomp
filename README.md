@@ -190,7 +190,7 @@ As the host, you must port forward the following ports on your router so other p
 ### 1. Clone the Repository
 Clone this repository using [Git](https://git-scm.com/).
 ```
-git clone https://github.com/TGP482/SCDoubleAgent-XBERecomp.git
+git clone https://github.com/TGP482/SCDA-XBERecomp.git
 ```
 
 ### 2. Add the Required Game Files
